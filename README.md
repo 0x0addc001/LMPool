@@ -1,6 +1,6 @@
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
-**Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)** | Prototype Stage
+Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | Prototype Stage | [English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
