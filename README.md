@@ -1,6 +1,6 @@
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
-**Built on Mini-vLLM** | Prototype Stage
+**Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)** | Prototype Stage
 
 ---
 
@@ -194,28 +194,28 @@ The decode-stage counterpart is `append_with_swap(seq)`, which follows the same 
 
 `select_eviction_candidates(gpu_id, num_blocks) → List[Tuple[int, int]]` uses a three-tier progressive strategy to find a swap target for each cold block:
 
-**Tier 1 — Select locally coldest blocks**
+**Tier 1 Select locally coldest blocks**
 
 Sorts `block_access_time[gpu_id]` by timestamp ascending, takes the top `num_blocks` as `cold_blocks`.
 
-**Tier 2 — Find a target GPU with free space for each cold block**
+**Tier 2 Find a target GPU with free space for each cold block**
 
 Iterates over candidate targets in the topology-priority order returned by `_get_target_gpu_order(gpu_id)`:
 
-- **Priority 1**: NVLink direct-connect partner
-- **Priority 2**: Same-socket GPUs (sorted by free block count descending)
-- **Priority 3**: Cross-socket GPUs (sorted by free block count descending)
+1. **Priority 1**: NVLink direct-connect partner
+2. **Priority 2**: Same-socket GPUs (sorted by free block count descending)
+3. **Priority 3**: Cross-socket GPUs (sorted by free block count descending)
 
 Stops at the first target where `free_blocks_per_gpu[target] > 0`, and temporarily decrements that target's free count by 1 to prevent subsequent blocks from occupying the same slot.
 
-**Tier 3 — Recursive eviction / overwrite**
+**Tier 3 Recursive eviction / overwrite**
 
 If all target GPUs have zero free blocks:
 
-- Calls `_select_remote_victim(target)` to pick the LRU-coldest block on the topologically nearest target
-- Removes that victim's entry from `block_access_time`, `block_hash`, and `global_page_table`—effectively recursive eviction
-- The target thus gains one free slot, ready to receive the local cold block
-- If the remote side is also completely empty (no blocks to choose from), falls back to direct overwrite—the target block count stays unchanged, old data is overwritten when the transfer arrives
+1. Calls `_select_remote_victim(target)` to pick the LRU-coldest block on the topologically nearest target
+2. Removes that victim's entry from `block_access_time`, `block_hash`, and `global_page_table`—effectively recursive eviction
+3. The target thus gains one free slot, ready to receive the local cold block
+4. If the remote side is also completely empty (no blocks to choose from), falls back to direct overwrite—the target block count stays unchanged, old data is overwritten when the transfer arrives
 
 `_get_target_gpu_order(gpu_id)` constructs the order as:
 
