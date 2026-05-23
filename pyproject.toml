@@ -1,5 +1,5 @@
 [project]
-name = "myvllm"
+name = "lmpool"
 version = "0.1.0"
 description = "A custom vLLM project"
 readme = "README.md"
