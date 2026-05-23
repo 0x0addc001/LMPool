@@ -23,7 +23,7 @@
 
 ## 1. Overview
 
-LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on Mini-vLLM's Paged Attention, it adds cross-GPU block-level prefix-aware routing and hot/cold-aware eviction.
+LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on Mini-vLLM's Paged Attention, it adds cross-GPU block-level prefix-aware routing and hot-cold/topo-aware eviction.
 
 ### 1.1 Problem
 
@@ -41,7 +41,7 @@ Abstract multi-GPU HBM into a unified distributed memory pool:
 
 1. **Logical unification**: `GlobalBlockManager` maintains a cross-GPU global page table recording the physical location of every KV block
 2. **Prefix deduplication**: Block-level hash chains encode prefixes; cross-GPU lookup ensures identical prefixes are stored only once
-3. **Hot/cold awareness**: LRU eviction + topology-prioritized swap (NVLink > PIX > NODE)
+3. **Hot-cold/topo awareness**: LRU eviction + topology-prioritized swap (NVLink > PIX > NODE)
 4. **Control/data plane separation**: `GlobalScheduler` makes decisions; `kv_transfer` executes NCCL transfers
 
 ---
@@ -102,7 +102,7 @@ Determines which GPU a newly arriving sequence should execute on. The algorithm 
 | Same socket (PIX)   | 1.5    |
 | Cross-socket (NODE) | 1.0    |
 
-5. **Select highest-scoring GPU with sufficient free blocks**: Iterates over scored candidates. Only GPUs satisfying `gbm.get_free_blocks_count(gpu_id) >= seq.num_blocks` are qualified. If the highest-scoring candidate has insufficient free blocks, it is still returned—the expectation is that a subsequent `rebalance()` will free up space.
+5. **Select highest-scoring GPU with sufficient free blocks**: Iterates over scored candidates. Only GPUs satisfying `gbm.get_free_blocks_count(gpu_id) >= seq.num_blocks` are qualified. If the highest-scoring candidate has insufficient free blocks, it is still returned, and the expectation is that a subsequent `rebalance()` will free up space.
 
 6. **Fallback: select GPU with most free blocks**: When there is no prefix hash or no hits at all, `_select_most_free_gpu` scans all ranks and returns the GPU with the largest free block count, preferring the local rank on ties.
 
@@ -215,13 +215,13 @@ If all target GPUs have zero free blocks:
 1. Calls `_select_remote_victim(target)` to pick the LRU-coldest block on the topologically nearest target
 2. Removes that victim's entry from `block_access_time`, `block_hash`, and `global_page_table`—effectively recursive eviction
 3. The target thus gains one free slot, ready to receive the local cold block
-4. If the remote side is also completely empty (no blocks to choose from), falls back to direct overwrite—the target block count stays unchanged, old data is overwritten when the transfer arrives
+4. If the remote side is also completely empty (no blocks to choose from), falls back to direct overwrite, meaning that the target block count stays unchanged, old data is overwritten when the transfer arrives
 
 `_get_target_gpu_order(gpu_id)` constructs the order as:
 
 ```python
 ordered = []
-# Tier 1: NVLink direct-connect partner (highest bandwidth)
+# Tier 1: NVLink direct-connect partner, highest bandwidth
 partner = nvlink_partner.get(gpu_id)
 if partner: ordered.append(partner)
 
@@ -262,11 +262,11 @@ First calls `gather_local_state()`—collects each rank's current `free_blocks_p
 
 **`maybe_sync()`**
 
-An internal counter increments; every `sync_interval` (default 10) scheduler cycles, calls `broadcast_page_table()` once. Currently commented out in the `Scheduler`; re-enabling it is the first step to activating true cross-GPU prefix reuse.
+An internal counter increments; every `sync_interval` (default 10) scheduler cycles, calls `broadcast_page_table()` once (currently commented out in the `Scheduler`, re-enable it to activate true cross-GPU prefix reuse).
 
 #### 3.2.6 Master Failover
 
-`GlobalBlockManager` includes a complete failure detection skeleton, not yet enabled in production paths:
+`GlobalBlockManager` includes failure detection function, not yet enabled:
 
 1. `check_master_health()`: The master refreshes its own `master_heartbeat` timestamp; non-master ranks call `_broadcast_master_heartbeat()` to receive the heartbeat. If `now - heartbeat > heartbeat_timeout` (default 100 s), triggers an election
 2. `_elect_new_master()`: Simplified rotation strategy: `new_master = (old_master + 1) % world_size`
@@ -275,34 +275,25 @@ An internal counter increments; every `sync_interval` (default 10) scheduler cyc
 #### 3.2.7 Block Lifecycle
 
 ```
-                         ┌─────────────────┐
-                         │   FREE (idle)   │
-                         └────────┬────────┘
-                                  │ _commit_alloc / allocate
-                                  ▼
-                         ┌─────────────────┐
-                         │   ALLOCATED     │◄──── ref_count > 0 (shared)
-                         └────────┬────────┘
-                                  │ ref_count → 0
-                                  ▼
-                         ┌─────────────────┐
-                         │   DEALLOCATED   │──► back to FREE
-                         └─────────────────┘
-                                  │
-                    swap_out      │      swap_in
-                    ┌─────────────┼─────────────┐
-                    ▼             │              ▼
-            ┌──────────┐          │       ┌──────────┐
-            │ REMOTE   │          │       │  LOCAL   │
-            │ GPU      │          │       │  RESTORE │
-            └──────────┘          │       └──────────┘
-                                  │
-                        overwrite │
-                                  │
-                                  ▼
-                            ┌──────────┐
-                            │ OVERWRITE│ (discard old data)
-                            └──────────┘
+                    ┌──────────┐
+          allocate  │   FREE   │  deallocate
+       ┌────────────│          │◄───────────┐
+       │            └─────┬────┘            │
+       │                  │                 │
+       │                  │ swap_in         │
+       │                  ▼                 │
+       │            ┌──────────┐            │
+       │ ++ref > 0  │  ALLOC   │ --ref <= 0 │
+       └───────────►│          │────────────┘
+(prefix hit/reuse)  └─────┬────┘  (seq done/preempted)
+                          │
+                          │ swap_out
+                          │ 
+                          ▼
+                    ┌──────────┐
+                    │  REMOTE  │
+                    │          │
+                    └──────────┘
 ```
 
 ---
@@ -461,16 +452,13 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ### 5.1 Current Status
 
-| Feature                          | Status            | Notes                                                        |
-| -------------------------------- | ----------------- | ------------------------------------------------------------ |
-| Peer-to-peer multi-GPU inference | ✅ Complete        | Both ranks independently schedule, execute, and sample       |
-| Cross-GPU sequence routing       | ✅ Complete        | `route_sequence` operational                                 |
-| Global page table sync           | ❌ Disabled        | `maybe_sync` commented out; ranks have independent page tables |
-| `swap_out`                       | ✅ Triggered       | Logs confirm execution                                       |
-| `swap_in`                        | 🔄 In progress     | End-to-end pending verification                              |
-| Prefix reuse (dedup)             | ❌ Not effective   | Page tables out of sync + remote allocation does not reuse existing blocks |
-| Topology-aware eviction          | ✅ Code ready      | `select_eviction_candidates` implements three-tier strategy  |
-| RadixTree prefix tree            | ❌ Not implemented | Current hash-chain approach sufficient; future optimization  |
+| Feature | Status | Notes |
+| ------- | ------ | ---------------------------------------------- |
+| Multi-GPU async inference | ✅ Done | Multiple ranks independently schedule, execute, and sample |
+| Block-level prefix-aware routing decision | ✅ Done | `route_sequence` implemented |
+| Global page table sync / prefix reuse | 🛠️ In progress | `maybe_sync` temporarily commented out; local page tables are independent and unsynchronized |
+| Hot/cold and topology-aware eviction decision | ✅ Code ready | `select_eviction_candidates` implemented |
+| Cross-GPU block migration primitives | 🛠️ In progress | `swap_out` / `swap_in` pending integration testing |
 
 ### 5.2 Future Work
 
