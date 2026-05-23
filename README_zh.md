@@ -1,6 +1,6 @@
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
 
-基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 构建 | 原型阶段
+基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 构建 | 原型阶段 | [English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
