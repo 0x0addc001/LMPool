@@ -439,11 +439,20 @@ All three fields are included in `__getstate__` / `__setstate__`, ensuring they 
 ### 4.2 Running
 
 ```bash
-# Dual-GPU NVLink test
+# Install uv package manager
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Sync dependencies
+uv sync
+
+# Dual-GPU (NVLink direct-connect partner)：
 CUDA_VISIBLE_DEVICES=0,2 uv run python main.py
 
-# Single-GPU baseline
+# Single-GPU：
 CUDA_VISIBLE_DEVICES=0 uv run python main.py
+
+# Eight-GPU：
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python main.py
 ```
 
 ---
@@ -457,12 +466,14 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 | Multi-GPU async inference | ✅ Done | Multiple ranks independently schedule, execute, and sample |
 | Block-level prefix-aware routing decision | ✅ Done | `route_sequence` implemented |
 | Global page table sync / prefix reuse | 🛠️ In progress | `maybe_sync` temporarily commented out; local page tables are independent and unsynchronized |
-| Hot/cold and topology-aware eviction decision | ✅ Code ready | `select_eviction_candidates` implemented |
+| Hot/cold and topology-aware eviction decision | ✅ Done | `select_eviction_candidates` implemented |
 | Cross-GPU block migration primitives | 🛠️ In progress | `swap_out` / `swap_in` pending integration testing |
+| Benchmarks | ❌ Not implemented | Throughput, latency, prefix hit rate metrics vs. baseline |
+| Tests | ❌ Not implemented | Component unit tests |
 
 ### 5.2 Future Work
 
-1. **Re-enable `maybe_sync()`**: The key missing link—this will allow `lookup_prefix` to find cross-GPU prefix hits
-2. **Verify swap end-to-end**: Construct NCCL send/recv scenarios between two ranks, confirm no deadlocks and data correctness
-3. **Implement prefix block reuse**: Modify `BlockManager.allocate` to accept `BlockLocation` hints, directly reference existing physical blocks instead of reallocating—closing the final gap in prefix reuse
-4. **Construct high-concurrency long-prefix benchmarks**: Quantify cache hit rate and TTFT improvement under shared-prefix scenarios
+1. **Global page table sync & prefix reuse**: Re-enable `maybe_sync()` so `lookup_prefix` can find cross-GPU prefix hits; modify `BlockManager.allocate` to accept a `BlockLocation` hint and directly reference existing remote blocks instead of reallocating.
+2. **Cross-GPU block migration end-to-end integration**: Set up Rank 0 → Rank 1 NCCL send/recv scenarios, verify `swap_out`/`swap_in` are deadlock-free and KV data is intact after transfer.
+3. **Benchmarks**: Build high-concurrency, long-shared-prefix stress scenarios; quantify throughput, TTFT, and prefix hit rate improvements over a single-GPU baseline.
+4. **Tests**: Cover routing decisions (hit / miss / insufficient free blocks), eviction strategy (three-tier fallback), page table sync consistency, and swap primitive correctness.
