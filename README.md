@@ -17,13 +17,13 @@ Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | Prototype Stage | [E
    - 3.6 [KV Transfer](#36-kv-transfer)
    - 3.7 [Sequence](#37-sequence)
 4. [Configuration & Running](#4-configuration--running)
-5. [Current Status & Future Work](#5-current-status--future-work)
+5. [Current State & Future Work](#5-current-state--future-work)
 
 ---
 
 ## 1. Overview
 
-LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on Mini-vLLM's Paged Attention, it adds cross-GPU block-level prefix-aware routing and hot-cold/topo-aware eviction.
+LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on Mini-vLLM's Paged Attention, it adds cross-GPU block-level prefix-topo-aware routing and temporal-topo-aware eviction.
 
 ### 1.1 Problem
 
@@ -41,7 +41,7 @@ Abstract multi-GPU HBM into a unified distributed memory pool:
 
 1. **Logical unification**: `GlobalBlockManager` maintains a cross-GPU global page table recording the physical location of every KV block
 2. **Prefix deduplication**: Block-level hash chains encode prefixes; cross-GPU lookup ensures identical prefixes are stored only once
-3. **Hot-cold/topo awareness**: LRU eviction + topology-prioritized swap (NVLink > PIX > NODE)
+3. **Temporal-topo awareness**: LRU eviction + topology-prioritized swap (NVLink > PIX > NODE)
 4. **Control/data plane separation**: `GlobalScheduler` makes decisions; `kv_transfer` executes NCCL transfers
 
 ---
@@ -49,6 +49,8 @@ Abstract multi-GPU HBM into a unified distributed memory pool:
 ## 2. Architecture
 
 Each GPU process runs an independent `LLMEngine` instance with its own `Scheduler`, `BlockManager`, and `ModelRunner`. `GlobalBlockManager` (authoritative copy on rank 0) and `GlobalScheduler` are layered on top as cross-GPU coordination.
+
+![fig_architecture.png](.\assets\fig_achitecture.png)
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -306,7 +308,7 @@ The local scheduler manages `waiting` and `running` double-ended queues, making 
 
 #### 3.3.1 Prefill Phase
 
-**Remote routing**: For each sequence at the front of `waiting`, if `remote_gpu_id` is not set, calls `global_scheduler.route_sequence(seq)`. If the returned target is a different GPU, pops the sequence from `waiting`, sets its status to `RUNNING`, adds it to `scheduled_sequences` without local block allocation, and calls `gbm.reserve_blocks(target_gpu, seq.num_blocks)` to optimistically decrement the target GPU's free count. Actual block allocation happens on the target rank.
+**Remote routing**: For each sequence at the front of `waiting`, if `remote_gpu_id` is not set, calls `global_scheduler.route_sequence(seq)`. If the returned target is a different GPU, pops the sequence from `waiting`, sets its state to `RUNNING`, adds it to `scheduled_sequences` without local block allocation, and calls `gbm.reserve_blocks(target_gpu, seq.num_blocks)` to optimistically decrement the target GPU's free count. Actual block allocation happens on the target rank.
 
 **Swap-assisted allocation**: If a locally-routed sequence cannot be allocated due to insufficient free blocks, calls `block_manager.allocate_with_swap(seq)`, which internally triggers `gbm.select_eviction_candidates` and evicts cold blocks to free up space. If this also fails, the prefill loop breaks and the sequence remains in `waiting`.
 
@@ -457,14 +459,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python main.py
 
 ---
 
-## 5. Current Status & Future Work
+## 5. Current State & Future Work
 
-### 5.1 Current Status
+### 5.1 Current State
 
-| Feature | Status | Notes |
+| Feature | State | Notes |
 | ------- | ------ | ---------------------------------------------- |
 | Multi-GPU async inference | ✅ Done | Multiple ranks independently schedule, execute, and sample |
-| Block-level prefix-aware routing decision | ✅ Done | `route_sequence` implemented |
+| Block-level prefix-topo-aware routing decision | ✅ Done | `route_sequence` implemented |
 | Global page table sync / prefix reuse | 🛠️ In progress | `maybe_sync` temporarily commented out; local page tables are independent and unsynchronized |
 | Hot/cold and topology-aware eviction decision | ✅ Done | `select_eviction_candidates` implemented |
 | Cross-GPU block migration primitives | 🛠️ In progress | `swap_out` / `swap_in` pending integration testing |

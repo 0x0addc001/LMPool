@@ -23,7 +23,7 @@
 
 ## 1. 概述
 
-LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池，它在 Mini-vLLM 的 Paged Attention 基础上，扩展了跨 GPU 的块级前缀感知路由和冷热/拓扑感知驱逐。
+LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池，它在 Mini-vLLM 的 Paged Attention 基础上，扩展了跨 GPU 的块级前缀-拓扑感知路由和时序-拓扑感知驱逐。
 
 ### 1.1 问题
 
@@ -41,7 +41,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 1. **逻辑统一**：`GlobalBlockManager` 维护跨 GPU 的全局页表，记录每个 KV 块的物理位置
 2. **前缀去重**：块级 hash 链编码前缀，跨 GPU 查重，相同前缀只存一份
-3. **冷热/拓扑感知**：LRU 驱逐 + 拓扑优先的 swap（NVLink > PIX > NODE）
+3. **时序-拓扑感知**：LRU 驱逐 + 拓扑优先的 swap（NVLink > PIX > NODE）
 4. **控制面/数据面分离**：`GlobalScheduler` 做决策，`kv_transfer` 做 NCCL 搬运
 
 ---
@@ -49,6 +49,8 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 ## 2. 架构
 
 每个 GPU 进程运行一个独立的 `LLMEngine` 实例，拥有自己的 `Scheduler`、`BlockManager` 和 `ModelRunner`。`GlobalBlockManager`（权威副本在 rank 0）和 `GlobalScheduler` 作为跨 GPU 协调层叠加在其上。
+
+![fig_architecture.png](.\assets\fig_achitecture.png)
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -184,7 +186,7 @@ hash_k = xxhash64(hash_{k-1}.to_bytes(8) + tokens[k*block_size : (k+1)*block_siz
 
 `BlockManager.allocate(seq)` 驱动这一过程：遍历新序列的所有块，计算链式 hash，检查本地 `hash_to_block_id` 是否命中——命中则复用（`ref_count++` 并累加 `seq.num_cached_tokens`），未命中则分配新块。最终通过 `gbm._commit_alloc` 将最后一个完整块的 hash 注册到全局。
 
-##### 3.2.2.2 冷热/拓扑感知分配
+##### 3.2.2.2 时序-拓扑感知分配
 
 当本地空闲块不足时，调用 `BlockManager.allocate_with_swap(seq)` 而非直接 `allocate`：
 
@@ -196,7 +198,7 @@ hash_k = xxhash64(hash_{k-1}.to_bytes(8) + tokens[k*block_size : (k+1)*block_siz
 
 Decode 阶段的对应入口为 `append_with_swap(seq)`，逻辑相同但每次只需腾出 1 个块。
 
-#### 3.2.3 冷热/拓扑感知驱逐（`select_eviction_candidates`）
+#### 3.2.3 时序-拓扑感知驱逐（`select_eviction_candidates`）
 
 `select_eviction_candidates(gpu_id, num_blocks) → List[Tuple[int, int]]` 以三级递进策略为每个冷块找到 swap 目标：
 
@@ -472,7 +474,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python main.py
 | 多 GPU 异步推理 | ✅ 已完成     | 多个 rank 独立调度、执行、采样                 |
 | 块级前缀感知路由决策  | ✅ 已完成     | `route_sequence` 已实现                     |
 | 全局页表同步/前缀复用| 🛠️ 进行中 | `maybe_sync` 暂时注释，本地页表独立未同步     |
-| 冷热/拓扑感知驱逐决策 | ✅ 已完成 | `select_eviction_candidates` 已实现      |
+| 时序-拓扑感知驱逐决策 | ✅ 已完成 | `select_eviction_candidates` 已实现      |
 | 跨 GPU 块迁移原语| 🛠️ 进行中 | `swap_out`/`swap_in` 待联调                    |
 | Benchmarks | ❌ 未实现 | 吞吐量、延迟、前缀命中率等指标，与基线对比 |
 | Tests | ❌ 未实现 | 各组件单元测试 |
