@@ -50,7 +50,7 @@ Abstract multi-GPU HBM into a unified distributed memory pool:
 
 Each GPU process runs an independent `LLMEngine` instance with its own `Scheduler`, `BlockManager`, and `ModelRunner`. `GlobalBlockManager` (authoritative copy on rank 0) and `GlobalScheduler` are layered on top as cross-GPU coordination.
 
-![fig_architecture.png](.\assets\fig_achitecture.png)
+![fig_architecture.png](/assets/fig_architecture.png)
 
 ```
 ┌──────────────────────────────────────────────────────┐

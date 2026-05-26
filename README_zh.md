@@ -50,7 +50,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 每个 GPU 进程运行一个独立的 `LLMEngine` 实例，拥有自己的 `Scheduler`、`BlockManager` 和 `ModelRunner`。`GlobalBlockManager`（权威副本在 rank 0）和 `GlobalScheduler` 作为跨 GPU 协调层叠加在其上。
 
-![fig_architecture.png](.\assets\fig_achitecture.png)
+![fig_architecture.png](/assets/fig_architecture.png)
 
 ```
 ┌──────────────────────────────────────────────────────┐
