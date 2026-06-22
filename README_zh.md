@@ -247,7 +247,7 @@ ordered.extend(other_socket)
 `lookup_prefix(prefix_hash) → List[BlockLocation]`
 
 1. 若 `prefix_hash` 不在 `global_page_table` 中，直接返回 `[]`
-2. 取出所有匹配的 `BlockLocation`，按 NVLink 亲和性打分排序：NVLink 伙伴上的块得分 2.0，同 Socket 得分 1.5，其他得分 1.0，分数越高排越前
+2. 取出所有匹配的 `BlockLocation`，按 NVLink 亲和性打分排序：NVLink 直连上的块得分 2.0，同 Socket 得分 1.5，其他得分 1.0，分数越高排越前
 3. 返回排序后的列表供路由器直接取最优选项
 
 注意：`lookup_prefix` 的排序权重是从**调用者**（当前 rank）视角衡量目标 GPU 的远近，与驱逐时的目标排序方向相同但基准不同。
@@ -472,7 +472,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python main.py
 | 功能              | 状态       | 说明                                        |
 | ----------------- | ---------- | ------------------------------------------ |
 | 多 GPU 异步推理 | ✅ 已完成     | 多个 rank 独立调度、执行、采样                 |
-| 块级前缀感知路由决策  | ✅ 已完成     | `route_sequence` 已实现                     |
+| 块级前缀-拓扑感知路由决策 | ✅ 已完成     | `route_sequence` 已实现                     |
 | 全局页表同步/前缀复用| 🛠️ 进行中 | `maybe_sync` 暂时注释，本地页表独立未同步     |
 | 时序-拓扑感知驱逐决策 | ✅ 已完成 | `select_eviction_candidates` 已实现      |
 | 跨 GPU 块迁移原语| 🛠️ 进行中 | `swap_out`/`swap_in` 待联调                    |
