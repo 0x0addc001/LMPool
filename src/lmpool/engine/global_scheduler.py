@@ -77,7 +77,8 @@ class GlobalScheduler:
         num_tokens: int,
         num_blocks: int,
         prefix_hash: Optional[int],
-    ) -> int:
+        return_info: bool = False,
+    ) -> int | tuple[int, dict]:
         """
         Route using metadata only.
 
@@ -88,16 +89,28 @@ class GlobalScheduler:
         rank = requester_rank
         candidates = self._candidate_gpus(rank)
         free_snapshot = {gpu_id: self.gbm.get_free_blocks_count(gpu_id) for gpu_id in candidates}
+        route_info = {
+            "requester_rank": rank,
+            "seq_id": seq_id,
+            "num_tokens": num_tokens,
+            "num_blocks": num_blocks,
+            "prefix_hash": prefix_hash,
+            "free_snapshot": free_snapshot,
+            "prefix_hit": False,
+            "reason": None,
+        }
 
         if prefix_hash is None:
             # 没有完整的块前缀，只在本地 / NVLink 伙伴之间选空闲更多的 GPU
             target = self._select_best_candidate(rank, candidates)
+            route_info["reason"] = "most_free_no_full_blocks"
+            route_info["target_rank"] = target
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=none free=%s -> GPU %s "
                 "(reason=most_free_no_full_blocks)",
                 seq_id, num_tokens, num_blocks, free_snapshot, target,
             )
-            return target
+            return (target, route_info) if return_info else target
 
         # 2. 查询全局前缀命中
         hits = self.gbm.lookup_prefix(prefix_hash, requester_rank=rank)
@@ -106,12 +119,14 @@ class GlobalScheduler:
         if not hits:
             # 没有命中任何 GPU，只在本地 / NVLink 伙伴之间选空闲更多的 GPU
             target = self._select_best_candidate(rank, candidates)
+            route_info["reason"] = "most_free_no_prefix_hit"
+            route_info["target_rank"] = target
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits={} free=%s -> GPU %s "
                 "(reason=most_free_no_prefix_hit)",
                 seq_id, num_tokens, num_blocks, prefix_hash, free_snapshot, target,
             )
-            return target
+            return (target, route_info) if return_info else target
 
         # 3. 按 GPU 聚合命中块数
         gpu_hit_count: dict[int, int] = {}
@@ -143,6 +158,11 @@ class GlobalScheduler:
                 failed_gpus.append((gpu_id, score, hit_count))
 
         if best_score >= 0:
+            route_info["prefix_hit"] = True
+            route_info["reason"] = "prefix_hit"
+            route_info["target_rank"] = best_gpu
+            route_info["hit_summary"] = hit_summary
+            route_info["scores"] = self._score_summary(rank, gpu_hit_count)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s scores=%s "
                 "-> GPU %s (reason=prefix_hit, score=%.1f, target_free=%s/%s)",
@@ -158,11 +178,16 @@ class GlobalScheduler:
                 self.gbm.get_free_blocks_count(best_gpu),
                 num_blocks,
             )
-            return best_gpu
+            return (best_gpu, route_info) if return_info else best_gpu
 
         if failed_gpus:
             failed_gpus.sort(key=lambda x: x[1], reverse=True)
             target = failed_gpus[0][0]
+            route_info["prefix_hit"] = True
+            route_info["reason"] = "prefix_hit_needs_rebalance"
+            route_info["target_rank"] = target
+            route_info["hit_summary"] = hit_summary
+            route_info["failed_gpus"] = [(g, s) for g, s, _ in failed_gpus]
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s failed=%s "
                 "-> GPU %s (reason=prefix_hit_needs_rebalance)",
@@ -175,16 +200,18 @@ class GlobalScheduler:
                 [(g, s) for g, s, _ in failed_gpus],
                 target,
             )
-            return target
+            return (target, route_info) if return_info else target
 
         # 兜底：只在本地 / NVLink 伙伴之间选一个空闲更多的 GPU
         target = self._select_best_candidate(rank, candidates)
+        route_info["reason"] = "fallback_most_free"
+        route_info["target_rank"] = target
         logger.info(
             "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s -> GPU %s "
             "(reason=fallback_most_free)",
             seq_id, num_tokens, num_blocks, prefix_hash, hit_summary, free_snapshot, target,
         )
-        return target
+        return (target, route_info) if return_info else target
 
     def _free_snapshot(self, world_size: int) -> dict[int, int]:
         return {

@@ -40,7 +40,7 @@ class ControlPlaneClient:
         self._last_worker_heartbeat = 0.0
         self._control_down_reported = False
 
-    def route_sequence(self, seq: Sequence) -> int:
+    def route_sequence(self, seq: Sequence, return_meta: bool = False) -> int | dict:
         request_id = uuid.uuid4().hex
         prefix_hash = self._compute_prefix_hash(seq)
         self.request_queue.put({
@@ -61,6 +61,11 @@ class ControlPlaneClient:
                 self._stashed_messages.append(msg)
                 continue
             if msg.get("type") == "route_response":
+                if return_meta:
+                    return {
+                        "target_rank": msg["target_rank"],
+                        "route_info": msg.get("route_info", {}),
+                    }
                 return msg["target_rank"]
             if msg.get("type") == "error":
                 raise RuntimeError(msg.get("error", "control plane request failed"))
@@ -322,12 +327,18 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     num_tokens=msg["num_tokens"],
                     num_blocks=msg["num_blocks"],
                     prefix_hash=msg["prefix_hash"],
+                    return_info=True,
                 )
+                if isinstance(target_rank, tuple):
+                    target_rank, route_info = target_rank
+                else:
+                    route_info = {}
                 gbm.reserve_blocks(target_rank, msg["num_blocks"])
                 response_queues[msg["reply_rank"]].put({
                     "type": "route_response",
                     "request_id": msg["request_id"],
                     "target_rank": target_rank,
+                    "route_info": route_info,
                 })
             except Exception as exc:
                 response_queues[msg["reply_rank"]].put({
