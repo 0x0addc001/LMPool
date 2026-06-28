@@ -1,6 +1,6 @@
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
 
-基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.md) | [简体中文](./README_zh.md)
+[English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
@@ -18,7 +18,7 @@
 
 ## 1. 概述
 
-LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池。它在 Mini-vLLM 的 Paged Attention 基础上，扩展了跨 GPU 的块级前缀感知路由和基于 NVLink 的驱逐 / swap 编排。
+LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池。它在 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 Paged Attention 基础上，扩展了跨 GPU 的路由和的驱逐。
 
 ### 1.1 问题
 

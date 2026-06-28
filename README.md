@@ -1,6 +1,6 @@
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
-Based on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.md) | [简体中文](./README_zh.md)
+[English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
@@ -18,7 +18,7 @@ Based on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.m
 
 ## 1. Overview
 
-LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on Mini-vLLM's Paged Attention, it adds cross-GPU block-level prefix-aware routing and NVLink-aware eviction / swap planning.
+LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)'s Paged Attention, it adds cross-GPU block-level prefix-aware routing and NVLink-aware eviction / swap planning.
 
 ### 1.1 Problem
 
