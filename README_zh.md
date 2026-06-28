@@ -1,6 +1,6 @@
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
 
-基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 构建 | [English](./README.md) | [简体中文](./README_zh.md)
+基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
@@ -192,7 +192,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 | `gpu_memory_utilization` | `float` | 可用 GPU 显存比例 |
 | `heartbeat_interval` | `float` | 控制面与数据面的心跳周期 |
 | `heartbeat_timeout` | `float` | 控制面 / worker 存活检测超时 |
-| `nvlink_topo.pairs` | `List[Tuple[int, int]]` | NVLink 直连 GPU 对 |
+| `nvlink_topo.pairs` | `List[Tuple[int, int]]` | 可选的 NVLink 直连 GPU 对；如果不配置，代码会尽量从 `nvidia-smi topo -m` 自动解析 |
 
 ### 5.2 运行
 
@@ -247,3 +247,4 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 未来工作：
 
 1. 继续扩展共享前缀基准测试到更长 trace 和更复杂负载。
+2. 继续更新 README

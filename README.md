@@ -1,6 +1,6 @@
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
-Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.md) | [简体中文](./README_zh.md)
+Based on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
@@ -192,7 +192,7 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 | `gpu_memory_utilization` | `float` | Fraction of GPU memory usable |
 | `heartbeat_interval` | `float` | Heartbeat period between control and data planes |
 | `heartbeat_timeout` | `float` | Liveness timeout for control / worker detection |
-| `nvlink_topo.pairs` | `List[Tuple[int, int]]` | NVLink direct-connect GPU pairs |
+| `nvlink_topo.pairs` | `List[Tuple[int, int]]` | Optional NVLink direct-connect GPU pairs; if omitted, the code best-effort parses `nvidia-smi topo -m` |
 
 ### 5.2 Running
 
@@ -240,12 +240,11 @@ See `benchmarks/README.md` for usage.
 | --- | --- | --- |
 | Multi-GPU async inference | Done | Multiple ranks independently schedule, execute, and sample |
 | Control-plane routing | Done | `route_sequence_meta` is implemented |
-| Global page table sync / prefix reuse | In progress | Worker snapshots are synchronized to the control plane; periodic broadcast remains a hook |
 | NVLink-aware eviction decision | Done | `select_eviction_candidates` is implemented |
-| Cross-GPU block migration primitives | In progress | `swap_out` / `swap_in` are integrated and still being tuned |
 | Benchmarks | Done | Shared-prefix benchmark with baseline comparisons |
 | Tests | Done | Module-level unit tests and NCCL integration test |
 
 Future work:
 
 1. Expand benchmarks to longer traces and broader workloads.
+2. Countinue to update README
