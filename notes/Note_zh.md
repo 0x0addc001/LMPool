@@ -50,7 +50,6 @@ flowchart TD
 flowchart LR
     subgraph Launcher["LLMEngine"]
         LE[LLMEngine]
-        CPC[ControlPlaneClient]
     end
 
     subgraph Control["控制面进程"]
@@ -59,15 +58,14 @@ flowchart LR
         GBM[GlobalBlockManager]
     end
 
-    subgraph Worker["DataPlaneProcess（每个 rank 一个实例）"]
+    subgraph Worker["数据面进程（每个 rank 一个实例）"]
         DP[data_plane_process]
         S[Scheduler]
         BM[BlockManager]
         MR[ModelRunner]
     end
 
-    LE --> CPC
-    CPC <--> CP
+    LE --> CP
     CP --> GS
     GS --> GBM
     DP --> S

@@ -1,6 +1,6 @@
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
-Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | Prototype stage | [English](./README.md) | [简体中文](./README_zh.md)
+Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) | [English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
@@ -47,6 +47,8 @@ The implementation separates orchestration from execution:
 - `data_plane_process`: per-rank worker process
 
 Each worker owns a local `Scheduler`, `BlockManager`, and `ModelRunner`. The control plane owns the authoritative `GlobalScheduler` and `GlobalBlockManager` state for routing and rebalance planning.
+
+![fig_architecture.png](/assets/fig_architecture.png)
 
 ---
 
@@ -113,9 +115,8 @@ Topology weights in the current routing policy are:
 
 | Relationship | Weight |
 | --- | --- |
-| Same GPU | 3.0 |
+| Same GPU | 2.0 |
 | NVLink partner | 1.0 |
-| Any other GPU | 0.0 |
 
 ### 4.5 Global Block Manager
 
@@ -247,8 +248,4 @@ See `benchmarks/README.md` for usage.
 
 Future work:
 
-1. Decide whether `maybe_sync()` should remain as a coherency optimization or be removed entirely.
-2. Extend `BlockManager.allocate` with a `BlockLocation` hint if true remote prefix aliasing is required.
-3. Expand benchmarks to longer traces and broader workloads.
-4. Add stronger failure handling if full HA becomes a requirement.
-
+1. Expand benchmarks to longer traces and broader workloads.

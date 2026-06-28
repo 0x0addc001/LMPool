@@ -50,7 +50,6 @@ flowchart TD
 flowchart LR
     subgraph Launcher["LLMEngine"]
         LE[LLMEngine]
-        CPC[ControlPlaneClient]
     end
 
     subgraph Control["Control Plane Process"]
@@ -66,8 +65,7 @@ flowchart LR
         MR[ModelRunner]
     end
 
-    LE --> CPC
-    CPC <--> CP
+    LE --> CP
     CP --> GS
     GS --> GBM
     DP --> S

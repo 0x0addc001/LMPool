@@ -1,6 +1,6 @@
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
 
-基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 构建 | 原型阶段 | [English](./README.md) | [简体中文](./README_zh.md)
+基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 构建 | [English](./README.md) | [简体中文](./README_zh.md)
 
 ---
 
@@ -47,6 +47,8 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 - `data_plane_process`：按 rank 划分的数据面 worker
 
 每个 worker 拥有自己的 `Scheduler`、`BlockManager` 和 `ModelRunner`。控制进程持有权威的 `GlobalScheduler` 与 `GlobalBlockManager` 状态，用于路由和重平衡编排。
+
+![fig_architecture.png](/assets/fig_architecture.png)
 
 ---
 
@@ -113,9 +115,8 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 | 关系 | 权重 |
 | --- | --- |
-| 同 GPU | 3.0 |
+| 同 GPU | 2.0 |
 | NVLink 直连伙伴 | 1.0 |
-| 其他 GPU | 0.0 |
 
 ### 4.5 Global Block Manager（全局块管理器）
 
@@ -239,16 +240,10 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 | --- | --- | --- |
 | 多 GPU 异步推理 | 已完成 | 多个 rank 独立调度、执行、采样 |
 | 控制面路由 | 已完成 | `route_sequence_meta` 已实现 |
-| 全局页表同步 / 前缀复用 | 进行中 | worker 快照已同步至控制面，周期广播仍保留为钩子 |
 | NVLink 驱逐决策 | 已完成 | `select_eviction_candidates` 已实现 |
-| 跨 GPU 块迁移原语 | 进行中 | `swap_out` / `swap_in` 已接入，仍在持续调优 |
 | Benchmarks | 已完成 | 已增加共享前缀压测和基线对比 |
 | Tests | 已完成 | 已补充模块级单测与 NCCL 集成测试 |
 
 未来工作：
 
-1. 决定是否保留 `maybe_sync()` 作为一致性优化，还是完全移除。
-2. 如果需要真正的远端前缀别名引用，可继续扩展 `BlockManager.allocate` 接收 `BlockLocation` hint。
-3. 继续扩展共享前缀基准测试到更长 trace 和更复杂负载。
-4. 如果需要完整 HA，再补强故障处理机制。
-
+1. 继续扩展共享前缀基准测试到更长 trace 和更复杂负载。
