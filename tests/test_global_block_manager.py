@@ -1,4 +1,8 @@
-from lmpool.engine.global_block_manager import BlockLocation, GlobalBlockManager
+from lmpool.engine.global_block_manager import (
+    BlockLocation,
+    GlobalBlockManager,
+    detect_nvlink_pairs_from_nvidia_smi,
+)
 
 
 def test_lookup_prefix_prefers_nvlink_partner():
@@ -97,3 +101,27 @@ def test_record_block_transfer_moves_location():
 
     assert gbm.get_block_location(555)[0].gpu_id == 1
     assert gbm.get_block_hash(1, 3) == 555
+
+
+def test_detect_nvlink_pairs_from_nvidia_smi_parses_topology(monkeypatch):
+    topo = """
+        GPU0    GPU1    CPU Affinity
+        GPU0     X      NV1     0-15
+        GPU1    NV1      X      0-15
+    """
+
+    def fake_check_output(*args, **kwargs):
+        return topo
+
+    monkeypatch.setattr("lmpool.engine.global_block_manager.subprocess.check_output", fake_check_output)
+
+    assert detect_nvlink_pairs_from_nvidia_smi(2) == [(0, 1)]
+
+
+def test_detect_nvlink_pairs_from_nvidia_smi_returns_empty_on_failure(monkeypatch):
+    def fake_check_output(*args, **kwargs):
+        raise RuntimeError("missing nvidia-smi")
+
+    monkeypatch.setattr("lmpool.engine.global_block_manager.subprocess.check_output", fake_check_output)
+
+    assert detect_nvlink_pairs_from_nvidia_smi(2) == []

@@ -9,6 +9,7 @@
 """
 
 import logging
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -32,6 +33,70 @@ class BlockLocation:
 # ============================================================================
 # 全局块管理器
 # ============================================================================
+
+
+def detect_nvlink_pairs_from_nvidia_smi(world_size: int) -> List[Tuple[int, int]]:
+    """
+    Best-effort NVLink topology detection from `nvidia-smi topo -m`.
+
+    Returns logical GPU index pairs in the current process ordering. If the
+    topology cannot be parsed, returns an empty list.
+    """
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "topo", "-m"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    header = None
+    rows: list[list[str]] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if "CPU Affinity" in stripped and header is None:
+            cols = stripped.split()
+            header = cols
+        elif stripped.startswith("GPU") and "CPU Affinity" not in stripped:
+            cols = stripped.split()
+            rows.append(cols)
+
+    if not header or not rows:
+        return []
+
+    gpu_cols = [col for col in header if col.startswith("GPU")]
+    if len(gpu_cols) < 2:
+        return []
+
+    def parse_gpu_index(token: str) -> Optional[int]:
+        if not token.startswith("GPU"):
+            return None
+        try:
+            return int(token[3:])
+        except ValueError:
+            return None
+
+    pairs: set[Tuple[int, int]] = set()
+    for row in rows:
+        if not row:
+            continue
+        src = parse_gpu_index(row[0])
+        if src is None or src >= world_size:
+            continue
+        for idx, cell in enumerate(row[1 : 1 + len(gpu_cols)]):
+            dst = idx
+            if dst >= world_size or src >= dst:
+                continue
+            cell = cell.upper()
+            if cell in {"NVL", "NVLINK", "NV1", "NV2"} or "NV" in cell:
+                pairs.add((src, dst))
+    return sorted(pairs)
+
 
 class GlobalBlockManager:
     """
@@ -71,6 +136,8 @@ class GlobalBlockManager:
         self.master_rank = master_rank
 
         # ---------- 拓扑信息 ----------
+        if nvlink_pairs is None:
+            nvlink_pairs = detect_nvlink_pairs_from_nvidia_smi(world_size)
         self.nvlink_pairs = set(nvlink_pairs or [])
 
         # 建立 GPU -> NVLink 伙伴的快速查找
@@ -123,9 +190,7 @@ class GlobalBlockManager:
                     del self.global_page_table[old_hash]
 
         self.block_hash[gpu_id] = dict(block_hashes)
-        self.block_access_time[gpu_id] = {
-            block_id: now for block_id in block_hashes
-        }
+        self.block_access_time[gpu_id] = {block_id: now for block_id in block_hashes}
 
         for block_id, block_hash in block_hashes.items():
             if block_hash == -1:
@@ -250,9 +315,9 @@ class GlobalBlockManager:
             self.free_blocks_per_gpu[gpu_id] -= 1
             self.block_access_time[gpu_id][bid] = now
             self.block_hash[gpu_id][bid] = h
-            if h not in self.global_page_table:
-                self.global_page_table[h] = []
-            self.global_page_table[h].append(BlockLocation(gpu_id, bid, h, now))
+            self.global_page_table.setdefault(h, []).append(
+                BlockLocation(gpu_id, bid, h, now)
+            )
 
     # ------------------------------------------------------------------
     # 释放
@@ -327,17 +392,16 @@ class GlobalBlockManager:
                 # 伙伴 GPU 都没空闲块：尝试递归驱逐伙伴上的冷块
                 target = target_order[0]  # 拓扑最近的目标
                 victim_block = self._select_remote_victim(target)
-                if victim_block is not None:
-                    self.block_access_time[target].pop(victim_block, None)
-                    h = self.block_hash[target].pop(victim_block, None)
-                    if h is not None and h in self.global_page_table:
-                        self.global_page_table[h] = [
-                            loc for loc in self.global_page_table[h]
-                            if loc.block_id != victim_block
-                        ]
-                    target_free[target] += 1
-                else:
+                if victim_block is None:
                     return []
+                self.block_access_time[target].pop(victim_block, None)
+                h = self.block_hash[target].pop(victim_block, None)
+                if h is not None and h in self.global_page_table:
+                    self.global_page_table[h] = [
+                        loc for loc in self.global_page_table[h]
+                        if loc.block_id != victim_block
+                    ]
+                target_free[target] += 1
                 candidates.append((block_id, target))
 
         return candidates
@@ -391,13 +455,9 @@ class GlobalBlockManager:
         self.block_access_time[dst_gpu][new_block_id] = now
         if h is not None:
             self.block_hash[dst_gpu][new_block_id] = h
-            if h not in self.global_page_table:
-                self.global_page_table[h] = []
-            self.global_page_table[h].append(BlockLocation(dst_gpu, new_block_id, h, now))
-
-    # ------------------------------------------------------------------
-    # 便利方法
-    # ------------------------------------------------------------------
+            self.global_page_table.setdefault(h, []).append(
+                BlockLocation(dst_gpu, new_block_id, h, now)
+            )
 
     def get_block_hash(self, gpu_id: int, block_id: int) -> Optional[int]:
         """获取指定块的内容 hash"""

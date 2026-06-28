@@ -247,4 +247,4 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 未来工作：
 
 1. 继续扩展共享前缀基准测试到更长 trace 和更复杂负载。
-2. 继续更新 README
+2. 继续更新 README 和补充注释

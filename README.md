@@ -247,4 +247,4 @@ See `benchmarks/README.md` for usage.
 Future work:
 
 1. Expand benchmarks to longer traces and broader workloads.
-2. Countinue to update README
+2. Countinue to update README and comments

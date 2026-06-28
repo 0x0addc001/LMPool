@@ -222,7 +222,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         world_size=world_size,
         num_blocks_per_gpu=config["max_cached_blocks"],
         master_rank=-1,
-        nvlink_pairs=config.get("nvlink_topo", {}).get("pairs", []),
+        nvlink_pairs=config.get("nvlink_topo", {}).get("pairs"),
     )
     scheduler = GlobalScheduler(gbm=gbm, block_manager=None)
     logger.info("control plane process started")

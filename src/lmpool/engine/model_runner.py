@@ -60,7 +60,7 @@ class ModelRunner:
                 rank=rank,
                 world_size=self.world_size,
                 num_blocks_per_gpu=config['max_cached_blocks'],
-                nvlink_pairs=config.get('nvlink_topo', {}).get('pairs', []),
+                nvlink_pairs=config.get('nvlink_topo', {}).get('pairs'),
             )
         else:
             self.gbm = None

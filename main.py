@@ -64,7 +64,7 @@ config = {
     'swap_threshold': 0.85,                 # GPU 显存使用率阈值，超此值触发 swap
     'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）
     'nvlink_topo': {                        # NVLink 拓扑信息
-        'pairs': [(0,1)],                   # NVLink 直连 GPU 对（重映射后逻辑ID）
+        'pairs': [(0,1)],                   # NVLink 直连 GPU 对（重映射后逻辑ID），显式配置时覆盖自动探测
     },
     # ---------------------------------------------------------------- #
     # 八卡：

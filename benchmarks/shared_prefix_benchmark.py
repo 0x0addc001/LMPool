@@ -513,11 +513,12 @@ def run_engine_scenario(
     )
 
 
-def make_config(world_size: int, enable_global_pool: bool, nvlink_pairs: list[tuple[int, int]]) -> dict:
+def make_config(world_size: int, enable_global_pool: bool, nvlink_pairs: list[tuple[int, int]] | None) -> dict:
     config = dict(MODEL_CONFIG)
     config["world_size"] = world_size
     config["enable_global_pool"] = enable_global_pool
-    config["nvlink_topo"] = {"pairs": nvlink_pairs}
+    if nvlink_pairs is not None:
+        config["nvlink_topo"] = {"pairs": nvlink_pairs}
     config["use_control_plane_process"] = enable_global_pool
     return config
 
@@ -610,7 +611,7 @@ def main():
     )
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
 
-    baseline_config = make_config(1, False, [])
+    baseline_config = make_config(1, False, None)
     baseline_config["model_name_or_path"] = model_name
     baseline = run_engine_scenario(
         "single-gpu",
@@ -637,7 +638,7 @@ def main():
         goodput_e2e_sla_s,
     )
 
-    routing_config = make_config(2, True, parse_pairs(args.nvlink_pairs))
+    routing_config = make_config(2, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     routing_config["model_name_or_path"] = model_name
     routing_config["max_cached_blocks"] = args.routing_max_cached_blocks
     kv_routing = run_engine_scenario(
@@ -650,7 +651,7 @@ def main():
         goodput_e2e_sla_s=goodput_e2e_sla_s,
     )
 
-    eviction_config = make_config(2, True, parse_pairs(args.nvlink_pairs))
+    eviction_config = make_config(2, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     eviction_config["model_name_or_path"] = model_name
     eviction_config["max_cached_blocks"] = args.eviction_max_cached_blocks
     kv_eviction = run_engine_scenario(
@@ -668,7 +669,7 @@ def main():
         if torch.cuda.device_count() < 2:
             print("pool scenario skipped: need at least 2 CUDA devices")
         else:
-            pool_pairs = parse_pairs(args.nvlink_pairs)
+            pool_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None
             pool_config = make_config(2, True, pool_pairs)
             pool_config["model_name_or_path"] = model_name
             pool_result = run_engine_scenario(
