@@ -138,6 +138,12 @@ def swap_out(
         # 本地传输或单 GPU 场景
         target_blocks = blocks_to_evict  # 同 GPU 内 swap 直接复用
 
+    if len(target_blocks) != num_blocks:
+        raise RuntimeError(
+            f"swap_out negotiated mismatched block counts: "
+            f"src={len(blocks_to_evict)} dst={len(target_blocks)}"
+        )
+
     # 2. 逐层、逐块传输 KV 数据
     for layer_idx in range(num_layers):
         layer_kv = kv_cache[layer_idx] if kv_cache.dim() == 5 else kv_cache
@@ -215,6 +221,12 @@ def swap_in(
         _send_block_list(local_blocks, dst=local_gpu)
     else:
         local_blocks = remote_blocks
+
+    if len(local_blocks) != len(remote_blocks):
+        raise RuntimeError(
+            f"swap_in negotiated mismatched block counts: "
+            f"remote={len(remote_blocks)} local={len(local_blocks)}"
+        )
 
     # 2. 逐层、逐块传输 KV 数据
     for layer_idx in range(num_layers):

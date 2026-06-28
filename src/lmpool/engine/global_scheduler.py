@@ -61,32 +61,55 @@ class GlobalScheduler:
         """
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        free_snapshot = self._free_snapshot(world_size)
-
-        # 1. 计算前缀 hash
         prefix_hash = self._compute_prefix_hash(seq)
+        return self.route_sequence_meta(
+            requester_rank=rank,
+            seq_id=seq.seq_id,
+            num_tokens=seq.num_tokens,
+            num_blocks=seq.num_blocks,
+            prefix_hash=prefix_hash,
+        )
+
+    def route_sequence_meta(
+        self,
+        requester_rank: int,
+        seq_id: int,
+        num_tokens: int,
+        num_blocks: int,
+        prefix_hash: Optional[int],
+    ) -> int:
+        """
+        Route using metadata only.
+
+        This is the control-plane API used by GlobalControlProcess. Prefix hash
+        is computed by the requester because it depends on the local
+        BlockManager hash implementation, but all global state is read from GBM.
+        """
+        rank = requester_rank
+        candidates = self._candidate_gpus(rank)
+        free_snapshot = {gpu_id: self.gbm.get_free_blocks_count(gpu_id) for gpu_id in candidates}
 
         if prefix_hash is None:
-            # 没有完整的块前缀，选择空闲最多的 GPU
-            target = self._select_most_free_gpu(rank, world_size)
+            # 没有完整的块前缀，只在本地 / NVLink 伙伴之间选空闲更多的 GPU
+            target = self._select_best_candidate(rank, candidates)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=none free=%s -> GPU %s "
                 "(reason=most_free_no_full_blocks)",
-                seq.seq_id, seq.num_tokens, seq.num_blocks, free_snapshot, target,
+                seq_id, num_tokens, num_blocks, free_snapshot, target,
             )
             return target
 
         # 2. 查询全局前缀命中
-        hits = self.gbm.lookup_prefix(prefix_hash)
+        hits = self.gbm.lookup_prefix(prefix_hash, requester_rank=rank)
         hit_summary = self._hit_summary(hits)
 
         if not hits:
-            # 没有命中任何 GPU，选择空闲最多的 GPU
-            target = self._select_most_free_gpu(rank, world_size)
+            # 没有命中任何 GPU，只在本地 / NVLink 伙伴之间选空闲更多的 GPU
+            target = self._select_best_candidate(rank, candidates)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits={} free=%s -> GPU %s "
                 "(reason=most_free_no_prefix_hit)",
-                seq.seq_id, seq.num_tokens, seq.num_blocks, prefix_hash, free_snapshot, target,
+                seq_id, num_tokens, num_blocks, prefix_hash, free_snapshot, target,
             )
             return target
 
@@ -97,17 +120,20 @@ class GlobalScheduler:
 
         # 4. 加权打分
         # score = 命中块数 × 拓扑权重
-        # 拓扑权重：同 GPU=3.0, NVLink 伙伴=2.0, 同 Socket=1.5, 跨 Socket=1.0
+        # 拓扑权重：同 GPU=2.0, NVLink 伙伴=1.0, 其他 GPU=0.0
+        # 也就是说：prefix-hit 只在“本地 / NVLink 直连伙伴”之间竞争。
         best_gpu = rank  # 默认本地
         best_score = -1.0
         failed_gpus = []  # 记录空闲不足的命中 GPU
 
         for gpu_id, hit_count in gpu_hit_count.items():
             topo_weight = self._get_topo_weight(rank, gpu_id)
+            if topo_weight <= 0:
+                continue
             score = hit_count * topo_weight
 
             # 检查空闲块是否足够（需要 seq.num_blocks 个块）
-            needed = seq.num_blocks
+            needed = num_blocks
             if self.gbm.get_free_blocks_count(gpu_id) >= needed:
                 if score > best_score:
                     best_score = score
@@ -120,9 +146,9 @@ class GlobalScheduler:
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s scores=%s "
                 "-> GPU %s (reason=prefix_hit, score=%.1f, target_free=%s/%s)",
-                seq.seq_id,
-                seq.num_tokens,
-                seq.num_blocks,
+                seq_id,
+                num_tokens,
+                num_blocks,
                 prefix_hash,
                 hit_summary,
                 free_snapshot,
@@ -130,20 +156,19 @@ class GlobalScheduler:
                 best_gpu,
                 best_score,
                 self.gbm.get_free_blocks_count(best_gpu),
-                seq.num_blocks,
+                num_blocks,
             )
             return best_gpu
 
-        # 5. 命中 GPU 空闲都不够 -> 选择权重最高的，后续 rebalance 会腾空间
         if failed_gpus:
             failed_gpus.sort(key=lambda x: x[1], reverse=True)
             target = failed_gpus[0][0]
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s failed=%s "
                 "-> GPU %s (reason=prefix_hit_needs_rebalance)",
-                seq.seq_id,
-                seq.num_tokens,
-                seq.num_blocks,
+                seq_id,
+                num_tokens,
+                num_blocks,
                 prefix_hash,
                 hit_summary,
                 free_snapshot,
@@ -152,12 +177,12 @@ class GlobalScheduler:
             )
             return target
 
-        # 6. 兜底：本地或空闲最多的 GPU
-        target = self._select_most_free_gpu(rank, world_size)
+        # 兜底：只在本地 / NVLink 伙伴之间选一个空闲更多的 GPU
+        target = self._select_best_candidate(rank, candidates)
         logger.info(
             "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s -> GPU %s "
             "(reason=fallback_most_free)",
-            seq.seq_id, seq.num_tokens, seq.num_blocks, prefix_hash, hit_summary, free_snapshot, target,
+            seq_id, num_tokens, num_blocks, prefix_hash, hit_summary, free_snapshot, target,
         )
         return target
 
@@ -203,26 +228,29 @@ class GlobalScheduler:
     def _get_topo_weight(self, my_rank: int, target_gpu: int) -> float:
         """
         计算拓扑权重
-        - 同 GPU: 3.0
-        - NVLink 直连: 2.0
-        - 同 Socket PCIe: 1.5
-        - 跨 Socket: 1.0
+        - 同 GPU: 2.0
+        - NVLink 直连: 1.0
+        - 其他 GPU: 0.0
         """
         if target_gpu == my_rank:
-            return 3.0
+            return 2.0
         partner = self.gbm._get_nvlink_partner(my_rank)
         if partner is not None and partner == target_gpu:
-            return 2.0
-        same_socket = self.gbm._get_same_socket_gpus(my_rank)
-        if target_gpu in same_socket:
-            return 1.5
-        return 1.0
+            return 1.0
+        return 0.0
 
-    def _select_most_free_gpu(self, my_rank: int, world_size: int) -> int:
-        """选择全局空闲块最多的 GPU，同等条件优先本地"""
+    def _candidate_gpus(self, my_rank: int) -> List[int]:
+        candidates = [my_rank]
+        partner = self.gbm._get_nvlink_partner(my_rank)
+        if partner is not None and partner != my_rank:
+            candidates.append(partner)
+        return candidates
+
+    def _select_best_candidate(self, my_rank: int, candidates: List[int]) -> int:
+        """只在本地 / NVLink 伙伴里选择空闲块最多的 GPU，同等条件优先本地"""
         best_gpu = my_rank
         best_free = self.gbm.get_free_blocks_count(my_rank)
-        for gpu_id in range(world_size):
+        for gpu_id in candidates:
             free = self.gbm.get_free_blocks_count(gpu_id)
             if free > best_free or (free == best_free and gpu_id == my_rank):
                 best_free = free
@@ -232,6 +260,57 @@ class GlobalScheduler:
     # ------------------------------------------------------------------
     # 显存重平衡
     # ------------------------------------------------------------------
+
+    def plan_rebalance(self, gpu_id: int, needed_blocks: int) -> dict | None:
+        """
+        生成一个可执行的 rebalance 计划，但不直接修改控制面的权威状态。
+
+        返回:
+            {
+                "gpu_id": gpu_id,
+                "needed_blocks": needed_blocks,
+                "transfers": [
+                    {
+                        "src_gpu": gpu_id,
+                        "dst_gpu": target_gpu,
+                        "src_blocks": [...],
+                        "hashes": [...],
+                    },
+                    ...
+                ],
+            }
+            或在无法满足时返回 None。
+        """
+        import copy
+
+        gbm_snapshot = copy.deepcopy(self.gbm)
+        candidates = gbm_snapshot.select_eviction_candidates(gpu_id, needed_blocks)
+        if not candidates or len(candidates) < needed_blocks:
+            return None
+
+        actual_candidates = candidates[:needed_blocks]
+        grouped: dict[int, list[int]] = {}
+        for local_block, target_gpu in actual_candidates:
+            grouped.setdefault(target_gpu, []).append(local_block)
+
+        transfers = []
+        for target_gpu, blocks in grouped.items():
+            hashes = []
+            for block_id in blocks:
+                block_hash = self.gbm.get_block_hash(gpu_id, block_id)
+                hashes.append(block_hash if block_hash is not None else -1)
+            transfers.append({
+                "src_gpu": gpu_id,
+                "dst_gpu": target_gpu,
+                "src_blocks": blocks,
+                "hashes": hashes,
+            })
+
+        return {
+            "gpu_id": gpu_id,
+            "needed_blocks": needed_blocks,
+            "transfers": transfers,
+        }
 
     def rebalance(self, gpu_id: int, needed_blocks: int) -> bool:
         """

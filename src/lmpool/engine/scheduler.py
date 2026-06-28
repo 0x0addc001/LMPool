@@ -53,6 +53,12 @@ class Scheduler:
     def _sync_local_state_to_global(self):
         if self.global_scheduler is None:
             return
+        if hasattr(self.global_scheduler, "report_block_state"):
+            self.global_scheduler.report_block_state(
+                len(self.block_manager.free_block_ids),
+                self.block_manager.get_local_block_hashes(),
+            )
+            return
         gbm = self.global_scheduler.gbm
         if gbm is None or not gbm.is_master:
             return
@@ -90,7 +96,7 @@ class Scheduler:
                 elif seq.remote_gpu_id != -1:
                     target_gpu = seq.remote_gpu_id
                 else:
-                    target_gpu = self.global_scheduler.route_sequence(seq)
+                    target_gpu = self.rank
                 seq.remote_gpu_id = target_gpu if target_gpu != self.rank else -1
 
                 # 如果序列路由到其他 GPU，从本地 waiting 移除并发送过去
@@ -116,11 +122,12 @@ class Scheduler:
             can_alloc = self.block_manager.can_allocate(seq)
 
             if not can_alloc:
-                # 本地空闲不足：尝试 swap
+                # 本地空闲不足：优先走控制面 rebalance 计划
                 if self.global_scheduler is not None:
-                    swapped = self.block_manager.allocate_with_swap(seq)
-                    if swapped:
+                    rebalance_success = self.global_scheduler.rebalance(self.rank, seq.num_blocks)
+                    if rebalance_success and self.block_manager.can_allocate(seq):
                         seq = self.waiting.popleft()
+                        self.block_manager.allocate(seq)
                         seq.status = SequenceStatus.RUNNING
                         self.running.append(seq)
                         current_scheduled_tokens += len(seq)
@@ -144,9 +151,6 @@ class Scheduler:
             self._sync_local_state_to_global()
 
         if scheduled_sequences:
-            # # 周期性同步全局页表
-            # if self.global_scheduler is not None:
-            #     self.global_scheduler.gbm.maybe_sync()
             return scheduled_sequences, True
 
         # ================================================================
@@ -196,10 +200,6 @@ class Scheduler:
         # 把已调度的序列重新放回 running 队列末尾（保持轮转顺序）
         if scheduled_sequences:
             self.running.extendleft(reversed(scheduled_sequences))
-
-        # # 周期性同步全局页表
-        # if self.global_scheduler is not None:
-        #     self.global_scheduler.gbm.maybe_sync()
 
         return scheduled_sequences, False
 

@@ -65,7 +65,6 @@ config = {
     'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）
     'nvlink_topo': {                        # NVLink 拓扑信息
         'pairs': [(0,1)],                   # NVLink 直连 GPU 对（重映射后逻辑ID）
-        'sockets': [[0,1]],                 # 同 CPU Socket 分组（重映射后逻辑ID）
     },
     # ---------------------------------------------------------------- #
     # 八卡：
@@ -76,7 +75,6 @@ config = {
     # 'global_page_table_sync_interval': 10,  # 全局页表广播间隔（调度周期数）
     # 'nvlink_topo': {                        # NVLink 拓扑信息
     #     'pairs': [(0,2), (1,3), (4,5), (6,7)],       # NVLink 直连 GPU 对
-    #     'sockets': [[0,1,2,3], [4,5,6,7]],  # 同 CPU Socket 分组
     # },
     # ---------------------------------------------------------------- #
 }

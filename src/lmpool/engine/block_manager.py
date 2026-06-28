@@ -114,12 +114,10 @@ class BlockManager:
                 block.update(h=h, token_ids=token_ids)
                 if h != -1:
                     self.hash_to_block_id[h] = block.block_id
+                    if self.gbm is not None:
+                        rank = dist.get_rank() if dist.is_initialized() else 0
+                        self.gbm._commit_alloc(rank, [block.block_id], [h])
             seq.block_table.append(block.block_id)
-
-        # 注册到全局页表
-        if self.gbm is not None and h != -1:
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            self.gbm._commit_alloc(rank, [block.block_id], [h])
 
     def deallocate(self, seq: Sequence) -> None:
         # update block information
@@ -207,7 +205,8 @@ class BlockManager:
             prefix_hash = self.compute_hash(token_ids, prefix_hash)
 
         # 查询全局页表
-        hits = self.gbm.lookup_prefix(prefix_hash)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        hits = self.gbm.lookup_prefix(prefix_hash, requester_rank=rank)
         if not hits:
             return False, -1
 
@@ -222,7 +221,6 @@ class BlockManager:
             return False, -1
 
         # 选择命中块数最多的 GPU（优先本地的 NVLink 伙伴）
-        rank = dist.get_rank()
         best_gpu = -1
         best_count = 0
 
@@ -233,14 +231,12 @@ class BlockManager:
                 count = count * 3
             elif self.gbm._get_nvlink_partner(rank) == gpu_id:
                 count = count * 2
-            elif gpu_id in self.gbm._get_same_socket_gpus(rank):
-                count = count * 1.5
 
             if count > best_count:
                 best_count = count
                 best_gpu = gpu_id
 
-        if best_gpu <= 0:
+        if best_gpu < 0:
             return False, -1
 
         # 标记序列的远程前缀信息
@@ -345,6 +341,52 @@ class BlockManager:
 
         self.append(seq)
         return True
+
+    def reserve_free_blocks(self, num_blocks: int) -> list[int]:
+        """
+        预留指定数量的空闲块，返回被预留的 block_id 列表。
+
+        这些块会从 free 集合移到 used 集合，但不会立刻绑定到某个
+        Sequence。用于控制平面下的 swap_in 目标块分配。
+        """
+        if len(self.free_block_ids) < num_blocks:
+            raise RuntimeError(
+                f"Not enough free blocks to reserve: need {num_blocks}, "
+                f"have {len(self.free_block_ids)}"
+            )
+        reserved = []
+        for _ in range(num_blocks):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            reserved.append(block_id)
+        return reserved
+
+    def release_blocks(self, block_ids: list[int]) -> None:
+        """
+        释放指定块回空闲池。
+        仅适用于 ref_count == 0 的块。
+        """
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            if block.ref_count != 0:
+                raise RuntimeError(f"Cannot release block {block_id}: ref_count={block.ref_count}")
+            self._deallocate_block(block_id)
+
+    def register_swap_in_blocks(self, block_ids: list[int], hashes: list[int]) -> None:
+        """
+        将已接收的 swap-in 块登记到本地 hash 表。
+
+        这一步不分配新的物理块，只更新 block.hash / hash_to_block_id，
+        便于后续全局页表同步和前缀查找。
+        """
+        if len(block_ids) != len(hashes):
+            raise ValueError("block_ids and hashes must have the same length")
+        for block_id, h in zip(block_ids, hashes):
+            block = self.blocks[block_id]
+            block.hash = h
+            block.token_ids = []
+            if h != -1:
+                self.hash_to_block_id[h] = block_id
 
     def get_local_block_hashes(self) -> dict[int, int]:
         """

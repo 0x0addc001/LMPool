@@ -7,7 +7,7 @@ import torch.distributed as dist
 from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
-from typing import List
+from typing import List, Optional
 
 from lmpool.models.qwen3 import Qwen3ForCausalLM
 from lmpool.models.llama import LlamaForCausalLM
@@ -55,13 +55,12 @@ class ModelRunner:
         # ----------------------------------------------- #
         if gbm is not None:
             self.gbm = gbm
-        elif self.enable_global_pool:
+        elif self.enable_global_pool and not config.get('use_control_plane_process', False):
             self.gbm = GlobalBlockManager(
                 rank=rank,
                 world_size=self.world_size,
                 num_blocks_per_gpu=config['max_cached_blocks'],
                 nvlink_pairs=config.get('nvlink_topo', {}).get('pairs', []),
-                socket_groups=config.get('nvlink_topo', {}).get('sockets', []),
             )
         else:
             self.gbm = None
@@ -665,6 +664,7 @@ class ModelRunner:
         self,
         remote_gpu: int,
         remote_blocks: List[int],
+        local_target_blocks: Optional[List[int]] = None,
     ):
         """
         执行 swap_in：从 remote_gpu 拉取 blocks 到本地
@@ -685,6 +685,7 @@ class ModelRunner:
             num_kv_heads=self.config['num_kv_heads'],
             head_dim=self.config['head_dim'] if 'head_dim' in self.config 
                      else self.config['hidden_size'] // self.config['num_heads'],
+            local_target_blocks=local_target_blocks,
         )
         logger.info(f"execute_swap_in done: remote_blocks={remote_blocks} → local_blocks={local_blocks}")
         return local_blocks
