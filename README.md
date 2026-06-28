@@ -18,7 +18,7 @@
 
 ## 1. Overview
 
-LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)'s Paged Attention, it adds cross-GPU block-level prefix-aware routing and NVLink-aware eviction / swap planning.
+LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)'s Paged Attention, it adds KV Cache-aware cross-GPU routing and swapping.
 
 ### 1.1 Problem
 

@@ -18,7 +18,7 @@
 
 ## 1. 概述
 
-LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池。它在 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 Paged Attention 基础上，扩展了跨 GPU 的路由和的驱逐。
+LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池。它在 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 Paged Attention 基础上，扩展了 KV Cache 感知的跨 GPU 路由和驱逐。
 
 ### 1.1 问题
 
