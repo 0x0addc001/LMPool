@@ -10,9 +10,11 @@
 2. [架构](#2-架构)
 3. [运行逻辑](#3-运行逻辑)
 4. [组件](#4-组件)
-5. [配置与运行](#5-配置与运行)
-6. [Benchmarks](#6-benchmarks)
-7. [当前状态与未来工作](#7-当前状态与未来工作)
+5. [实现](#5-实现)
+6. [配置与运行](#6-配置与运行)
+7. [测试](#7-测试)
+8. [评估](#8-评估)
+9. [当前状态与未来工作](#9-当前状态与未来工作)
 
 ---
 
@@ -180,9 +182,13 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 ---
 
-## 5. 配置与运行
+## 5. [实现](./src/lmpool/README_zh.md)
 
-### 5.1 关键配置项
+---
+
+## 6. 配置与运行
+
+### 6.1 关键配置项
 
 | 项目 | 类型 | 说明 |
 | --- | --- | --- |
@@ -194,7 +200,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 | `heartbeat_timeout` | `float` | 控制面 / worker 存活检测超时 |
 | `nvlink_topo.pairs` | `List[Tuple[int, int]]` | 可选的 NVLink 直连 GPU 对；如果不配置，代码会尽量从 `nvidia-smi topo -m` 自动解析 |
 
-### 5.2 运行
+### 6.2 运行
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -209,7 +215,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ---
 
-## 6. Benchmarks
+## 7. [测试](./tests/README.md)
+
+---
+
+## 8. 评估
 
 `benchmarks/` 下提供共享前缀压测脚本，场景包括：
 
@@ -234,7 +244,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ---
 
-## 7. 当前状态与未来工作
+## 9. 当前状态与未来工作
 
 | 功能 | 状态 | 说明 |
 | --- | --- | --- |

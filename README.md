@@ -10,9 +10,11 @@
 2. [Architecture](#2-architecture)
 3. [Runtime Model](#3-runtime-model)
 4. [Components](#4-components)
-5. [Configuration & Running](#5-configuration--running)
-6. [Benchmarks](#6-benchmarks)
-7. [Current State & Future Work](#7-current-state--future-work)
+5. [Implementation](#5-implementation)
+6. [Configuration & Running](#6-configuration--running)
+7. [Tests](#7-tests)
+8. [Benchmarks](#8-benchmarks)
+9. [Current State & Future Work](#9-current-state--future-work)
 
 ---
 
@@ -180,9 +182,13 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 
 ---
 
-## 5. Configuration & Running
+## 5. [Implementation](./src/lmpool/README.md)
 
-### 5.1 Key Configuration Items
+---
+
+## 6. Configuration & Running
+
+### 6.1 Key Configuration Items
 
 | Item | Type | Description |
 | --- | --- | --- |
@@ -194,7 +200,7 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 | `heartbeat_timeout` | `float` | Liveness timeout for control / worker detection |
 | `nvlink_topo.pairs` | `List[Tuple[int, int]]` | Optional NVLink direct-connect GPU pairs; if omitted, the code best-effort parses `nvidia-smi topo -m` |
 
-### 5.2 Running
+### 6.2 Running
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -209,7 +215,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ---
 
-## 6. Benchmarks
+## 7. [Tests](./tests/README.md)
+
+---
+
+## 8. [Benchmarks](./benchmarks/README.md)
 
 The `benchmarks/` directory includes a shared-prefix workload benchmark with the following scenarios:
 
@@ -234,7 +244,7 @@ See `benchmarks/README.md` for usage.
 
 ---
 
-## 7. Current State & Future Work
+## 9. Current State & Future Work
 
 | Feature | State | Notes |
 | --- | --- | --- |
