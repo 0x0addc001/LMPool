@@ -182,7 +182,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 ---
 
-## 5. [实现](./src/lmpool/README_zh.md)
+## 5. [实现](./src/lmpool/)
 
 ---
 
@@ -215,11 +215,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ---
 
-## 7. [测试](./tests/README.md)
+## 7. [测试](./tests/)
 
 ---
 
-## 8. 评估
+## 8. [评估](./benchmarks/)
 
 `benchmarks/` 下提供共享前缀压测脚本，场景包括：
 

@@ -182,7 +182,7 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 
 ---
 
-## 5. [Implementation](./src/lmpool/README.md)
+## 5. [Implementation](./src/lmpool/)
 
 ---
 
@@ -215,11 +215,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ---
 
-## 7. [Tests](./tests/README.md)
+## 7. [Tests](./tests/)
 
 ---
 
-## 8. [Benchmarks](./benchmarks/README.md)
+## 8. [Benchmarks](./benchmarks/)
 
 The `benchmarks/` directory includes a shared-prefix workload benchmark with the following scenarios:
 
