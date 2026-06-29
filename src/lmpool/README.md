@@ -1,6 +1,6 @@
-# LMPool System Notes
+# LMPool Implementation
 
-This document summarizes the current implementation in a form suitable for a paper draft:
+This document summarizes the current implementation as follows:
 
 - runtime flow
 - component relationships
