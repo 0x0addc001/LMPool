@@ -84,6 +84,21 @@ def test_route_sequence_meta_falls_back_to_most_free_local_or_partner():
     ) == 1
 
 
+def test_route_sequence_meta_from_ingress_rank_uses_real_gpu_candidates():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [1, 3]
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    seq = Sequence([1, 2, 3], block_size=2)
+
+    assert scheduler.route_sequence_meta(
+        requester_rank=-1,
+        seq_id=seq.seq_id,
+        num_tokens=seq.num_tokens,
+        num_blocks=seq.num_blocks,
+        prefix_hash=None,
+    ) == 1
+
+
 def test_plan_rebalance_groups_transfers():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [0, 4]
@@ -96,3 +111,15 @@ def test_plan_rebalance_groups_transfers():
     assert plan["gpu_id"] == 0
     assert plan["needed_blocks"] == 1
     assert plan["transfers"][0]["src_gpu"] == 0
+
+
+def test_plan_rebalance_does_not_use_recursive_target_victims():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_access_time[0] = {i: float(i) for i in range(5)}
+    gbm.block_hash[0] = {i: 100 + i for i in range(5)}
+    gbm.block_access_time[1] = {0: 1.0}
+    gbm.block_hash[1] = {0: 300}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=5) is None

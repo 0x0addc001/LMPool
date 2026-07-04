@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from lmpool.engine.kv_transfer import _allocate_empty_block, _compute_tag, swap_in, swap_out
+from lmpool.engine.kv_transfer import _allocate_empty_block, _compute_tag, _get_layer_kv, swap_in
 
 
 def _find_free_port() -> int:
@@ -34,6 +34,18 @@ def test_kv_transfer_helpers_are_stable():
     assert view.shape == (2, 2, 1, 1)
     assert _compute_tag(3, 4, True) != _compute_tag(3, 4, False)
     assert _compute_tag(3, 4, True) != _compute_tag(4, 4, True)
+
+
+def test_get_layer_kv_accepts_model_runner_cache_layout():
+    k0 = torch.zeros(4, 2, 1, 1)
+    v0 = torch.ones(4, 2, 1, 1)
+    k1 = torch.full((4, 2, 1, 1), 2.0)
+    v1 = torch.full((4, 2, 1, 1), 3.0)
+
+    layer_k, layer_v = _get_layer_kv([(k0, v0), (k1, v1)], 1)
+
+    assert layer_k is k1
+    assert layer_v is v1
 
 
 def _swap_worker(rank: int, world_size: int, port: int, result_queue):
@@ -67,10 +79,10 @@ def _swap_worker(rank: int, world_size: int, port: int, result_queue):
     dist.barrier()
 
     if rank == 0:
-        swap_out(
-            local_gpu=0,
-            blocks_to_evict=[0, 1],
-            target_gpu=1,
+        swap_in(
+            remote_gpu=0,
+            remote_blocks=[0, 1],
+            local_gpu=1,
             kv_cache=kv_cache,
             num_layers=1,
             block_size=block_size,

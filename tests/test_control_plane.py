@@ -63,7 +63,7 @@ def test_route_prefers_nvlink_and_capacity_fallback():
 
 
 def test_rebalance_round_trip_executes_on_source_and_target():
-    config, request_queue, response_queues, thread = _start_control_plane()
+    config, request_queue, response_queues, control_thread = _start_control_plane()
     try:
         client0 = ControlPlaneClient(0, request_queue, response_queues[0])
         client1 = ControlPlaneClient(1, request_queue, response_queues[1])
@@ -87,8 +87,8 @@ def test_rebalance_round_trip_executes_on_source_and_target():
                 client1.pump_async_messages()
                 time.sleep(0.01)
 
-        thread = threading.Thread(target=pump_target, daemon=True)
-        thread.start()
+        pump_thread = threading.Thread(target=pump_target, daemon=True)
+        pump_thread.start()
         try:
             request_queue.put({
                 "type": "block_state",
@@ -107,14 +107,70 @@ def test_rebalance_round_trip_executes_on_source_and_target():
             assert client0.rebalance(0, 1) is True
         finally:
             stop.set()
-            thread.join(timeout=5)
+            pump_thread.join(timeout=5)
 
         ranks = {entry[0] for entry in seen}
         assert ranks == {0, 1}
         assert all(entry[2] == 0 for entry in seen)
         assert any(1 in entry[3] for entry in seen)
     finally:
-        _stop_control_plane(request_queue, thread)
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_rebalance_prepare_failure_does_not_execute_source():
+    config, request_queue, response_queues, control_thread = _start_control_plane()
+    try:
+        client0 = ControlPlaneClient(0, request_queue, response_queues[0])
+        client1 = ControlPlaneClient(1, request_queue, response_queues[1])
+
+        seen = []
+
+        def source_executor(plan):
+            seen.append(("source", plan["_phase"]))
+            return True
+
+        def target_executor(plan):
+            seen.append(("target", plan["_phase"]))
+            if plan["_phase"] == "prepare":
+                return {"success": False, "error": "not enough free blocks"}
+            return {"success": True}
+
+        client0.set_rebalance_executor(source_executor)
+        client1.set_rebalance_executor(target_executor)
+
+        stop = threading.Event()
+
+        def pump_target():
+            while not stop.is_set():
+                client1.pump_async_messages()
+                time.sleep(0.01)
+
+        pump_thread = threading.Thread(target=pump_target, daemon=True)
+        pump_thread.start()
+        try:
+            request_queue.put({
+                "type": "block_state",
+                "rank": 0,
+                "free_blocks": 0,
+                "block_hashes": {i: 100 + i for i in range(5)},
+            })
+            request_queue.put({
+                "type": "block_state",
+                "rank": 1,
+                "free_blocks": 5,
+                "block_hashes": {},
+            })
+            time.sleep(0.2)
+
+            assert client0.rebalance(0, 5) is False
+        finally:
+            stop.set()
+            pump_thread.join(timeout=5)
+
+        assert ("target", "prepare") in seen
+        assert ("source", "execute") not in seen
+    finally:
+        _stop_control_plane(request_queue, control_thread)
 
 
 def test_nvlink_only_block_manager_targets_peer_only():

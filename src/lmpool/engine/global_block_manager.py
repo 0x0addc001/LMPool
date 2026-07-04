@@ -348,14 +348,21 @@ class GlobalBlockManager:
         self,
         gpu_id: int,
         num_blocks: int,
+        allow_recursive: bool = True,
     ) -> List[Tuple[int, int]]:
         """
         从指定 GPU 选择 num_blocks 个 LRU 冷块作为 swap 候选
         
         swap 目标选择策略：
         1. 只考虑 NVLink 直连伙伴作为目标 GPU
-        2. 若伙伴无空闲块，则尝试在伙伴上递归驱逐冷块
-        3. 若伙伴也无块可驱逐，则返回空列表
+        2. 若伙伴无空闲块，allow_recursive=True 时尝试在伙伴上递归驱逐冷块
+        3. 若伙伴也无块可驱逐，或可执行计划禁用递归驱逐，则返回空列表
+
+        注意：
+            当前 data plane 的 rebalance 执行器只支持“源 GPU -> 目标 GPU 空闲块”
+            的直接搬运，尚未实现目标侧 victim block 的二阶段递归驱逐。因此控制面
+            生成可执行计划时应传 allow_recursive=False，避免计划容量超过目标 rank
+            实际可 reserve 的空闲块数。
         
         返回:
             [(local_block_id_to_evict, target_gpu_id), ...]
@@ -390,6 +397,8 @@ class GlobalBlockManager:
                     break
             if not placed:
                 # 伙伴 GPU 都没空闲块：尝试递归驱逐伙伴上的冷块
+                if not allow_recursive:
+                    return []
                 target = target_order[0]  # 拓扑最近的目标
                 victim_block = self._select_remote_victim(target)
                 if victim_block is None:

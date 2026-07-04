@@ -259,6 +259,9 @@ class GlobalScheduler:
         - NVLink 直连: 1.0
         - 其他 GPU: 0.0
         """
+        if my_rank < 0:
+            # launcher / ingress 侧没有“本地 GPU”概念；此时只做全局 prefix / free-space 决策
+            return 1.0
         if target_gpu == my_rank:
             return 2.0
         partner = self.gbm._get_nvlink_partner(my_rank)
@@ -267,6 +270,8 @@ class GlobalScheduler:
         return 0.0
 
     def _candidate_gpus(self, my_rank: int) -> List[int]:
+        if my_rank < 0:
+            return list(range(self.gbm.world_size))
         candidates = [my_rank]
         partner = self.gbm._get_nvlink_partner(my_rank)
         if partner is not None and partner != my_rank:
@@ -275,11 +280,11 @@ class GlobalScheduler:
 
     def _select_best_candidate(self, my_rank: int, candidates: List[int]) -> int:
         """只在本地 / NVLink 伙伴里选择空闲块最多的 GPU，同等条件优先本地"""
-        best_gpu = my_rank
-        best_free = self.gbm.get_free_blocks_count(my_rank)
+        best_gpu = candidates[0]
+        best_free = self.gbm.get_free_blocks_count(best_gpu)
         for gpu_id in candidates:
             free = self.gbm.get_free_blocks_count(gpu_id)
-            if free > best_free or (free == best_free and gpu_id == my_rank):
+            if free > best_free or (free == best_free and gpu_id == my_rank and my_rank >= 0):
                 best_free = free
                 best_gpu = gpu_id
         return best_gpu
@@ -311,7 +316,11 @@ class GlobalScheduler:
         import copy
 
         gbm_snapshot = copy.deepcopy(self.gbm)
-        candidates = gbm_snapshot.select_eviction_candidates(gpu_id, needed_blocks)
+        candidates = gbm_snapshot.select_eviction_candidates(
+            gpu_id,
+            needed_blocks,
+            allow_recursive=False,
+        )
         if not candidates or len(candidates) < needed_blocks:
             return None
 

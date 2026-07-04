@@ -83,10 +83,34 @@ def test_allocate_with_swap_uses_eviction_candidates(monkeypatch):
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
 
-    seed = Sequence([1, 2, 3, 4], block_size=2)
-    bm.allocate(seed)
+    # 构造两个“已占用但当前无人引用”的冷块，模拟已经被 swap_out 的候选块。
+    for block_id in range(2):
+        block = bm._allocate_block(block_id)
+        block.ref_count = 0
+        block.update(100 + block_id, [block_id, block_id + 1])
 
     bm.free_block_ids.clear()
     seq = Sequence([5, 6, 7, 8], block_size=2)
     assert bm.allocate_with_swap(seq) is True
     assert gbm.eviction_requests == [(0, 2)]
+
+
+def test_shared_prefix_ref_count_keeps_block_out_of_free_list():
+    bm = BlockManager(num_blocks=4, block_size=2)
+    seq1 = Sequence([1, 2], block_size=2)
+    seq2 = Sequence([1, 2], block_size=2)
+
+    bm.allocate(seq1)
+    bm.allocate(seq2)
+
+    shared_block_id = seq1.block_table[0]
+    assert seq2.block_table[0] == shared_block_id
+    assert bm.blocks[shared_block_id].ref_count == 2
+
+    bm.deallocate(seq1)
+    assert bm.blocks[shared_block_id].ref_count == 1
+    assert shared_block_id not in bm.free_block_ids
+
+    bm.deallocate(seq2)
+    assert bm.blocks[shared_block_id].ref_count == 0
+    assert shared_block_id in bm.free_block_ids

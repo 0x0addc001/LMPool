@@ -93,7 +93,9 @@ def test_data_plane_process_handles_sequence_and_exit():
     )
     thread.start()
     try:
-        recv_queue.put({"type": "sequence", "seq": Sequence([1, 2], block_size=2)})
+        seq = Sequence([1, 2], block_size=2)
+        seq.remote_gpu_id = 0
+        recv_queue.put({"type": "sequence", "seq": seq})
         assert send_queue.get(timeout=10)["type"] == "finished"
         recv_queue.put({"type": "exit"})
         thread.join(timeout=10)

@@ -47,6 +47,7 @@ class DummyContext:
 def test_llm_engine_add_prompt_and_drain_messages(monkeypatch):
     monkeypatch.setattr(llm_engine_module.mp, "get_context", lambda _: DummyContext())
     monkeypatch.setattr(llm_engine_module.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    monkeypatch.setattr(llm_engine_module, "_find_free_port", lambda: 23456)
 
     engine = llm_engine_module.LLMEngine(
         {
@@ -61,6 +62,7 @@ def test_llm_engine_add_prompt_and_drain_messages(monkeypatch):
             "log_level": "ERROR",
         }
     )
+    assert engine.config["distributed_init_method"].startswith("tcp://127.0.0.1:")
 
     engine.add_prompt("ab", SimpleNamespace(temperature=1.0, max_tokens=4, ignore_eos=True, max_model_length=None))
     queued = engine.send_queues[0].get(timeout=1)

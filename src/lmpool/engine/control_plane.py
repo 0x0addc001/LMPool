@@ -26,7 +26,14 @@ class ControlPlaneClient:
     table.
     """
 
-    def __init__(self, rank: int, request_queue: Queue, response_queue: Queue):
+    def __init__(
+        self,
+        rank: int,
+        request_queue: Queue,
+        response_queue: Queue,
+        heartbeat_interval: float = 1.0,
+        heartbeat_timeout: float = 3.0,
+    ):
         self.rank = rank
         self.request_queue = request_queue
         self.response_queue = response_queue
@@ -34,8 +41,8 @@ class ControlPlaneClient:
         self.gbm = None
         self.rebalance_executor = None
         self._stashed_messages = deque()
-        self.heartbeat_interval = 1.0
-        self.heartbeat_timeout = 3.0
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_timeout = heartbeat_timeout
         self._last_control_heartbeat = time.monotonic()
         self._last_worker_heartbeat = 0.0
         self._control_down_reported = False
@@ -191,17 +198,25 @@ class ControlPlaneClient:
         if msg.get("type") == "heartbeat":
             self.note_control_heartbeat(msg.get("ts"))
             return True
-        if msg.get("type") != "rebalance_execute":
+        if msg.get("type") not in {"rebalance_prepare", "rebalance_execute", "rebalance_abort"}:
             return False
         if self.rebalance_executor is None:
             raise RuntimeError("rebalance_executor is not installed on ControlPlaneClient")
-        plan = msg["plan"]
+        plan = dict(msg["plan"])
+        if msg.get("type") == "rebalance_prepare":
+            phase = "prepare"
+        elif msg.get("type") == "rebalance_abort":
+            phase = "abort"
+        else:
+            phase = "execute"
+        plan["_phase"] = phase
         result = self.rebalance_executor(plan)
         self.request_queue.put({
             "type": "rebalance_done",
             "plan_id": msg["plan_id"],
             "rank": self.rank,
             "role": msg.get("role"),
+            "phase": phase,
             "result": result,
         })
         return True
@@ -262,6 +277,39 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 })
                 del pending_rebalances[plan_id]
 
+    def _send_rebalance_execute(plan_id: str, plan: dict):
+        source_ranks = {
+            transfer["src_gpu"] for transfer in plan["transfers"]
+        }
+        target_ranks = {
+            transfer["dst_gpu"] for transfer in plan["transfers"]
+        }
+        for src_rank in source_ranks:
+            response_queues[src_rank].put({
+                "type": "rebalance_execute",
+                "plan_id": plan_id,
+                "role": "source",
+                "plan": plan,
+            })
+        for dst_rank in target_ranks:
+            if dst_rank in source_ranks:
+                continue
+            response_queues[dst_rank].put({
+                "type": "rebalance_execute",
+                "plan_id": plan_id,
+                "role": "target",
+                "plan": plan,
+            })
+
+    def _send_rebalance_abort(plan_id: str, plan: dict, ranks: set[int]):
+        for rank in ranks:
+            response_queues[rank].put({
+                "type": "rebalance_abort",
+                "plan_id": plan_id,
+                "role": "abort",
+                "plan": plan,
+            })
+
     def service_heartbeats(force: bool = False):
         nonlocal last_control_heartbeat_sent
         now = time.monotonic()
@@ -308,15 +356,45 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             if plan is None:
                 service_heartbeats()
                 continue
-            plan["pending_ranks"].discard(msg["rank"])
-            if not plan["pending_ranks"]:
+            result = msg.get("result")
+            if isinstance(result, dict):
+                result_success = bool(result.get("success", False))
+                result_error = result.get("error", "rebalance failed")
+            else:
+                result_success = bool(result)
+                result_error = "rebalance failed"
+            if not result_success:
+                prepared_ranks = set(plan.get("prepared_ranks", set()))
+                if prepared_ranks:
+                    _send_rebalance_abort(plan_id, plan["plan"], prepared_ranks)
                 response_queues[plan["reply_rank"]].put({
                     "type": "rebalance_response",
                     "request_id": plan["request_id"],
-                    "success": True,
+                    "success": False,
+                    "error": result_error,
                     "plan_id": plan_id,
                 })
                 del pending_rebalances[plan_id]
+                service_heartbeats()
+                continue
+
+            phase = msg.get("phase", plan.get("phase", "execute"))
+            if phase == "prepare":
+                plan.setdefault("prepared_ranks", set()).add(msg["rank"])
+            plan["pending_ranks"].discard(msg["rank"])
+            if not plan["pending_ranks"]:
+                if phase == "prepare":
+                    plan["phase"] = "execute"
+                    plan["pending_ranks"] = set(plan["execute_ranks"])
+                    _send_rebalance_execute(plan_id, plan["plan"])
+                else:
+                    response_queues[plan["reply_rank"]].put({
+                        "type": "rebalance_response",
+                        "request_id": plan["request_id"],
+                        "success": True,
+                        "plan_id": plan_id,
+                    })
+                    del pending_rebalances[plan_id]
             service_heartbeats()
             continue
         if msg_type == "route_request":
@@ -364,39 +442,40 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
 
                 plan_id = uuid.uuid4().hex
                 plan["plan_id"] = plan_id
-                pending_rebalances[plan_id] = {
-                    "request_id": msg["request_id"],
-                    "reply_rank": msg["reply_rank"],
-                    "pending_ranks": {
-                        transfer["src_gpu"] for transfer in plan["transfers"]
-                    } | {
-                        transfer["dst_gpu"] for transfer in plan["transfers"]
-                    },
-                }
-
                 source_ranks = {
                     transfer["src_gpu"] for transfer in plan["transfers"]
                 }
                 target_ranks = {
                     transfer["dst_gpu"] for transfer in plan["transfers"]
                 }
-                for src_rank in source_ranks:
-                    response_queues[src_rank].put({
-                        "type": "rebalance_execute",
+                execute_ranks = source_ranks | target_ranks
+                if not target_ranks:
+                    response_queues[msg["reply_rank"]].put({
+                        "type": "rebalance_response",
+                        "request_id": msg["request_id"],
+                        "success": False,
+                        "error": "rebalance plan has no target ranks",
+                    })
+                    continue
+
+                pending_rebalances[plan_id] = {
+                    "request_id": msg["request_id"],
+                    "reply_rank": msg["reply_rank"],
+                    "phase": "prepare",
+                    "pending_ranks": set(execute_ranks),
+                    "execute_ranks": execute_ranks,
+                    "plan": plan,
+                }
+
+                for prepare_rank in execute_ranks:
+                    role = "source" if prepare_rank in source_ranks else "target"
+                    response_queues[prepare_rank].put({
+                        "type": "rebalance_prepare",
                         "plan_id": plan_id,
-                        "role": "source",
+                        "role": role,
                         "plan": plan,
                     })
-                for dst_rank in target_ranks:
-                    if dst_rank in source_ranks:
-                        continue
-                    response_queues[dst_rank].put({
-                        "type": "rebalance_execute",
-                        "plan_id": plan_id,
-                        "role": "target",
-                        "plan": plan,
-                    })
-                # 立即继续，等待 rebalance_done
+                # 先等待目标 rank 预留成功，再下发 execute，避免源端单边进入 NCCL send。
             except Exception as exc:
                 response_queues[msg["reply_rank"]].put({
                     "type": "error",

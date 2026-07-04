@@ -70,7 +70,7 @@ class Sequence:
 
     @property
     def num_cached_blocks(self):
-        return int(math.ceil(self.num_cached_tokens / self.block_size))
+        return int(math.floor(self.num_cached_tokens / self.block_size))
 
     @property
     def num_blocks(self):

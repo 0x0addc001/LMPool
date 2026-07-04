@@ -4,6 +4,7 @@ import time
 import torch
 import pickle
 import torch.distributed as dist
+from datetime import timedelta
 from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -47,8 +48,14 @@ class ModelRunner:
         self._decode_log_seconds = 0.0
 
         self.rank = rank
-        dist.init_process_group('nccl', "tcp://localhost:12347", world_size=config['world_size'], rank=rank)
         torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend='nccl',
+            init_method=config.get("distributed_init_method", "tcp://127.0.0.1:12347"),
+            world_size=config['world_size'],
+            rank=rank,
+            timeout=timedelta(seconds=float(config.get("distributed_timeout_s", 1800.0))),
+        )
 
         # ----------------------------------------------- #
         # 初始化 GlobalBlockManager（仅在启用全局池化时）
@@ -247,6 +254,12 @@ class ModelRunner:
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        # Warmup runs before KV cache allocation and bypasses Scheduler, so no
+        # BlockManager has populated block_table yet. Attention will not store
+        # into KV cache at this point, but prepare_prefill still needs a valid
+        # logical mapping to build a consistent context.
+        for seq in seqs:
+            seq.block_table = list(range(seq.num_blocks))
         self.run(seqs, is_prefill=True)
         torch.cuda.empty_cache()
 
@@ -331,17 +344,27 @@ class ModelRunner:
         for seq in seqs:
             token_ids = seq.token_ids
             num_cached_tokens = seq.num_cached_tokens
-            input_ids.extend(token_ids[num_cached_tokens:])
-            seqlens_q.append(len(token_ids) - num_cached_tokens)
+            uncached_tokens = token_ids[num_cached_tokens:]
+            input_ids.extend(uncached_tokens)
+            seqlens_q.append(len(uncached_tokens))
             seqlens_k.append(len(token_ids))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
-            if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    if seq.num_cached_blocks + i != seq.num_blocks - 1:
-                        slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
-                    else:
-                        slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
+            for token_idx in range(num_cached_tokens, len(token_ids)):
+                block_idx = token_idx // self.block_size
+                if block_idx >= len(seq.block_table):
+                    raise RuntimeError(
+                        f"Missing block table entry for seq {seq.seq_id}: "
+                        f"token_idx={token_idx}, block_idx={block_idx}, "
+                        f"block_table={seq.block_table}"
+                    )
+                block_id = seq.block_table[block_idx]
+                slot_mappings.append(block_id * self.block_size + (token_idx % self.block_size))
+        if len(slot_mappings) != len(input_ids):
+            raise RuntimeError(
+                f"Prefill slot mapping mismatch: slots={len(slot_mappings)} "
+                f"input_tokens={len(input_ids)} seq_ids={[seq.seq_id for seq in seqs]}"
+            )
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
             # pad block_tables
             all_block_tables = [seq.block_table for seq in seqs]
@@ -637,19 +660,18 @@ class ModelRunner:
     ):
         """
         执行 swap_out：将本地 blocks 的数据搬移到 target_gpu
-        在源 GPU 上执行 swap_out
-        直接调用 kv_transfer 的 send 逻辑
+        在源 GPU 上响应目标 GPU 的 swap_in pull 请求。
         """
-        from lmpool.engine.kv_transfer import swap_out
+        from lmpool.engine.kv_transfer import swap_in
         
         # 找到 kv_cache 引用
         kv_cache = self._get_kv_cache()
         
         logger.info(f"execute_swap_out: GPU{self.rank} → GPU{target_gpu} | blocks={blocks}")
-        target_blocks = swap_out(
-            local_gpu=self.rank,
-            blocks_to_evict=blocks,
-            target_gpu=target_gpu,
+        target_blocks = swap_in(
+            remote_gpu=self.rank,
+            remote_blocks=blocks,
+            local_gpu=target_gpu,
             kv_cache=kv_cache,
             num_layers=self.config['num_layers'],
             block_size=self.block_size,
@@ -691,11 +713,17 @@ class ModelRunner:
         return local_blocks
 
     def _get_kv_cache(self):
-        """获取任意一层的 kv_cache 引用"""
+        """获取所有层的 (k_cache, v_cache) 引用。"""
+        layer_caches = []
         for module in self.model.modules():
-            if hasattr(module, 'k_cache'):
-                return module.k_cache
-        raise RuntimeError("Cannot find k_cache in model layers")
+            if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
+                if module.k_cache is not None and module.v_cache is not None:
+                    if hasattr(module.k_cache, "numel") and module.k_cache.numel() == 0:
+                        continue
+                    layer_caches.append((module.k_cache, module.v_cache))
+        if not layer_caches:
+            raise RuntimeError("Cannot find k_cache/v_cache in model layers")
+        return layer_caches
 
     
     # ------------------------------------------------------------------

@@ -120,6 +120,12 @@ def test_prepare_prefill_and_decode_set_context(monkeypatch):
     assert contexts["slot_mapping"].tolist() == [20, 21, 22]
     assert contexts["block_tables"] is None
 
+    seq.num_cached_tokens = 2
+    prefill_ids = runner.prepare_prefill([seq])
+    assert prefill_ids.tolist() == [3]
+    assert contexts["slot_mapping"].tolist() == [22]
+    assert contexts["block_tables"].tolist() == [[10, 11]]
+
     seq.last_token = 4
     seq.block_table = [10, 11]
     seq.num_tokens = 4
@@ -148,7 +154,7 @@ def test_run_model_and_kv_helpers(monkeypatch):
 
     runner.model._modules[0].k_cache = "k0"
     runner.model._modules[0].v_cache = "v0"
-    assert runner._get_kv_cache() == "k0"
+    assert runner._get_kv_cache() == [("k0", "v0")]
 
 
 def test_execute_swap_methods_forward_to_kv_transfer(monkeypatch):
@@ -158,14 +164,14 @@ def test_execute_swap_methods_forward_to_kv_transfer(monkeypatch):
     runner.model._modules[0].v_cache = torch.zeros(2, 2)
     runner.config["num_layers"] = 2
 
-    calls = {}
+    calls = {"in": []}
 
     def fake_swap_out(**kwargs):
         calls["out"] = kwargs
         return [7, 8]
 
     def fake_swap_in(**kwargs):
-        calls["in"] = kwargs
+        calls["in"].append(kwargs)
         return [9, 10]
 
     monkeypatch.setattr(model_runner_module, "swap_out", fake_swap_out, raising=False)
@@ -173,7 +179,9 @@ def test_execute_swap_methods_forward_to_kv_transfer(monkeypatch):
     monkeypatch.setattr("lmpool.engine.kv_transfer.swap_out", fake_swap_out)
     monkeypatch.setattr("lmpool.engine.kv_transfer.swap_in", fake_swap_in)
 
-    assert runner.execute_swap_out([1, 2], target_gpu=1) == [7, 8]
+    assert runner.execute_swap_out([1, 2], target_gpu=1) == [9, 10]
     assert runner.execute_swap_in(remote_gpu=1, remote_blocks=[3, 4], local_target_blocks=[5, 6]) == [9, 10]
-    assert calls["out"]["blocks_to_evict"] == [1, 2]
-    assert calls["in"]["remote_blocks"] == [3, 4]
+    assert calls["in"][0]["remote_gpu"] == 0
+    assert calls["in"][0]["remote_blocks"] == [1, 2]
+    assert calls["in"][0]["local_gpu"] == 1
+    assert calls["in"][1]["remote_blocks"] == [3, 4]

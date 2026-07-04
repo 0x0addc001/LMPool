@@ -43,7 +43,13 @@ def data_plane_process(
     model_runner = ModelRunner(config, rank, gbm=None)
     control_plane_client = None
     if config.get("enable_global_pool", False) and config.get("use_control_plane_process", True):
-        control_plane_client = ControlPlaneClient(rank, global_request_queue, global_response_queue)
+        control_plane_client = ControlPlaneClient(
+            rank,
+            global_request_queue,
+            global_response_queue,
+            heartbeat_interval=float(config.get("heartbeat_interval", 1.0)),
+            heartbeat_timeout=float(config.get("heartbeat_timeout", 3.0)),
+        )
     scheduler = Scheduler(
         max_num_sequences=config.get("max_num_sequences", 16),
         max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
@@ -52,11 +58,72 @@ def data_plane_process(
         eos=config.get("eos", 50256),
         global_scheduler=control_plane_client,
     )
+    prepared_rebalance_blocks: dict[str, dict[tuple[int, tuple[int, ...]], list[int]]] = {}
 
     def execute_rebalance_plan(plan: dict):
         if plan is None:
             return {"success": False}
+        phase = plan.get("_phase", "execute")
+        plan_id = plan.get("plan_id")
         transfers = plan.get("transfers", [])
+
+        if phase == "abort":
+            prepared = prepared_rebalance_blocks.pop(plan_id, {})
+            for local_target_blocks in prepared.values():
+                scheduler.block_manager.release_reserved_blocks(local_target_blocks)
+            send_block_state()
+            return {"success": True, "rank": rank}
+
+        if phase == "prepare":
+            prepared: dict[tuple[int, tuple[int, ...]], list[int]] = {}
+            source_blocks = [
+                block_id
+                for transfer in transfers
+                if rank == transfer["src_gpu"]
+                for block_id in transfer["src_blocks"]
+            ]
+            pinned_blocks = [
+                block_id
+                for block_id in source_blocks
+                if scheduler.block_manager.blocks[block_id].ref_count != 0
+            ]
+            if pinned_blocks:
+                send_block_state()
+                return {
+                    "success": False,
+                    "rank": rank,
+                    "error": f"source blocks still referenced: {pinned_blocks}",
+                }
+
+            needed = sum(
+                len(transfer["src_blocks"])
+                for transfer in transfers
+                if rank == transfer["dst_gpu"]
+            )
+            if len(scheduler.block_manager.free_block_ids) < needed:
+                send_block_state()
+                return {
+                    "success": False,
+                    "rank": rank,
+                    "error": (
+                        f"not enough free blocks to reserve: need {needed}, "
+                        f"have {len(scheduler.block_manager.free_block_ids)}"
+                    ),
+                }
+
+            for transfer in transfers:
+                if rank != transfer["dst_gpu"]:
+                    continue
+                src_gpu = transfer["src_gpu"]
+                src_blocks = transfer["src_blocks"]
+                local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
+                prepared[(src_gpu, tuple(src_blocks))] = local_target_blocks
+
+            if plan_id is not None:
+                prepared_rebalance_blocks[plan_id] = prepared
+            send_block_state()
+            return {"success": True, "rank": rank}
+
         for transfer in transfers:
             src_gpu = transfer["src_gpu"]
             dst_gpu = transfer["dst_gpu"]
@@ -67,7 +134,10 @@ def data_plane_process(
                 model_runner.execute_swap_out(src_blocks, dst_gpu)
                 scheduler.block_manager.release_blocks(src_blocks)
             elif rank == dst_gpu:
-                local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
+                prepared = prepared_rebalance_blocks.get(plan_id, {})
+                local_target_blocks = prepared.get((src_gpu, tuple(src_blocks)))
+                if local_target_blocks is None:
+                    local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
                 model_runner.execute_swap_in(
                     src_gpu,
                     src_blocks,
@@ -75,6 +145,8 @@ def data_plane_process(
                 )
                 scheduler.block_manager.register_swap_in_blocks(local_target_blocks, hashes)
 
+        if plan_id is not None:
+            prepared_rebalance_blocks.pop(plan_id, None)
         send_block_state()
         return {"success": True, "rank": rank}
 
@@ -88,7 +160,10 @@ def data_plane_process(
             model_runner.exit()
             return False
         if msg.get("type") == "sequence":
-            scheduler.add_sequence(msg["seq"])
+            seq = msg["seq"]
+            if seq.remote_gpu_id == rank:
+                seq.remote_gpu_id = -1
+            scheduler.add_sequence(seq)
             return True
         return True
 
@@ -176,6 +251,17 @@ def data_plane_process(
             send_queue.put({"type": "sequence", "target": seq.remote_gpu_id, "seq": seq})
 
         if local_seqs:
+            if is_prefill:
+                missing_blocks = [
+                    (seq.seq_id, seq.remote_gpu_id, seq.num_blocks, list(seq.block_table))
+                    for seq in local_seqs
+                    if len(seq.block_table) < seq.num_blocks
+                ]
+                if missing_blocks:
+                    raise RuntimeError(
+                        f"rank {rank} scheduled local prefill without enough blocks: "
+                        f"{missing_blocks}"
+                    )
             outputs = model_runner.run(local_seqs, is_prefill)
             scheduler.postprocess(local_seqs, outputs)
             send_block_state()

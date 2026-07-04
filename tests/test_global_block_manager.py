@@ -60,6 +60,22 @@ def test_select_eviction_candidates_can_recurse_to_nvlink_partner():
     assert gbm.get_block_location(300) == []
 
 
+def test_select_eviction_candidates_can_disable_recursive_overcommit():
+    gbm = GlobalBlockManager(
+        rank=0,
+        world_size=2,
+        num_blocks_per_gpu=8,
+        nvlink_pairs=[(0, 1)],
+    )
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_access_time[0] = {i: float(i) for i in range(5)}
+    gbm.block_hash[0] = {i: 100 + i for i in range(5)}
+    gbm.block_access_time[1] = {0: 1.0}
+    gbm.block_hash[1] = {0: 300}
+
+    assert gbm.select_eviction_candidates(0, 5, allow_recursive=False) == []
+
+
 def test_select_eviction_candidates_returns_empty_without_nvlink_partner():
     gbm = GlobalBlockManager(
         rank=0,

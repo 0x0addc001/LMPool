@@ -1,7 +1,67 @@
+"""
+运行方式示例：
+
+1. 使用默认参数：
+   CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/shared_prefix_benchmark.py
+
+2. 显式指定参数：
+    CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/shared_prefix_benchmark.py \
+    --num-prompts 32 \
+    --prompt-repeat 10 \
+    --max-tokens 16 \
+    --temperature 0.6 \
+    --nvlink-pairs 0,1 \
+    --output-json /tmp/shared_prefix_benchmark.json \
+    --output-figure /tmp/shared_prefix_benchmark.png
+
+参数说明：
+1. `--num-prompts`：
+  本次压测总共生成多少条请求。值越大，并发压力越高，统计结果也更稳定。
+
+2. `--prompt-repeat`：
+  共享前缀重复多少次。值越大，公共前缀越长，越容易观察 prefix cache / 路由收益。
+
+3. `--max-tokens`：
+  每条请求最多生成多少个输出 token。值越大，decode 阶段占比越高，也更容易触发 swap 压力。
+
+4. `--temperature`：
+  采样温度。benchmark 默认主要看系统性能，通常保持固定值即可，不建议在不同实验间频繁改动。
+
+5. `--output-json`：
+  将各场景统计结果导出到指定 JSON 文件，便于后续画图、汇总表格或论文实验复现。
+
+6. `--model-name-or-path`：
+  指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
+
+7. `--nvlink-pairs`：
+  手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。如果不想手动写，可以传空字符串，让底层逻辑走自动探测。
+
+8. `--routing-max-cached-blocks`：
+  `multi-gpu-kv-routing` 场景的 KV block 上限，用来调节“主要看路由收益”时的缓存容量。
+
+9. `--eviction-max-cached-blocks`：
+  `multi-gpu-kv-swapping` 场景的 KV block 上限。通常设得更小，用来更容易触发 swap / rebalance。
+
+10. `--goodput-e2e-sla-ms`：
+  goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，才计入 goodput。
+
+11. `--skip-pool`：
+  跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 swapping。
+
+12. `--output-figure`：
+  将五种场景的核心指标画成一张图表图片并保存到指定路径，适合直接插入实验记录或论文草稿。
+
+说明：
+1. 建议显式设置 CUDA_VISIBLE_DEVICES，避免在共享机器上误用其他 GPU。
+2. 如果物理 GPU 0 和 2 之间有 NVLink，可以使用 `CUDA_VISIBLE_DEVICES=0,2`。
+   但脚本内部看到的是重映射后的逻辑 GPU `0,1`，因此 `--nvlink-pairs` 应写成 `0,1`，而不是 `0,2`。
+3. `multi-gpu`，`multi-gpu-kv-swapping` 场景当前采用 round-robin 分发。
+4. `multi-gpu-lmpool` 需要至少 2 张可见 CUDA GPU。
+"""
+
 import argparse
 import json
 import multiprocessing as mp
-import os
 import subprocess
 import statistics
 import sys
@@ -28,6 +88,7 @@ from lmpool.sampling_parameters import SamplingParams
 
 
 MODEL_CONFIG = {
+    # 这份配置尽量贴近仓库当前默认模型，方便 benchmark 与主流程复用同一套模型结构
     "max_num_sequences": 64,
     "max_num_batched_tokens": 4096,
     "max_cached_blocks": 1024,
@@ -55,10 +116,16 @@ MODEL_CONFIG = {
     "log_level": "ERROR",
     "log_timing": False,
     "log_decode_every_n": 16,
+    # benchmark 启动阶段会经历权重加载、warmup、KV cache 分配，默认 3 秒 heartbeat 超时过于激进
+    "heartbeat_interval": 1.0,
+    "heartbeat_timeout": 3600.0,
+    "distributed_timeout_s": 1800.0,
+    "worker_join_timeout": 30.0,
 }
 
 
 SUFFIXES = [
+    # 共享前缀固定，后缀变化，用来模拟真实业务里“前半段高度重复、后半段各不相同”的请求分布
     "introduce yourself",
     "list all prime numbers within 100",
     "give me your opinion on the impact of artificial intelligence on society",
@@ -80,6 +147,7 @@ SUFFIXES = [
 
 @dataclass
 class ScenarioResult:
+    # 每个 benchmark 场景统一产出同一份统计结构，方便最后横向对比和导出 JSON
     name: str
     total_requests: int
     total_tokens: int
@@ -103,6 +171,7 @@ class ScenarioResult:
 
 
 def build_shared_prefix(prompt_repeat: int) -> str:
+    # 用重复的长文本构造可控的共享前缀，长度越大，越容易触发 prefix cache 命中
     block = (
         "Artificial intelligence is a field of computer science that aims to create systems "
         "capable of performing tasks that normally require human intelligence. These tasks "
@@ -117,6 +186,7 @@ def build_shared_prefix(prompt_repeat: int) -> str:
 
 
 def build_prompts(tokenizer, num_prompts: int, prompt_repeat: int) -> list[str]:
+    # 每个 prompt 都共享同一段前缀，只在尾部附加不同任务，适合测前缀复用和路由收益
     shared_prefix = build_shared_prefix(prompt_repeat)
     prompts = []
     for i in range(num_prompts):
@@ -133,6 +203,7 @@ def build_prompts(tokenizer, num_prompts: int, prompt_repeat: int) -> list[str]:
 
 
 def compute_prefix_hashes(tokenizer, prompts: Iterable[str], block_size: int):
+    # 先把 prompt 转成 Sequence，方便后续直接复用 Sequence 的 block 计数和 hash 逻辑
     seqs = [
         Sequence(tokenizer.encode(prompt), block_size=block_size)
         for prompt in prompts
@@ -141,6 +212,7 @@ def compute_prefix_hashes(tokenizer, prompts: Iterable[str], block_size: int):
 
 
 def _percentile(values: list[float], p: float) -> float:
+    # 轻量 percentile 计算，避免引入额外依赖
     if not values:
         return 0.0
     if len(values) == 1:
@@ -162,6 +234,7 @@ def _median(values: list[float]) -> float:
 
 
 def _sample_gpu_metrics_once() -> list[tuple[float, float]]:
+    # 通过 nvidia-smi 采样 GPU 利用率和显存利用率，属于外部观测面，不参与调度决策
     cmd = [
         "nvidia-smi",
         "--query-gpu=utilization.gpu,memory.used,memory.total",
@@ -188,6 +261,7 @@ def _sample_gpu_metrics_once() -> list[tuple[float, float]]:
 
 
 class GpuMetricSampler:
+    # 后台定时采样器：benchmark 跑的同时持续抓 GPU 状态，最后再汇总 mean / p95
     def __init__(self, interval_s: float = 0.5):
         self.interval_s = interval_s
         self.samples: list[list[tuple[float, float]]] = []
@@ -229,6 +303,11 @@ def _run_independent_worker(
     goodput_e2e_sla_s: float,
     result_queue,
 ):
+    # 独立 multi-gpu baseline：
+    # - 每个 GPU 一个进程
+    # - 没有全局控制面
+    # - prompt 只做静态切分
+    # 这条路径的目的是提供“多卡但不共享 KV”的对照组
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
@@ -258,6 +337,7 @@ def _run_independent_worker(
     seq_count = 0
     goodput_tokens = 0
 
+    # 每张卡拿到一小段静态 shard，worker 只处理自己这份请求
     for token_ids in prompt_token_ids:
         seq = Sequence(token_ids=token_ids, block_size=config["block_size"], sampling_params=sampling_params)
         scheduler.add_sequence(seq)
@@ -265,6 +345,7 @@ def _run_independent_worker(
         seq_count += 1
 
     start_wall = time.perf_counter()
+    # 本地循环只关心本 shard 的完成情况，不和其他 GPU 做任何协同
     while not scheduler.is_finished():
         scheduled, is_prefill = scheduler.schedule()
         if not scheduled:
@@ -313,6 +394,8 @@ def run_independent_multi_gpu_benchmark(
     tokenizer,
     goodput_e2e_sla_s: float,
 ) -> ScenarioResult | None:
+    # 这条 baseline 先按 GPU 数量把请求静态切分，再分别启动 worker
+    # 因此它不是动态调度，而是“静态 shard + 本地执行”的独立多卡基线
     gpu_count = torch.cuda.device_count()
     if gpu_count < 2:
         return None
@@ -321,6 +404,7 @@ def run_independent_multi_gpu_benchmark(
     prompt_token_ids = [tokenizer.encode(prompt) for prompt in prompts]
     shards: list[list[list[int]]] = [[] for _ in range(gpu_count)]
     for idx, token_ids in enumerate(prompt_token_ids):
+        # 轮转切 shard：第 i 个请求固定分到 i % gpu_count 的 GPU
         shards[idx % gpu_count].append(token_ids)
 
     result_queue = ctx.Queue()
@@ -353,6 +437,7 @@ def run_independent_multi_gpu_benchmark(
         elapsed = time.perf_counter() - start_wall
         total_requests = sum(item["total_requests"] for item in results)
         total_tokens = sum(item["total_tokens"] for item in results)
+        # 汇总各卡结果时，把每个 worker 的 token / latency 样本合并起来
         ttfts = [lat for item in results for lat in item.get("ttfts", [])]
         e2es = [lat for item in results for lat in item.get("e2es", [])]
         prefix_hit_rate = sum(
@@ -395,6 +480,7 @@ def run_independent_multi_gpu_benchmark(
 
 
 def measure_single_gpu_prefix_hit_rate(tokenizer, prompts: list[str], block_size: int, max_cached_blocks: int) -> float:
+    # 单卡基线里也会用同样的 prefix hash 逻辑，主要用于计算“理论上能命中多少前缀”
     gbm = GlobalBlockManager(
         rank=0,
         world_size=1,
@@ -431,6 +517,10 @@ def run_engine_scenario(
     route_mode: str = "control_plane",
     goodput_e2e_sla_s: float = 2.0,
 ) -> ScenarioResult:
+    # 调用 LLMEngine
+    # prompt 先进入 launcher
+    # 再由控制面路由或按 round-robin 分发
+    # worker 侧执行 prefill / decode
     engine = LLMEngine(config)
     submit_times: dict[int, float] = {}
     ttfts: list[float] = []
@@ -452,19 +542,25 @@ def run_engine_scenario(
             start = time.perf_counter()
             target_rank = 0
             if route_mode == "control_plane" and engine.control_plane_client is not None:
+                # 控制面模式：每个请求都先做 prefix hash，再让全局调度器决定落在哪张卡
                 routed = engine.control_plane_client.route_sequence(seq, return_meta=True)
                 target_rank = routed["target_rank"]
                 if routed.get("route_info", {}).get("prefix_hit"):
                     route_hits += 1
             elif route_mode == "round_robin":
+                # round-robin 模式只用于剥离 swap 开销，不做全局路由打分
                 target_rank = len(submit_times) % config["world_size"]
-            seq.remote_gpu_id = target_rank
+            # The launcher has already selected the destination worker. Keep
+            # remote_gpu_id clear so the destination Scheduler treats this as a
+            # local request and allocates local blocks before prefill.
+            seq.remote_gpu_id = -1
             engine.send_queues[target_rank].put({"type": "sequence", "seq": seq})
             submit_times[seq.seq_id] = start
 
         finished_count = 0
         completion_times: dict[int, float] = {}
         completion_token_counts: dict[int, int] = {}
+        # 主循环不断泵 worker 消息，直到所有请求都完成
         while finished_count < len(prompts):
             finished, _, _ = engine.step()
             now = time.perf_counter()
@@ -484,6 +580,7 @@ def run_engine_scenario(
         route_hits = 0
 
     gpu_util_mean, gpu_util_p95, gpu_mem_util_mean, gpu_mem_util_p95 = sampler.summarize()
+    # goodput：只有在给定 e2e SLA 内完成的请求，才计入有效吞吐
     goodput_tokens = sum(
         completion_token_counts[seq_id] for seq_id, done_at in completion_times.items()
         if done_at - submit_times[seq_id] <= goodput_e2e_sla_s
@@ -514,6 +611,7 @@ def run_engine_scenario(
 
 
 def make_config(world_size: int, enable_global_pool: bool, nvlink_pairs: list[tuple[int, int]] | None) -> dict:
+    # benchmark 里统一通过这层构造 config，避免每个场景单独拼参数时漏掉关键项
     config = dict(MODEL_CONFIG)
     config["world_size"] = world_size
     config["enable_global_pool"] = enable_global_pool
@@ -527,49 +625,86 @@ def fmt_pct(value: float) -> str:
     return f"{value * 100:.2f}%"
 
 
-def print_report(title: str, baseline: ScenarioResult, compare: ScenarioResult | None):
+def print_summary_table(results: list[ScenarioResult | None]):
+    # 横向总表：把所有场景放在同一张表里，便于直接看五种配置的整体差异。
+    valid_results = [result for result in results if result is not None]
     print("\nBenchmark Summary")
-    print("=" * 80)
-    print(title)
+    print("=" * 120)
     print(
-        f"{'scenario':<20} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
-        f"{'e2e(ms)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} {'prefix hit':>14}"
+        f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
+        f"{'e2e(ms)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} {'prefix hit':>12}"
     )
-    print(
-        f"{baseline.name:<20} "
-        f"{baseline.throughput_tok_s:>14.2f} "
-        f"{baseline.goodput_tok_s:>12.2f} "
-        f"{baseline.mean_ttft_s * 1000:>12.2f} "
-        f"{baseline.mean_ttpt_s * 1000:>12.2f} "
-        f"{baseline.mean_e2e_s * 1000:>12.2f} "
-        f"{baseline.p95_e2e_s * 1000:>12.2f} "
-        f"{(baseline.gpu_util_mean if baseline.gpu_util_mean is not None else float('nan')):>10.2f} "
-        f"{(baseline.gpu_mem_util_mean if baseline.gpu_mem_util_mean is not None else float('nan')):>10.2f} "
-        f"{fmt_pct(baseline.prefix_hit_rate):>14}"
-    )
-    if compare is not None:
+    for result in valid_results:
         print(
-            f"{compare.name:<20} "
-            f"{compare.throughput_tok_s:>14.2f} "
-            f"{compare.goodput_tok_s:>12.2f} "
-            f"{compare.mean_ttft_s * 1000:>12.2f} "
-            f"{compare.mean_ttpt_s * 1000:>12.2f} "
-            f"{compare.mean_e2e_s * 1000:>12.2f} "
-            f"{compare.p95_e2e_s * 1000:>12.2f} "
-            f"{(compare.gpu_util_mean if compare.gpu_util_mean is not None else float('nan')):>10.2f} "
-            f"{(compare.gpu_mem_util_mean if compare.gpu_mem_util_mean is not None else float('nan')):>10.2f} "
-            f"{fmt_pct(compare.prefix_hit_rate):>14}"
+            f"{result.name:<22} "
+            f"{result.throughput_tok_s:>14.2f} "
+            f"{result.goodput_tok_s:>12.2f} "
+            f"{result.mean_ttft_s * 1000:>12.2f} "
+            f"{result.mean_ttpt_s * 1000:>12.2f} "
+            f"{result.mean_e2e_s * 1000:>12.2f} "
+            f"{result.p95_e2e_s * 1000:>12.2f} "
+            f"{(result.gpu_util_mean if result.gpu_util_mean is not None else float('nan')):>10.2f} "
+            f"{(result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else float('nan')):>10.2f} "
+            f"{fmt_pct(result.prefix_hit_rate):>12}"
         )
-        print("-" * 80)
-        print(f"throughput uplift: {(compare.throughput_tok_s / max(baseline.throughput_tok_s, 1e-9) - 1.0) * 100:.2f}%")
-        print(f"goodput uplift: {(compare.goodput_tok_s / max(baseline.goodput_tok_s, 1e-9) - 1.0) * 100:.2f}%")
-        print(f"TTFT reduction: {(1.0 - compare.mean_ttft_s / max(baseline.mean_ttft_s, 1e-9)) * 100:.2f}%")
-        print(f"TTPT reduction: {(1.0 - compare.mean_ttpt_s / max(baseline.mean_ttpt_s, 1e-9)) * 100:.2f}%")
-        print(f"E2E reduction: {(1.0 - compare.mean_e2e_s / max(baseline.mean_e2e_s, 1e-9)) * 100:.2f}%")
-        print(f"prefix-hit lift: {(compare.prefix_hit_rate - baseline.prefix_hit_rate) * 100:.2f} pct points")
+
+
+def save_summary_figure(results: list[ScenarioResult | None], output_path: str) -> None:
+    # 生成一张总览图：吞吐 / goodput、延迟、prefix hit、GPU 利用率分别放在不同子图。
+    valid_results = [result for result in results if result is not None]
+    if not valid_results:
+        return
+
+    import matplotlib.pyplot as plt
+
+    names = [result.name for result in valid_results]
+    x = list(range(len(valid_results)))
+
+    throughput = [result.throughput_tok_s for result in valid_results]
+    goodput = [result.goodput_tok_s for result in valid_results]
+    ttft_ms = [result.mean_ttft_s * 1000.0 for result in valid_results]
+    e2e_ms = [result.mean_e2e_s * 1000.0 for result in valid_results]
+    prefix_hit_pct = [result.prefix_hit_rate * 100.0 for result in valid_results]
+    gpu_util = [result.gpu_util_mean if result.gpu_util_mean is not None else 0.0 for result in valid_results]
+    gpu_mem_util = [result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else 0.0 for result in valid_results]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle("Shared Prefix Benchmark Summary", fontsize=16)
+
+    width = 0.38
+    axes[0, 0].bar([i - width / 2 for i in x], throughput, width=width, label="throughput")
+    axes[0, 0].bar([i + width / 2 for i in x], goodput, width=width, label="goodput")
+    axes[0, 0].set_title("Throughput / Goodput")
+    axes[0, 0].set_ylabel("tokens/s")
+    axes[0, 0].set_xticks(x, names, rotation=15, ha="right")
+    axes[0, 0].legend()
+
+    axes[0, 1].bar([i - width / 2 for i in x], ttft_ms, width=width, label="TTFT")
+    axes[0, 1].bar([i + width / 2 for i in x], e2e_ms, width=width, label="E2E")
+    axes[0, 1].set_title("Latency")
+    axes[0, 1].set_ylabel("ms")
+    axes[0, 1].set_xticks(x, names, rotation=15, ha="right")
+    axes[0, 1].legend()
+
+    axes[1, 0].bar(x, prefix_hit_pct)
+    axes[1, 0].set_title("Prefix Hit Rate")
+    axes[1, 0].set_ylabel("%")
+    axes[1, 0].set_xticks(x, names, rotation=15, ha="right")
+
+    axes[1, 1].bar([i - width / 2 for i in x], gpu_util, width=width, label="GPU util")
+    axes[1, 1].bar([i + width / 2 for i in x], gpu_mem_util, width=width, label="GPU mem util")
+    axes[1, 1].set_title("GPU Utilization")
+    axes[1, 1].set_ylabel("%")
+    axes[1, 1].set_xticks(x, names, rotation=15, ha="right")
+    axes[1, 1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def parse_args():
+    # benchmark 入口参数尽量保持简单：只暴露场景规模、模型、拓扑和 SLA
     parser = argparse.ArgumentParser(description="Shared-prefix high-concurrency benchmark")
     parser.add_argument("--num-prompts", type=int, default=32)
     parser.add_argument("--prompt-repeat", type=int, default=10)
@@ -582,10 +717,12 @@ def parse_args():
     parser.add_argument("--eviction-max-cached-blocks", type=int, default=256)
     parser.add_argument("--goodput-e2e-sla-ms", type=float, default=2000.0)
     parser.add_argument("--skip-pool", action="store_true")
+    parser.add_argument("--output-figure", type=str, default="")
     return parser.parse_args()
 
 
 def parse_pairs(raw: str) -> list[tuple[int, int]]:
+    # 解析命令行里的 "0,1;2,3" 形式拓扑输入
     if not raw:
         return []
     pairs = []
@@ -596,6 +733,12 @@ def parse_pairs(raw: str) -> list[tuple[int, int]]:
 
 
 def main():
+    # 主流程：
+    # 1) 准备 prompts
+    # 2) 跑 single-gpu 基线
+    # 3) 跑 multi-gpu 独立基线
+    # 4) 跑 routing / swapping / pool 场景
+    # 5) 打印和导出结果
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
@@ -611,6 +754,7 @@ def main():
     )
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
 
+    # single-gpu baseline：单卡独立执行，不启用全局池
     baseline_config = make_config(1, False, None)
     baseline_config["model_name_or_path"] = model_name
     baseline = run_engine_scenario(
@@ -629,15 +773,20 @@ def main():
     )
     baseline.prefix_hit_rate = baseline_hit_rate
 
-    independent_result = run_independent_multi_gpu_benchmark(
+    # multi-gpu baseline：不共享 KV、不走控制面路由，但请求通过 round-robin 分发到多张卡
+    multi_gpu_config = make_config(2, False, None)
+    multi_gpu_config["model_name_or_path"] = model_name
+    independent_result = run_engine_scenario(
         "multi-gpu",
-        baseline_config,
+        multi_gpu_config,
         prompts,
         sampling_params,
         tokenizer,
-        goodput_e2e_sla_s,
+        route_mode="round_robin",
+        goodput_e2e_sla_s=goodput_e2e_sla_s,
     )
 
+    # multi-gpu-kv-routing：走控制面路由，用来测 prefix 命中带来的收益
     routing_config = make_config(2, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     routing_config["model_name_or_path"] = model_name
     routing_config["max_cached_blocks"] = args.routing_max_cached_blocks
@@ -651,6 +800,7 @@ def main():
         goodput_e2e_sla_s=goodput_e2e_sla_s,
     )
 
+    # multi-gpu-kv-swapping：用 round-robin 分发，尽量隔离出 swap / rebalance 的开销
     eviction_config = make_config(2, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     eviction_config["model_name_or_path"] = model_name
     eviction_config["max_cached_blocks"] = args.eviction_max_cached_blocks
@@ -669,6 +819,7 @@ def main():
         if torch.cuda.device_count() < 2:
             print("pool scenario skipped: need at least 2 CUDA devices")
         else:
+            # multi-gpu-lmpool：真实全局池化路径，控制面路由 + 数据面执行一起跑。
             pool_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None
             pool_config = make_config(2, True, pool_pairs)
             pool_config["model_name_or_path"] = model_name
@@ -681,12 +832,16 @@ def main():
                 goodput_e2e_sla_s=goodput_e2e_sla_s,
             )
 
-    print_report("single-gpu vs multi-gpu", baseline, independent_result)
-    print_report("single-gpu vs multi-gpu-kv-routing", baseline, kv_routing)
-    print_report("single-gpu vs multi-gpu-kv-swapping", baseline, kv_eviction)
-    if pool_result is not None:
-        print()
-        print_report("single-gpu vs multi-gpu-lmpool", baseline, pool_result)
+    all_results = [
+        baseline,
+        independent_result,
+        kv_routing,
+        kv_eviction,
+        pool_result,
+    ]
+    print_summary_table(all_results)
+    if args.output_figure:
+        save_summary_figure(all_results, args.output_figure)
     if args.output_json:
         payload = {
             "single-gpu": asdict(baseline),

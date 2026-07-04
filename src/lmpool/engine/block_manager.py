@@ -111,6 +111,7 @@ class BlockManager:
             else:
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
+                block.ref_count = 1
                 block.update(h=h, token_ids=token_ids)
                 if h != -1:
                     self.hash_to_block_id[h] = block.block_id
@@ -169,6 +170,7 @@ class BlockManager:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
             block = self._allocate_block(self.free_block_ids[0])
+            block.ref_count = 1
             block_tables.append(block.block_id)
         # else, do nothing
         else:
@@ -370,6 +372,18 @@ class BlockManager:
             block = self.blocks[block_id]
             if block.ref_count != 0:
                 raise RuntimeError(f"Cannot release block {block_id}: ref_count={block.ref_count}")
+            self._deallocate_block(block_id)
+
+    def release_reserved_blocks(self, block_ids: list[int]) -> None:
+        """
+        释放 prepare 阶段预留但尚未完成 swap-in 注册的块。
+        """
+        for block_id in block_ids:
+            if block_id not in self.used_block_ids:
+                continue
+            block = self.blocks[block_id]
+            if block.ref_count != 0:
+                raise RuntimeError(f"Cannot release reserved block {block_id}: ref_count={block.ref_count}")
             self._deallocate_block(block_id)
 
     def register_swap_in_blocks(self, block_ids: list[int], hashes: list[int]) -> None:

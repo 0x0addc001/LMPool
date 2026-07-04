@@ -13,7 +13,7 @@ KV cache 数据的直接搬运
 import logging
 import torch
 import torch.distributed as dist
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,37 @@ def _compute_tag(block_id: int, layer_idx: int, is_k: bool) -> int:
     type_bit = 0 if is_k else 1
     # tag = layer_idx * 2 + type_bit，上限 block_id * 10000 避免冲突
     return block_id * 10000 + layer_idx * 2 + type_bit
+
+
+def _get_layer_kv(kv_cache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Normalize supported KV cache layouts to one layer's (k_cache, v_cache).
+
+    Supported layouts:
+    - [(k_cache_layer0, v_cache_layer0), ...]
+    - (k_cache, v_cache) for a single layer
+    - Tensor shaped (2, num_layers, blocks, block_size, heads, dim)
+    - Tensor shaped (2, blocks, block_size, heads, dim) for a single layer
+    """
+    if isinstance(kv_cache, (list, tuple)):
+        if not kv_cache:
+            raise RuntimeError("empty kv_cache")
+        first = kv_cache[0]
+        if isinstance(first, (list, tuple)):
+            return kv_cache[layer_idx][0], kv_cache[layer_idx][1]
+        if len(kv_cache) == 2 and isinstance(kv_cache[0], torch.Tensor):
+            return kv_cache[0], kv_cache[1]
+
+    if isinstance(kv_cache, torch.Tensor):
+        if kv_cache.dim() == 6:
+            return kv_cache[0, layer_idx], kv_cache[1, layer_idx]
+        if kv_cache.dim() == 5:
+            return kv_cache[0], kv_cache[1]
+
+    raise RuntimeError(
+        "Unsupported kv_cache layout for transfer; expected per-layer "
+        "(k_cache, v_cache) pairs or a tensor with leading K/V dimension"
+    )
 
 
 # ============================================================================
@@ -146,24 +177,24 @@ def swap_out(
 
     # 2. 逐层、逐块传输 KV 数据
     for layer_idx in range(num_layers):
-        layer_kv = kv_cache[layer_idx] if kv_cache.dim() == 5 else kv_cache
+        layer_k, layer_v = _get_layer_kv(kv_cache, layer_idx)
         for i, (src_block, dst_block) in enumerate(zip(blocks_to_evict, target_blocks)):
             if rank == local_gpu and rank != target_gpu:
                 # 读取本地 K、V 切片
-                k_slice = layer_kv[0, src_block, ...].contiguous()
-                v_slice = layer_kv[1, src_block, ...].contiguous()
+                k_slice = layer_k[src_block, ...].contiguous()
+                v_slice = layer_v[src_block, ...].contiguous()
                 dist.send(k_slice, dst=target_gpu, tag=_compute_tag(src_block, layer_idx, is_k=True))
                 dist.send(v_slice, dst=target_gpu, tag=_compute_tag(src_block, layer_idx, is_k=False))
             elif rank == target_gpu and rank != local_gpu:
                 # 接收并写入目标块
                 k_buf = torch.zeros(block_size, num_kv_heads, head_dim,
-                                    dtype=layer_kv.dtype, device=device)
+                                    dtype=layer_k.dtype, device=device)
                 v_buf = torch.zeros(block_size, num_kv_heads, head_dim,
-                                    dtype=layer_kv.dtype, device=device)
+                                    dtype=layer_v.dtype, device=device)
                 dist.recv(k_buf, src=local_gpu, tag=_compute_tag(src_block, layer_idx, is_k=True))
                 dist.recv(v_buf, src=local_gpu, tag=_compute_tag(src_block, layer_idx, is_k=False))
-                layer_kv[0, dst_block, ...].copy_(k_buf)
-                layer_kv[1, dst_block, ...].copy_(v_buf)
+                layer_k[dst_block, ...].copy_(k_buf)
+                layer_v[dst_block, ...].copy_(v_buf)
 
     # 3. 全层同步
     barrier_tensor = torch.zeros(1, device=device)
@@ -230,20 +261,20 @@ def swap_in(
 
     # 2. 逐层、逐块传输 KV 数据
     for layer_idx in range(num_layers):
-        layer_kv = kv_cache[layer_idx] if kv_cache.dim() == 5 else kv_cache
+        layer_k, layer_v = _get_layer_kv(kv_cache, layer_idx)
         for src_block, dst_block in zip(remote_blocks, local_blocks):
             if rank == local_gpu and rank != remote_gpu:
                 k_buf = torch.zeros(block_size, num_kv_heads, head_dim,
-                                    dtype=layer_kv.dtype, device=device)
+                                    dtype=layer_k.dtype, device=device)
                 v_buf = torch.zeros(block_size, num_kv_heads, head_dim,
-                                    dtype=layer_kv.dtype, device=device)
+                                    dtype=layer_v.dtype, device=device)
                 dist.recv(k_buf, src=remote_gpu, tag=_compute_tag(src_block, layer_idx, is_k=True))
                 dist.recv(v_buf, src=remote_gpu, tag=_compute_tag(src_block, layer_idx, is_k=False))
-                layer_kv[0, dst_block, ...].copy_(k_buf)
-                layer_kv[1, dst_block, ...].copy_(v_buf)
+                layer_k[dst_block, ...].copy_(k_buf)
+                layer_v[dst_block, ...].copy_(v_buf)
             elif rank == remote_gpu and rank != local_gpu:
-                k_slice = layer_kv[0, src_block, ...].contiguous()
-                v_slice = layer_kv[1, src_block, ...].contiguous()
+                k_slice = layer_k[src_block, ...].contiguous()
+                v_slice = layer_v[src_block, ...].contiguous()
                 dist.send(k_slice, dst=local_gpu, tag=_compute_tag(src_block, layer_idx, is_k=True))
                 dist.send(v_slice, dst=local_gpu, tag=_compute_tag(src_block, layer_idx, is_k=False))
 

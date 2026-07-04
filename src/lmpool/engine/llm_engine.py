@@ -1,5 +1,6 @@
 import atexit
 import logging
+import socket
 import time
 import torch.multiprocessing as mp
 from queue import Empty
@@ -11,6 +12,12 @@ from lmpool.sampling_parameters import SamplingParams
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _configure_logging(config: dict):
@@ -37,6 +44,10 @@ class LLMEngine:
         self.config = dict(config)
         self.config.setdefault('use_control_plane_process', True)
         self.world_size = config.get("world_size", 1)
+        self.config.setdefault(
+            "distributed_init_method",
+            f"tcp://127.0.0.1:{_find_free_port()}",
+        )
         self._mp_ctx = mp.get_context("spawn")
 
         self.processes = []
@@ -64,6 +75,8 @@ class LLMEngine:
                 -1,
                 self.control_plane_request_queue,
                 self.control_plane_response_queues[-1],
+                heartbeat_interval=float(self.config.get("heartbeat_interval", 1.0)),
+                heartbeat_timeout=float(self.config.get("heartbeat_timeout", 3.0)),
             )
 
         for i in range(self.world_size):
@@ -122,14 +135,23 @@ class LLMEngine:
 
 
     def exit(self):
+        worker_join_timeout = float(self.config.get("worker_join_timeout", 30.0))
         for rank, q in self.send_queues.items():
             q.put({"type": "exit"})
         for process in self.processes:
-            process.join()
+            process.join(timeout=worker_join_timeout)
+            if hasattr(process, "is_alive") and process.is_alive():
+                logger.warning("worker process pid=%s did not exit in %.1fs; terminating", getattr(process, "pid", None), worker_join_timeout)
+                process.terminate()
+                process.join(timeout=worker_join_timeout)
         if self.control_plane_request_queue is not None:
             self.control_plane_request_queue.put({"type": "shutdown"})
         if self.control_plane_process_handle is not None:
-            self.control_plane_process_handle.join()
+            self.control_plane_process_handle.join(timeout=worker_join_timeout)
+            if self.control_plane_process_handle.is_alive():
+                logger.warning("control plane process pid=%s did not exit in %.1fs; terminating", self.control_plane_process_handle.pid, worker_join_timeout)
+                self.control_plane_process_handle.terminate()
+                self.control_plane_process_handle.join(timeout=worker_join_timeout)
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling
@@ -181,7 +203,7 @@ class LLMEngine:
         target_rank = 0
         if self.control_plane_client is not None:
             target_rank = self.control_plane_client.route_sequence(seq)
-        seq.remote_gpu_id = target_rank
+        seq.remote_gpu_id = -1
         self.send_queues[target_rank].put({"type": "sequence", "seq": seq})
 
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[str]:

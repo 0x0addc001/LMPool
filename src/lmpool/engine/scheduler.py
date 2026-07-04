@@ -134,7 +134,14 @@ class Scheduler:
                         scheduled_sequences.append(seq)
                         self._sync_local_state_to_global()
                         continue
-                # swap 失败或未启用全局池化：停止 prefill
+                # swap 失败或未启用全局池化：抢占一个 running 序列腾空间。
+                # 这覆盖源端 prepare 因 ref_count>0 拒绝 eviction 的情况，避免
+                # waiting 队首请求反复触发同一个不可执行 rebalance 计划。
+                if scheduled_sequences:
+                    break
+                if self.running:
+                    self.preempt(self.running.pop())
+                    break
                 break
 
             # 检查 token 预算

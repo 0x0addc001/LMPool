@@ -10,13 +10,14 @@ from lmpool.engine.sequence import Sequence, SequenceStatus
 
 
 class DummyGlobalScheduler:
-    def __init__(self, gbm):
+    def __init__(self, gbm, rebalance_result=True):
         self.gbm = gbm
+        self.rebalance_result = rebalance_result
         self.rebalance_calls = []
 
     def rebalance(self, gpu_id, needed_blocks):
         self.rebalance_calls.append((gpu_id, needed_blocks))
-        return True
+        return self.rebalance_result
 
 
 def test_prefill_routes_remote_sequences_without_local_allocation():
@@ -83,6 +84,60 @@ def test_decode_rebalance_prevents_preemption(monkeypatch):
     assert scheduled == []
     assert dummy.rebalance_calls == [(0, 1)]
     assert list(scheduler.running) == [seq]
+
+
+def test_prefill_rebalance_failure_preempts_running_sequence():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=1, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm, rebalance_result=False)
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=1,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    running_seq = Sequence([1, 2], block_size=2)
+    scheduler.block_manager.allocate(running_seq)
+    running_seq.status = SequenceStatus.RUNNING
+    scheduler.running.append(running_seq)
+
+    waiting_seq = Sequence([3, 4], block_size=2)
+    scheduler.add_sequence(waiting_seq)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is False
+    assert scheduled == []
+    assert dummy.rebalance_calls == [(0, 1)]
+    assert running_seq in scheduler.waiting
+    assert waiting_seq in scheduler.waiting
+
+
+def test_prefill_rebalance_failure_does_not_preempt_current_batch():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm, rebalance_result=False)
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=2,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    first = Sequence([1, 2], block_size=2)
+    second = Sequence([3, 4, 5], block_size=2)
+    scheduler.add_sequence(first)
+    scheduler.add_sequence(second)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled == [first]
+    assert len(first.block_table) == first.num_blocks
+    assert first in scheduler.running
+    assert second in scheduler.waiting
+    assert dummy.rebalance_calls == [(0, 2)]
 
 
 def test_postprocess_finishes_and_requeues_non_finished():
