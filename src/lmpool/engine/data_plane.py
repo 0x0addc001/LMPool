@@ -92,6 +92,7 @@ def data_plane_process(
                 return {
                     "success": False,
                     "rank": rank,
+                    "reason": "pinned_source",
                     "error": f"source blocks still referenced: {pinned_blocks}",
                 }
 
@@ -105,6 +106,7 @@ def data_plane_process(
                 return {
                     "success": False,
                     "rank": rank,
+                    "reason": "no_target_space",
                     "error": (
                         f"not enough free blocks to reserve: need {needed}, "
                         f"have {len(scheduler.block_manager.free_block_ids)}"
@@ -133,6 +135,11 @@ def data_plane_process(
             if rank == src_gpu:
                 model_runner.execute_swap_out(src_blocks, dst_gpu)
                 scheduler.block_manager.release_blocks(src_blocks)
+                send_queue.put({
+                    "type": "runtime_stats",
+                    "rank": rank,
+                    "data": {"swap_count": len(src_blocks)},
+                })
             elif rank == dst_gpu:
                 prepared = prepared_rebalance_blocks.get(plan_id, {})
                 local_target_blocks = prepared.get((src_gpu, tuple(src_blocks)))
@@ -173,6 +180,8 @@ def data_plane_process(
         control_plane_client.report_block_state(
             len(scheduler.block_manager.free_block_ids),
             scheduler.block_manager.get_local_block_hashes(),
+            scheduler.block_manager.get_evictable_block_hashes(),
+            scheduler.block_manager.get_pinned_block_hashes(),
         )
 
     send_block_state()
@@ -181,6 +190,9 @@ def data_plane_process(
     heartbeat_interval = float(config.get("heartbeat_interval", 1.0))
     last_worker_heartbeat_sent = 0.0
     control_down_reported = False
+    last_rebalance_success_count = 0
+    last_rebalance_fail_count = 0
+    last_rebalance_fail_reasons: dict[str, int] = {}
 
     def maybe_send_worker_heartbeat():
         nonlocal last_worker_heartbeat_sent
@@ -233,6 +245,27 @@ def data_plane_process(
                 control_down_reported = True
 
         scheduled, is_prefill = scheduler.schedule()
+        if control_plane_client is not None:
+            success_delta = control_plane_client.rebalance_success_count - last_rebalance_success_count
+            fail_delta = control_plane_client.rebalance_fail_count - last_rebalance_fail_count
+            reason_deltas = {}
+            for reason, count in control_plane_client.rebalance_fail_reasons.items():
+                delta = count - last_rebalance_fail_reasons.get(reason, 0)
+                if delta:
+                    reason_deltas[reason] = delta
+            if success_delta or fail_delta or reason_deltas:
+                send_queue.put({
+                    "type": "runtime_stats",
+                    "rank": rank,
+                    "data": {
+                        "rebalance_success": success_delta,
+                        "rebalance_fail": fail_delta,
+                        "rebalance_fail_reasons": reason_deltas,
+                    },
+                })
+                last_rebalance_success_count = control_plane_client.rebalance_success_count
+                last_rebalance_fail_count = control_plane_client.rebalance_fail_count
+                last_rebalance_fail_reasons = dict(control_plane_client.rebalance_fail_reasons)
         if not scheduled:
             if scheduler.is_finished() and recv_queue.empty() and not idle_sent:
                 try:
@@ -262,8 +295,25 @@ def data_plane_process(
                         f"rank {rank} scheduled local prefill without enough blocks: "
                         f"{missing_blocks}"
                     )
+                prefill_stats = [
+                    {
+                        "seq_id": seq.seq_id,
+                        "prefix_hit": seq.num_cached_tokens > 0,
+                        "num_cached_tokens": seq.num_cached_tokens,
+                    }
+                    for seq in local_seqs
+                ]
+                if prefill_stats:
+                    send_queue.put({"type": "prefill_stats", "rank": rank, "data": prefill_stats})
             outputs = model_runner.run(local_seqs, is_prefill)
             scheduler.postprocess(local_seqs, outputs)
+            first_tokens = [
+                (seq.seq_id, _as_token_list([seq.completion_token_ids[-1]])[0])
+                for seq in local_seqs
+                if seq.num_completion_tokens == 1
+            ]
+            if first_tokens:
+                send_queue.put({"type": "first_token", "rank": rank, "data": first_tokens})
             send_block_state()
 
         finished = [

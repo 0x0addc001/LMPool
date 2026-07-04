@@ -157,8 +157,11 @@ class LLMEngine:
     # return scheduled sequences and whether it is for prefilling
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
-    def _drain_worker_messages(self) -> list[tuple[int, list[int]]]:
+    def _drain_worker_messages(self) -> tuple[list[tuple[int, list[int]]], list[tuple[int, int]], list[dict], list[dict]]:
         finished = []
+        first_tokens = []
+        prefill_stats = []
+        runtime_stats = []
         for rank, q in self.recv_queues.items():
             try:
                 while True:
@@ -175,6 +178,12 @@ class LLMEngine:
                         for seq_id, tokens in msg["data"]:
                             finished.append((seq_id, tokens))
                             self.remote_inflight_seq_ids.discard(seq_id)
+                    elif msg_type == "first_token":
+                        first_tokens.extend(msg.get("data", []))
+                    elif msg_type == "prefill_stats":
+                        prefill_stats.extend(msg.get("data", []))
+                    elif msg_type == "runtime_stats":
+                        runtime_stats.append(msg.get("data", {}))
                     elif msg_type == "idle":
                         self.remote_finished.add(rank)
             except Empty:
@@ -182,15 +191,15 @@ class LLMEngine:
             except Exception as e:
                 logger.warning("worker message error from rank %s: %s", rank, e)
                 pass
-        return finished
+        return finished, first_tokens, prefill_stats, runtime_stats
 
-    def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
+    def step(self) -> tuple[list[tuple[int, list[int]]], list[tuple[int, int]], list[dict], list[dict]]:
         """Pump worker messages once and return any newly finished sequences."""
         self._ensure_control_plane_process()
-        finished = self._drain_worker_messages()
+        finished, first_tokens, prefill_stats, runtime_stats = self._drain_worker_messages()
         if not finished:
             time.sleep(0.01)
-        return finished, 0, False
+        return finished, first_tokens, prefill_stats, runtime_stats
 
 
     # add prompt string to the waiting queue by first transforming it to Sequence object

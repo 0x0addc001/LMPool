@@ -137,7 +137,7 @@ def test_prefill_rebalance_failure_does_not_preempt_current_batch():
     assert len(first.block_table) == first.num_blocks
     assert first in scheduler.running
     assert second in scheduler.waiting
-    assert dummy.rebalance_calls == [(0, 2)]
+    assert dummy.rebalance_calls == [(0, 1)]
 
 
 def test_postprocess_finishes_and_requeues_non_finished():

@@ -409,6 +409,27 @@ class BlockManager:
         """
         return {bid: self.blocks[bid].hash for bid in self.used_block_ids}
 
+    def get_evictable_block_hashes(self) -> dict[int, int]:
+        """
+        获取本地可 move-evict 的块。
+
+        ref_count > 0 的块仍被序列引用，只能作为复制式 migration 的来源，
+        不能作为释放源端空间的 eviction victim。
+        """
+        return {
+            bid: self.blocks[bid].hash
+            for bid in self.used_block_ids
+            if self.blocks[bid].ref_count == 0
+        }
+
+    def get_pinned_block_hashes(self) -> dict[int, int]:
+        """获取仍被引用、不可释放的块，用于诊断和未来复制式 migration。"""
+        return {
+            bid: self.blocks[bid].hash
+            for bid in self.used_block_ids
+            if self.blocks[bid].ref_count > 0
+        }
+
     def sync_with_global(self):
         """
         将本地块状态推送到 GlobalBlockManager

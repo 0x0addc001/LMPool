@@ -10,13 +10,16 @@
     --prompt-repeat 10 \
     --max-tokens 16 \
     --temperature 0.6 \
+    --output-json ./tmp/shared_prefix_benchmark.json \
     --nvlink-pairs 0,1 \
-    --output-json /tmp/shared_prefix_benchmark.json \
-    --output-figure /tmp/shared_prefix_benchmark.png
+    --submit-window 5 \
+    --goodput-e2e-sla-ms 10000 \
+    --output-figure ./tmp/shared_prefix_benchmark.png
 
 参数说明：
 1. `--num-prompts`：
-  本次压测总共生成多少条请求。值越大，并发压力越高，统计结果也更稳定。
+  本次压测总共生成多少条请求。脚本会为每条请求构造同一个共享前缀和不同后缀；
+  值越大，并发压力越高，统计结果也更稳定。
 
 2. `--prompt-repeat`：
   共享前缀重复多少次。值越大，公共前缀越长，越容易观察 prefix cache / 路由收益。
@@ -28,40 +31,55 @@
   采样温度。benchmark 默认主要看系统性能，通常保持固定值即可，不建议在不同实验间频繁改动。
 
 5. `--output-json`：
-  将各场景统计结果导出到指定 JSON 文件，便于后续画图、汇总表格或论文实验复现。
+  将各场景统计结果导出到指定 JSON 文件。脚本会自动创建父目录，并在成功后打印
+  `saved json: ...`。
 
 6. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
 7. `--nvlink-pairs`：
-  手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。如果不想手动写，可以传空字符串，让底层逻辑走自动探测。
+  手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
+  `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
+  可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。
 
 8. `--routing-max-cached-blocks`：
-  `multi-gpu-kv-routing` 场景的 KV block 上限，用来调节“主要看路由收益”时的缓存容量。
+  `multi-gpu-kv-routing` 场景的 KV block 上限。该场景启用控制面路由和全局页表，
+  但保留较大的缓存容量，主要用来观察 prefix-hit routing 的收益和控制面开销。
 
 9. `--eviction-max-cached-blocks`：
-  `multi-gpu-kv-swapping` 场景的 KV block 上限。通常设得更小，用来更容易触发 swap / rebalance。
+  `multi-gpu-kv-swapping` 场景的 KV block 上限。通常设得更小，用来更容易触发
+  swap / rebalance；请求仍按 round-robin 下发，用来隔离驱逐/迁移开销。
 
 10. `--goodput-e2e-sla-ms`：
-  goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，才计入 goodput。
+  goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
+  才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
 11. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 swapping。
 
 12. `--output-figure`：
-  将五种场景的核心指标画成一张图表图片并保存到指定路径，适合直接插入实验记录或论文草稿。
+  将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
+  使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
+
+13. `--submit-window`：
+  benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
+  prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
+  如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
 说明：
 1. 建议显式设置 CUDA_VISIBLE_DEVICES，避免在共享机器上误用其他 GPU。
 2. 如果物理 GPU 0 和 2 之间有 NVLink，可以使用 `CUDA_VISIBLE_DEVICES=0,2`。
    但脚本内部看到的是重映射后的逻辑 GPU `0,1`，因此 `--nvlink-pairs` 应写成 `0,1`，而不是 `0,2`。
 3. `multi-gpu`，`multi-gpu-kv-swapping` 场景当前采用 round-robin 分发。
-4. `multi-gpu-lmpool` 需要至少 2 张可见 CUDA GPU。
+4. 表里的 prefix hit 是 worker 在 prefill 时实际观察到的本地 prefix cache 命中率，
+   round-robin 基线也会统计，因此可横向对比。它不是控制面路由命中率。
+5. `multi-gpu-lmpool` 需要至少 2 张可见 CUDA GPU。
 """
 
 import argparse
 import json
 import multiprocessing as mp
+import os
 import subprocess
 import statistics
 import sys
@@ -163,7 +181,13 @@ class ScenarioResult:
     mean_e2e_s: float
     p50_e2e_s: float
     p95_e2e_s: float
+    route_hit_rate: float
+    routed_to_prefix_owner_rate: float
     prefix_hit_rate: float
+    swap_count: int
+    rebalance_success: int
+    rebalance_fail: int
+    rebalance_fail_reasons: dict[str, int]
     gpu_util_mean: float | None
     gpu_util_p95: float | None
     gpu_mem_util_mean: float | None
@@ -303,11 +327,12 @@ def _run_independent_worker(
     goodput_e2e_sla_s: float,
     result_queue,
 ):
-    # 独立 multi-gpu baseline：
+    # 旧版独立 multi-gpu helper：
     # - 每个 GPU 一个进程
     # - 没有全局控制面
     # - prompt 只做静态切分
-    # 这条路径的目的是提供“多卡但不共享 KV”的对照组
+    # 这条路径保留给离线 shard 对照实验。当前 main() 里的 `multi-gpu`
+    # 场景使用 LLMEngine + round-robin 在线提交，不再调用这个 helper。
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
@@ -394,8 +419,8 @@ def run_independent_multi_gpu_benchmark(
     tokenizer,
     goodput_e2e_sla_s: float,
 ) -> ScenarioResult | None:
-    # 这条 baseline 先按 GPU 数量把请求静态切分，再分别启动 worker
-    # 因此它不是动态调度，而是“静态 shard + 本地执行”的独立多卡基线
+    # 旧版离线 baseline：先按 GPU 数量把请求静态切分，再分别启动 worker。
+    # 当前 main() 不调用它；保留它是为了需要静态 shard 对照实验时复用。
     gpu_count = torch.cuda.device_count()
     if gpu_count < 2:
         return None
@@ -461,7 +486,13 @@ def run_independent_multi_gpu_benchmark(
             mean_e2e_s=_mean(e2es),
             p50_e2e_s=_median(e2es),
             p95_e2e_s=statistics.quantiles(e2es, n=20)[18] if len(e2es) >= 20 else (max(e2es) if e2es else 0.0),
+            route_hit_rate=0.0,
+            routed_to_prefix_owner_rate=0.0,
             prefix_hit_rate=prefix_hit_rate,
+            swap_count=0,
+            rebalance_success=0,
+            rebalance_fail=0,
+            rebalance_fail_reasons={},
             gpu_util_mean=gpu_util_mean,
             gpu_util_p95=gpu_util_p95,
             gpu_mem_util_mean=gpu_mem_util_mean,
@@ -516,6 +547,7 @@ def run_engine_scenario(
     tokenizer,
     route_mode: str = "control_plane",
     goodput_e2e_sla_s: float = 2.0,
+    submit_window: int = 8,
 ) -> ScenarioResult:
     # 调用 LLMEngine
     # prompt 先进入 launcher
@@ -524,16 +556,34 @@ def run_engine_scenario(
     engine = LLMEngine(config)
     submit_times: dict[int, float] = {}
     ttfts: list[float] = []
+    ttpts: list[float] = []
     e2es: list[float] = []
     total_tokens = 0
     goodput_tokens = 0
     route_hits = 0
+    routed_to_prefix_owner = 0
+    route_count = 0
+    prefill_hits = 0
+    prefill_count = 0
+    swap_count = 0
+    rebalance_success = 0
+    rebalance_fail = 0
+    rebalance_fail_reasons: dict[str, int] = {}
     start_wall = time.perf_counter()
     sampler = GpuMetricSampler(interval_s=0.5)
 
     try:
         sampler.start()
-        for prompt in prompts:
+
+        next_prompt_idx = 0
+        finished_count = 0
+        completion_times: dict[int, float] = {}
+        completion_token_counts: dict[int, int] = {}
+        inflight: set[int] = set()
+        effective_submit_window = len(prompts) if submit_window <= 0 else max(1, submit_window)
+
+        def submit_prompt(prompt: str):
+            nonlocal route_hits, routed_to_prefix_owner, route_count
             seq = Sequence(
                 token_ids=tokenizer.encode(prompt),
                 block_size=config["block_size"],
@@ -545,8 +595,12 @@ def run_engine_scenario(
                 # 控制面模式：每个请求都先做 prefix hash，再让全局调度器决定落在哪张卡
                 routed = engine.control_plane_client.route_sequence(seq, return_meta=True)
                 target_rank = routed["target_rank"]
-                if routed.get("route_info", {}).get("prefix_hit"):
+                route_info = routed.get("route_info", {})
+                route_count += 1
+                if route_info.get("prefix_hit"):
                     route_hits += 1
+                    if target_rank in route_info.get("hit_summary", {}):
+                        routed_to_prefix_owner += 1
             elif route_mode == "round_robin":
                 # round-robin 模式只用于剥离 swap 开销，不做全局路由打分
                 target_rank = len(submit_times) % config["world_size"]
@@ -556,28 +610,46 @@ def run_engine_scenario(
             seq.remote_gpu_id = -1
             engine.send_queues[target_rank].put({"type": "sequence", "seq": seq})
             submit_times[seq.seq_id] = start
+            inflight.add(seq.seq_id)
 
-        finished_count = 0
-        completion_times: dict[int, float] = {}
-        completion_token_counts: dict[int, int] = {}
+        while next_prompt_idx < len(prompts) and len(inflight) < effective_submit_window:
+            submit_prompt(prompts[next_prompt_idx])
+            next_prompt_idx += 1
+
         # 主循环不断泵 worker 消息，直到所有请求都完成
         while finished_count < len(prompts):
-            finished, _, _ = engine.step()
+            finished, first_tokens, prefill_stats, runtime_stats = engine.step()
             now = time.perf_counter()
+            for item in runtime_stats:
+                swap_count += int(item.get("swap_count", 0))
+                rebalance_success += int(item.get("rebalance_success", 0))
+                rebalance_fail += int(item.get("rebalance_fail", 0))
+                for reason, count in item.get("rebalance_fail_reasons", {}).items():
+                    rebalance_fail_reasons[reason] = rebalance_fail_reasons.get(reason, 0) + int(count)
+            for seq_id, _token in first_tokens:
+                if seq_id in submit_times:
+                    ttfts.append(now - submit_times[seq_id])
+            for item in prefill_stats:
+                prefill_count += 1
+                if item.get("prefix_hit", False):
+                    prefill_hits += 1
             for seq_id, tokens in finished:
+                inflight.discard(seq_id)
                 finished_count += 1
                 total_tokens += len(tokens)
-                ttfts.append(now - submit_times[seq_id])
-                e2es.append(now - submit_times[seq_id])
+                latency = now - submit_times[seq_id]
+                output_tokens = max(len(tokens), 1)
+                ttpts.append(latency / output_tokens)
+                e2es.append(latency)
                 completion_times[seq_id] = now
                 completion_token_counts[seq_id] = len(tokens)
+            while next_prompt_idx < len(prompts) and len(inflight) < effective_submit_window:
+                submit_prompt(prompts[next_prompt_idx])
+                next_prompt_idx += 1
         elapsed = time.perf_counter() - start_wall
     finally:
         sampler.stop()
         engine.exit()
-
-    if engine.control_plane_client is None:
-        route_hits = 0
 
     gpu_util_mean, gpu_util_p95, gpu_mem_util_mean, gpu_mem_util_p95 = sampler.summarize()
     # goodput：只有在给定 e2e SLA 内完成的请求，才计入有效吞吐
@@ -596,13 +668,19 @@ def run_engine_scenario(
         mean_ttft_s=_mean(ttfts),
         p50_ttft_s=_median(ttfts),
         p95_ttft_s=statistics.quantiles(ttfts, n=20)[18] if len(ttfts) >= 20 else (max(ttfts) if ttfts else 0.0),
-        mean_ttpt_s=_mean(ttfts),
-        p50_ttpt_s=_median(ttfts),
-        p95_ttpt_s=statistics.quantiles(ttfts, n=20)[18] if len(ttfts) >= 20 else (max(ttfts) if ttfts else 0.0),
+        mean_ttpt_s=_mean(ttpts),
+        p50_ttpt_s=_median(ttpts),
+        p95_ttpt_s=statistics.quantiles(ttpts, n=20)[18] if len(ttpts) >= 20 else (max(ttpts) if ttpts else 0.0),
         mean_e2e_s=_mean(e2es),
         p50_e2e_s=_median(e2es),
         p95_e2e_s=statistics.quantiles(e2es, n=20)[18] if len(e2es) >= 20 else (max(e2es) if e2es else 0.0),
-        prefix_hit_rate=route_hits / max(len(prompts), 1),
+        route_hit_rate=route_hits / max(route_count, 1),
+        routed_to_prefix_owner_rate=routed_to_prefix_owner / max(route_count, 1),
+        prefix_hit_rate=prefill_hits / max(prefill_count, 1),
+        swap_count=swap_count,
+        rebalance_success=rebalance_success,
+        rebalance_fail=rebalance_fail,
+        rebalance_fail_reasons=rebalance_fail_reasons,
         gpu_util_mean=gpu_util_mean,
         gpu_util_p95=gpu_util_p95,
         gpu_mem_util_mean=gpu_mem_util_mean,
@@ -629,10 +707,12 @@ def print_summary_table(results: list[ScenarioResult | None]):
     # 横向总表：把所有场景放在同一张表里，便于直接看五种配置的整体差异。
     valid_results = [result for result in results if result is not None]
     print("\nBenchmark Summary")
-    print("=" * 120)
+    print("=" * 160)
     print(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
-        f"{'e2e(ms)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} {'prefix hit':>12}"
+        f"{'e2e(ms)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
+        f"{'route hit':>11} {'owner hit':>11} {'local hit':>11} {'swaps':>8} {'reb ok':>8} {'reb fail':>9} "
+        f"{'pinned':>8} {'no space':>9} {'no plan':>8}"
     )
     for result in valid_results:
         print(
@@ -645,7 +725,15 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{result.p95_e2e_s * 1000:>12.2f} "
             f"{(result.gpu_util_mean if result.gpu_util_mean is not None else float('nan')):>10.2f} "
             f"{(result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else float('nan')):>10.2f} "
-            f"{fmt_pct(result.prefix_hit_rate):>12}"
+            f"{fmt_pct(result.route_hit_rate):>11} "
+            f"{fmt_pct(result.routed_to_prefix_owner_rate):>11} "
+            f"{fmt_pct(result.prefix_hit_rate):>11} "
+            f"{result.swap_count:>8} "
+            f"{result.rebalance_success:>8} "
+            f"{result.rebalance_fail:>9} "
+            f"{result.rebalance_fail_reasons.get('pinned_source', 0):>8} "
+            f"{result.rebalance_fail_reasons.get('no_target_space', 0):>9} "
+            f"{result.rebalance_fail_reasons.get('no_plan', 0):>8}"
         )
 
 
@@ -655,6 +743,12 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     if not valid_results:
         return
 
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     names = [result.name for result in valid_results]
@@ -663,44 +757,91 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     throughput = [result.throughput_tok_s for result in valid_results]
     goodput = [result.goodput_tok_s for result in valid_results]
     ttft_ms = [result.mean_ttft_s * 1000.0 for result in valid_results]
+    ttpt_ms = [result.mean_ttpt_s * 1000.0 for result in valid_results]
     e2e_ms = [result.mean_e2e_s * 1000.0 for result in valid_results]
-    prefix_hit_pct = [result.prefix_hit_rate * 100.0 for result in valid_results]
+    route_hit_pct = [result.route_hit_rate * 100.0 for result in valid_results]
+    owner_hit_pct = [result.routed_to_prefix_owner_rate * 100.0 for result in valid_results]
+    local_hit_pct = [result.prefix_hit_rate * 100.0 for result in valid_results]
     gpu_util = [result.gpu_util_mean if result.gpu_util_mean is not None else 0.0 for result in valid_results]
     gpu_mem_util = [result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else 0.0 for result in valid_results]
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle("Shared Prefix Benchmark Summary", fontsize=16)
 
+    def annotate_bars(ax, bars, suffix: str = "", decimals: int = 1):
+        max_height = 0.0
+        for bar in bars:
+            height = bar.get_height()
+            max_height = max(max_height, height)
+            label = f"{height:.{decimals}f}{suffix}"
+            ax.annotate(
+                label,
+                xy=(bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                rotation=0,
+            )
+        if max_height > 0:
+            top = ax.get_ylim()[1]
+            ax.set_ylim(top=max(top, max_height * 1.18))
+
     width = 0.38
-    axes[0, 0].bar([i - width / 2 for i in x], throughput, width=width, label="throughput")
-    axes[0, 0].bar([i + width / 2 for i in x], goodput, width=width, label="goodput")
+    bars = axes[0, 0].bar([i - width / 2 for i in x], throughput, width=width, label="throughput")
+    annotate_bars(axes[0, 0], bars)
+    bars = axes[0, 0].bar([i + width / 2 for i in x], goodput, width=width, label="goodput")
+    annotate_bars(axes[0, 0], bars)
     axes[0, 0].set_title("Throughput / Goodput")
     axes[0, 0].set_ylabel("tokens/s")
     axes[0, 0].set_xticks(x, names, rotation=15, ha="right")
     axes[0, 0].legend()
 
-    axes[0, 1].bar([i - width / 2 for i in x], ttft_ms, width=width, label="TTFT")
-    axes[0, 1].bar([i + width / 2 for i in x], e2e_ms, width=width, label="E2E")
+    latency_width = 0.25
+    bars = axes[0, 1].bar([i - latency_width for i in x], ttft_ms, width=latency_width, label="TTFT")
+    annotate_bars(axes[0, 1], bars, decimals=0)
+    bars = axes[0, 1].bar(x, ttpt_ms, width=latency_width, label="TTPT")
+    annotate_bars(axes[0, 1], bars, decimals=0)
+    bars = axes[0, 1].bar([i + latency_width for i in x], e2e_ms, width=latency_width, label="E2E")
+    annotate_bars(axes[0, 1], bars, decimals=0)
     axes[0, 1].set_title("Latency")
     axes[0, 1].set_ylabel("ms")
     axes[0, 1].set_xticks(x, names, rotation=15, ha="right")
     axes[0, 1].legend()
 
-    axes[1, 0].bar(x, prefix_hit_pct)
+    hit_width = 0.25
+    bars = axes[1, 0].bar([i - hit_width for i in x], route_hit_pct, width=hit_width, label="route")
+    annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
+    bars = axes[1, 0].bar(x, owner_hit_pct, width=hit_width, label="owner")
+    annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
+    bars = axes[1, 0].bar([i + hit_width for i in x], local_hit_pct, width=hit_width, label="local")
+    annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
     axes[1, 0].set_title("Prefix Hit Rate")
     axes[1, 0].set_ylabel("%")
     axes[1, 0].set_xticks(x, names, rotation=15, ha="right")
+    axes[1, 0].legend()
 
-    axes[1, 1].bar([i - width / 2 for i in x], gpu_util, width=width, label="GPU util")
-    axes[1, 1].bar([i + width / 2 for i in x], gpu_mem_util, width=width, label="GPU mem util")
+    bars = axes[1, 1].bar([i - width / 2 for i in x], gpu_util, width=width, label="GPU util")
+    annotate_bars(axes[1, 1], bars, suffix="%", decimals=1)
+    bars = axes[1, 1].bar([i + width / 2 for i in x], gpu_mem_util, width=width, label="GPU mem util")
+    annotate_bars(axes[1, 1], bars, suffix="%", decimals=1)
     axes[1, 1].set_title("GPU Utilization")
     axes[1, 1].set_ylabel("%")
     axes[1, 1].set_xticks(x, names, rotation=15, ha="right")
     axes[1, 1].legend()
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    print(f"saved figure: {output}")
+
+
+def save_summary_json(results: dict, output_path: str) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    print(f"saved json: {output}")
 
 
 def parse_args():
@@ -718,6 +859,7 @@ def parse_args():
     parser.add_argument("--goodput-e2e-sla-ms", type=float, default=2000.0)
     parser.add_argument("--skip-pool", action="store_true")
     parser.add_argument("--output-figure", type=str, default="")
+    parser.add_argument("--submit-window", type=int, default=8)
     return parser.parse_args()
 
 
@@ -764,6 +906,7 @@ def main():
         sampling_params,
         tokenizer,
         goodput_e2e_sla_s=goodput_e2e_sla_s,
+        submit_window=args.submit_window,
     )
     baseline_hit_rate = measure_single_gpu_prefix_hit_rate(
         tokenizer,
@@ -784,6 +927,7 @@ def main():
         tokenizer,
         route_mode="round_robin",
         goodput_e2e_sla_s=goodput_e2e_sla_s,
+        submit_window=args.submit_window,
     )
 
     # multi-gpu-kv-routing：走控制面路由，用来测 prefix 命中带来的收益
@@ -798,6 +942,7 @@ def main():
         tokenizer,
         route_mode="control_plane",
         goodput_e2e_sla_s=goodput_e2e_sla_s,
+        submit_window=args.submit_window,
     )
 
     # multi-gpu-kv-swapping：用 round-robin 分发，尽量隔离出 swap / rebalance 的开销
@@ -812,6 +957,7 @@ def main():
         tokenizer,
         route_mode="round_robin",
         goodput_e2e_sla_s=goodput_e2e_sla_s,
+        submit_window=args.submit_window,
     )
 
     pool_result = None
@@ -830,6 +976,7 @@ def main():
                 sampling_params,
                 tokenizer,
                 goodput_e2e_sla_s=goodput_e2e_sla_s,
+                submit_window=args.submit_window,
             )
 
     all_results = [
@@ -850,7 +997,7 @@ def main():
             "multi-gpu-kv-swapping": asdict(kv_eviction) if kv_eviction is not None else None,
             "multi-gpu-lmpool": asdict(pool_result) if pool_result is not None else None,
         }
-        Path(args.output_json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        save_summary_json(payload, args.output_json)
 
 
 if __name__ == "__main__":

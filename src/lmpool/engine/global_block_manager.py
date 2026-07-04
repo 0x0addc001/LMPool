@@ -165,6 +165,8 @@ class GlobalBlockManager:
         gpu_id: int,
         free_blocks: int,
         block_hashes: Dict[int, int],
+        evictable_block_hashes: Optional[Dict[int, int]] = None,
+        pinned_block_hashes: Optional[Dict[int, int]] = None,
     ):
         """
         Master-only state ingestion boundary.
@@ -190,7 +192,8 @@ class GlobalBlockManager:
                     del self.global_page_table[old_hash]
 
         self.block_hash[gpu_id] = dict(block_hashes)
-        self.block_access_time[gpu_id] = {block_id: now for block_id in block_hashes}
+        evictable = block_hashes if evictable_block_hashes is None else evictable_block_hashes
+        self.block_access_time[gpu_id] = {block_id: now for block_id in evictable}
 
         for block_id, block_hash in block_hashes.items():
             if block_hash == -1:

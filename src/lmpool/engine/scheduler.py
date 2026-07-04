@@ -1,4 +1,5 @@
 from collections import deque
+import time
 import torch.distributed as dist
 from lmpool.engine.sequence import Sequence, SequenceStatus
 from lmpool.engine.block_manager import BlockManager
@@ -33,6 +34,8 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.eos = eos
+        self._rebalance_cooldown_until: dict[tuple, float] = {}
+        self._rebalance_cooldown_s = 0.25
 
         # --------------------------------------------- #
         # 全局调度器接口
@@ -43,6 +46,12 @@ class Scheduler:
         
         # 当前 rank（用于路由判断）
         self.rank = dist.get_rank() if dist.is_initialized() else 0
+
+    def _rebalance_on_cooldown(self, key: tuple) -> bool:
+        return time.monotonic() < self._rebalance_cooldown_until.get(key, 0.0)
+
+    def _mark_rebalance_failed(self, key: tuple) -> None:
+        self._rebalance_cooldown_until[key] = time.monotonic() + self._rebalance_cooldown_s
 
     def is_finished(self):
         return len(self.waiting) == 0 and len(self.running) == 0
@@ -123,8 +132,14 @@ class Scheduler:
 
             if not can_alloc:
                 # 本地空闲不足：优先走控制面 rebalance 计划
+                shortage = max(0, seq.num_blocks - len(self.block_manager.free_block_ids))
+                cooldown_key = ("prefill", self.rank, shortage)
                 if self.global_scheduler is not None:
-                    rebalance_success = self.global_scheduler.rebalance(self.rank, seq.num_blocks)
+                    rebalance_success = False
+                    if shortage > 0 and not self._rebalance_on_cooldown(cooldown_key):
+                        rebalance_success = self.global_scheduler.rebalance(self.rank, shortage)
+                        if not rebalance_success:
+                            self._mark_rebalance_failed(cooldown_key)
                     if rebalance_success and self.block_manager.can_allocate(seq):
                         seq = self.waiting.popleft()
                         self.block_manager.allocate(seq)
@@ -173,7 +188,11 @@ class Scheduler:
                 # ---------------------------------------------------- #
                 rebalance_success = False
                 if self.global_scheduler is not None:
-                    rebalance_success = self.global_scheduler.rebalance(self.rank, 1)
+                    cooldown_key = ("decode", self.rank, 1)
+                    if not self._rebalance_on_cooldown(cooldown_key):
+                        rebalance_success = self.global_scheduler.rebalance(self.rank, 1)
+                        if not rebalance_success:
+                            self._mark_rebalance_failed(cooldown_key)
 
                 if rebalance_success:
                     # rebalance 成功，把序列放回队首，下轮重试

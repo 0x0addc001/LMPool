@@ -96,7 +96,12 @@ def test_data_plane_process_handles_sequence_and_exit():
         seq = Sequence([1, 2], block_size=2)
         seq.remote_gpu_id = 0
         recv_queue.put({"type": "sequence", "seq": seq})
-        assert send_queue.get(timeout=10)["type"] == "finished"
+        seen = []
+        while "finished" not in {msg["type"] for msg in seen}:
+            seen.append(send_queue.get(timeout=10))
+        assert "prefill_stats" in {msg["type"] for msg in seen}
+        assert "first_token" in {msg["type"] for msg in seen}
+        assert "finished" in {msg["type"] for msg in seen}
         recv_queue.put({"type": "exit"})
         thread.join(timeout=10)
         assert not thread.is_alive()

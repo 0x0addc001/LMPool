@@ -231,14 +231,19 @@ The `benchmarks/` directory includes a shared-prefix workload benchmark with the
 
 Reported metrics:
 
-- throughput
-- goodput
+- throughput in generated tokens/s
+- goodput in generated tokens/s under `--goodput-e2e-sla-ms`
 - mean / p95 TTFT
 - mean / p95 TTPT
 - mean / p95 end-to-end latency
 - GPU utilization mean / p95
 - GPU memory utilization mean / p95
 - prefix hit rate
+- route hit / prefix-owner hit
+- swap count and rebalance success / failure counts
+
+The current `multi-gpu` baseline uses online round-robin dispatch. Control-plane scenarios should use a bounded `--submit-window` such as `4` or `8` when measuring prefix reuse, because routing can only hit prefixes that previous requests have already prefetched and reported to the global page table.
+The benchmark records TTFT from explicit first-token events emitted by data-plane workers. Local prefix hit is measured as worker-side prefill cache hit rate for every scenario, including round-robin baselines. Route hit and prefix-owner hit are reported separately for control-plane scenarios.
 
 See `benchmarks/README.md` for usage.
 

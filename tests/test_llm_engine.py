@@ -70,9 +70,15 @@ def test_llm_engine_add_prompt_and_drain_messages(monkeypatch):
     assert queued["seq"].token_ids == [97, 98]
 
     engine.recv_queues[0].put({"type": "sequence", "target": 0, "seq": Sequence([1, 2], block_size=2)})
+    engine.recv_queues[0].put({"type": "first_token", "data": [(123, 9)]})
+    engine.recv_queues[0].put({"type": "prefill_stats", "data": [{"seq_id": 123, "prefix_hit": True, "num_cached_tokens": 2}]})
+    engine.recv_queues[0].put({"type": "runtime_stats", "data": {"swap_count": 2}})
     engine.recv_queues[0].put({"type": "finished", "data": [(123, [9, 8])]})
-    finished, _, _ = engine.step()
+    finished, first_tokens, prefill_stats, runtime_stats = engine.step()
     assert finished == [(123, [9, 8])]
+    assert first_tokens == [(123, 9)]
+    assert prefill_stats == [{"seq_id": 123, "prefix_hit": True, "num_cached_tokens": 2}]
+    assert runtime_stats == [{"swap_count": 2}]
     forwarded = engine.send_queues[0].get(timeout=1)
     assert forwarded["type"] == "sequence"
 

@@ -231,14 +231,23 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 报告指标包括：
 
-- throughput
-- goodput
+- throughput，单位为生成 token/s
+- goodput，单位为满足 `--goodput-e2e-sla-ms` 的生成 token/s
 - mean / p95 TTFT
 - mean / p95 TTPT
 - mean / p95 端到端延迟
 - GPU 利用率 mean / p95
 - GPU 显存利用率 mean / p95
 - 前缀命中率
+- route hit / prefix-owner hit
+- swap count 和 rebalance success / failure count
+
+当前 `multi-gpu` 基线采用在线 round-robin 分发。控制面场景如果要观察 prefix reuse，建议使用
+`--submit-window 4` 或 `--submit-window 8`，因为只有前序请求完成 prefill 并上报全局页表后，
+后续请求的路由决策才可能产生前缀命中。
+当前 benchmark 的 TTFT 来自 data-plane worker 上报的 first-token 事件。local prefix hit 统计
+worker 在 prefill 时实际发生的本地 prefix cache 命中率，因此 round-robin 基线也会有可比数值。
+控制面 route hit 和 prefix-owner hit 会单独报告。
 
 具体用法见 `benchmarks/README.md`。
 

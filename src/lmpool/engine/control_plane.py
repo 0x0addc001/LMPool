@@ -2,7 +2,7 @@ import logging
 import queue
 import time
 import uuid
-from collections import deque
+from collections import defaultdict, deque
 from multiprocessing import Queue
 from typing import Optional
 
@@ -46,6 +46,9 @@ class ControlPlaneClient:
         self._last_control_heartbeat = time.monotonic()
         self._last_worker_heartbeat = 0.0
         self._control_down_reported = False
+        self.rebalance_success_count = 0
+        self.rebalance_fail_count = 0
+        self.rebalance_fail_reasons = defaultdict(int)
 
     def route_sequence(self, seq: Sequence, return_meta: bool = False) -> int | dict:
         request_id = uuid.uuid4().hex
@@ -77,7 +80,13 @@ class ControlPlaneClient:
             if msg.get("type") == "error":
                 raise RuntimeError(msg.get("error", "control plane request failed"))
 
-    def report_block_state(self, free_blocks: int, block_hashes: dict[int, int]):
+    def report_block_state(
+        self,
+        free_blocks: int,
+        block_hashes: dict[int, int],
+        evictable_block_hashes: dict[int, int] | None = None,
+        pinned_block_hashes: dict[int, int] | None = None,
+    ):
         if self.rank < 0:
             return
         self.request_queue.put({
@@ -85,6 +94,8 @@ class ControlPlaneClient:
             "rank": self.rank,
             "free_blocks": free_blocks,
             "block_hashes": block_hashes,
+            "evictable_block_hashes": evictable_block_hashes,
+            "pinned_block_hashes": pinned_block_hashes,
         })
 
     def rebalance(self, gpu_id: int, needed_blocks: int) -> bool:
@@ -104,7 +115,13 @@ class ControlPlaneClient:
                 self._stashed_messages.append(msg)
                 continue
             if msg.get("type") == "rebalance_response":
-                return bool(msg.get("success", False))
+                success = bool(msg.get("success", False))
+                if success:
+                    self.rebalance_success_count += 1
+                else:
+                    self.rebalance_fail_count += 1
+                    self.rebalance_fail_reasons[msg.get("reason", "unknown")] += 1
+                return success
             if msg.get("type") == "error":
                 logger.error(
                     "rank %s rebalance error for gpu=%s needed=%s: %s",
@@ -113,6 +130,8 @@ class ControlPlaneClient:
                     needed_blocks,
                     msg.get("error", "unknown error"),
                 )
+                self.rebalance_fail_count += 1
+                self.rebalance_fail_reasons["error"] += 1
                 return False
 
     def close(self):
@@ -347,6 +366,8 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 msg["rank"],
                 msg["free_blocks"],
                 msg["block_hashes"],
+                msg.get("evictable_block_hashes"),
+                msg.get("pinned_block_hashes"),
             )
             service_heartbeats()
             continue
@@ -360,9 +381,11 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             if isinstance(result, dict):
                 result_success = bool(result.get("success", False))
                 result_error = result.get("error", "rebalance failed")
+                result_reason = result.get("reason", result_error)
             else:
                 result_success = bool(result)
                 result_error = "rebalance failed"
+                result_reason = "unknown"
             if not result_success:
                 prepared_ranks = set(plan.get("prepared_ranks", set()))
                 if prepared_ranks:
@@ -372,6 +395,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     "request_id": plan["request_id"],
                     "success": False,
                     "error": result_error,
+                    "reason": result_reason,
                     "plan_id": plan_id,
                 })
                 del pending_rebalances[plan_id]
@@ -437,6 +461,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "type": "rebalance_response",
                         "request_id": msg["request_id"],
                         "success": False,
+                        "reason": scheduler.last_rebalance_fail_reason or "no_plan",
                     })
                     continue
 
@@ -455,6 +480,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "request_id": msg["request_id"],
                         "success": False,
                         "error": "rebalance plan has no target ranks",
+                        "reason": "no_plan",
                     })
                     continue
 

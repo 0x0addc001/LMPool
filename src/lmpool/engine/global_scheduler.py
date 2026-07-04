@@ -40,6 +40,7 @@ class GlobalScheduler:
         self.gbm = gbm
         self.block_manager = block_manager
         self.model_runner = model_runner
+        self.last_rebalance_fail_reason = ""
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -315,6 +316,20 @@ class GlobalScheduler:
         """
         import copy
 
+        self.last_rebalance_fail_reason = ""
+        target_order = self.gbm._get_target_gpu_order(gpu_id)
+        if not target_order:
+            self.last_rebalance_fail_reason = "no_plan"
+            return None
+        if not self.gbm.block_access_time[gpu_id]:
+            self.last_rebalance_fail_reason = (
+                "pinned_source" if self.gbm.block_hash[gpu_id] else "no_plan"
+            )
+            return None
+        if sum(self.gbm.get_free_blocks_count(target) for target in target_order) < needed_blocks:
+            self.last_rebalance_fail_reason = "no_target_space"
+            return None
+
         gbm_snapshot = copy.deepcopy(self.gbm)
         candidates = gbm_snapshot.select_eviction_candidates(
             gpu_id,
@@ -322,6 +337,7 @@ class GlobalScheduler:
             allow_recursive=False,
         )
         if not candidates or len(candidates) < needed_blocks:
+            self.last_rebalance_fail_reason = "no_plan"
             return None
 
         actual_candidates = candidates[:needed_blocks]

@@ -37,6 +37,20 @@ def test_update_allocate_and_free_global_state():
     assert gbm.get_free_blocks_count(1) == 3
 
 
+def test_update_gpu_state_uses_only_evictable_blocks_for_eviction():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=0,
+        block_hashes={0: 111, 1: 222},
+        evictable_block_hashes={1: 222},
+        pinned_block_hashes={0: 111},
+    )
+    gbm.free_blocks_per_gpu[1] = 1
+
+    assert gbm.select_eviction_candidates(0, 1, allow_recursive=False) == [(1, 1)]
+
+
 def test_select_eviction_candidates_can_recurse_to_nvlink_partner():
     gbm = GlobalBlockManager(
         rank=0,
