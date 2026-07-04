@@ -10,11 +10,11 @@
     --prompt-repeat 10 \
     --max-tokens 16 \
     --temperature 0.6 \
-    --output-json ./tmp/shared_prefix_benchmark.json \
+    --output-json ./benchmarks/results/shared_prefix_benchmark.json \
     --nvlink-pairs 0,1 \
     --submit-window 5 \
     --goodput-e2e-sla-ms 10000 \
-    --output-figure ./tmp/shared_prefix_benchmark.png
+    --output-figure ./benchmarks/results/shared_prefix_benchmark.png
 
 参数说明：
 1. `--num-prompts`：
