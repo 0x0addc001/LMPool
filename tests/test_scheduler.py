@@ -140,6 +140,58 @@ def test_prefill_rebalance_failure_does_not_preempt_current_batch():
     assert dummy.rebalance_calls == [(0, 1)]
 
 
+def test_prefill_capacity_uses_cached_prefix_blocks():
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=2,
+        block_size=2,
+        eos=999,
+        global_scheduler=None,
+    )
+    cached = Sequence([1, 2], block_size=2)
+    scheduler.block_manager.allocate(cached)
+    cached.status = SequenceStatus.RUNNING
+    scheduler.running.append(cached)
+
+    seq = Sequence([1, 2, 3, 4], block_size=2)
+    scheduler.add_sequence(seq)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled == [seq]
+    assert seq.num_cached_tokens == 2
+
+
+def test_prefill_can_disable_foreground_rebalance():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=1, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm, rebalance_result=True)
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=1,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    scheduler.enable_foreground_rebalance = False
+
+    running_seq = Sequence([1, 2], block_size=2)
+    scheduler.block_manager.allocate(running_seq)
+    running_seq.status = SequenceStatus.RUNNING
+    scheduler.running.append(running_seq)
+
+    waiting_seq = Sequence([3, 4], block_size=2)
+    scheduler.add_sequence(waiting_seq)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert scheduled == []
+    assert is_prefill is False
+    assert dummy.rebalance_calls == []
+
+
 def test_postprocess_finishes_and_requeues_non_finished():
     scheduler = Scheduler(
         max_num_sequences=4,

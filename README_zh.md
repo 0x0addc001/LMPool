@@ -20,7 +20,7 @@
 
 ## 1. 概述
 
-LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池。它在 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 Paged Attention 基础上，扩展了 KV Cache 感知的跨 GPU 路由和驱逐。
+LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Cache 池。它在 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 Paged Attention 基础上，扩展了 KV Cache 感知的跨 GPU 路由和 NVLink KV transfer。
 
 ### 1.1 问题
 
@@ -35,7 +35,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 1. `GlobalBlockManager` 维护跨 GPU 的全局页表。
 2. 块级 hash 链编码前缀，支持前缀复用决策。
 3. `GlobalScheduler` 负责请求路由与重平衡编排。
-4. `kv_transfer` 负责基于 NCCL 的 KV 迁移。
+4. `kv_transfer` 负责基于 NCCL 的 KV transfer。
 5. `LLMEngine` 作为 launcher / supervisor，启动独立控制进程和每卡数据面 worker。
 
 ---
@@ -62,7 +62,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 4. `LLMEngine` 将 `Sequence` 转发给目标 worker。
 5. worker 通过 `Scheduler` 和 `ModelRunner` 执行 prefill / decode。
 6. 如果显存压力过高，worker 向控制进程请求 rebalance。
-7. 控制进程下发 swap 计划，worker 执行 NCCL 搬运并回报状态。
+7. 控制进程下发 transfer 计划，worker 执行 NCCL 搬运并回报状态。
 
 ---
 
@@ -88,7 +88,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 - `src/lmpool/engine/model_runner.py`
 - `src/lmpool/engine/kv_transfer.py`
 
-每个数据面进程绑定一张 GPU，负责本地调度、KV 块分配、模型执行，以及控制面下发的 swap 任务。
+每个数据面进程绑定一张 GPU，负责本地调度、KV 块分配、模型执行，以及控制面下发的 KV transfer 任务。
 
 ### 4.3 Sequence（序列）
 
@@ -103,14 +103,14 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 `GlobalScheduler` 是跨 GPU 决策层，当前运行在独立控制进程中。它对外暴露两个主入口：
 
 - `route_sequence_meta()`：请求路由
-- `plan_rebalance()`：swap 编排
+- `plan_rebalance()`：transfer 编排
 
 路由策略：
 
 1. 只对完整块做 hash
 2. 在全局页表中查找前缀命中
-3. 优先选择前缀命中分数最高的 GPU
-4. 如果没有命中，则回退到空闲块最多的 GPU
+3. 优先选择扣除队列压力后的前缀命中分数最高的 GPU
+4. 如果没有命中，则回退到负载更低且空闲块更多的 GPU
 5. 路由后进行乐观 reserve
 
 当前路由权重如下：
@@ -176,7 +176,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 - `is_remote_prefix`
 - `remote_gpu_id`
-- `pending_swap_in`
+- `pending_swap_in`：legacy 字段名，表示待 transfer-in 的远端块
 
 这些字段可通过 `multiprocessing.Queue` 跨进程传递。
 
@@ -199,6 +199,10 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 | `heartbeat_interval` | `float` | 控制面与数据面的心跳周期 |
 | `heartbeat_timeout` | `float` | 控制面 / worker 存活检测超时 |
 | `nvlink_topo.pairs` | `List[Tuple[int, int]]` | 可选的 NVLink 直连 GPU 对；如果不配置，代码会尽量从 `nvidia-smi topo -m` 自动解析 |
+| `route_prefix_hit_weight` | `float` | 全局路由中可复用前缀块的正向权重 |
+| `route_queue_pressure_weight` | `float` | worker waiting/running 队列压力的惩罚权重 |
+| `route_free_block_weight` | `float` | 空闲 KV block 的轻量 tie-breaker 权重 |
+| `route_cache_queue_slack` | `float` | 允许使用 cached prefix route 的最大队列压力余量 |
 
 ### 6.2 运行
 
@@ -226,7 +230,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 - `single-gpu`
 - `multi-gpu`
 - `multi-gpu-kv-routing`
-- `multi-gpu-kv-swapping`
+- `multi-gpu-kv-transfer`
 - `multi-gpu-lmpool`
 
 报告指标包括：
@@ -240,7 +244,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 - GPU 显存利用率 mean / p95
 - 前缀命中率
 - route hit / prefix-owner hit
-- swap count 和 rebalance success / failure count
+- transfer / copy count 和 rebalance success / failure count
 
 当前 `multi-gpu` 基线采用在线 round-robin 分发。控制面场景如果要观察 prefix reuse，建议使用
 `--submit-window 4` 或 `--submit-window 8`，因为只有前序请求完成 prefill 并上报全局页表后，

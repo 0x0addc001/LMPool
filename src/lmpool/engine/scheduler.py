@@ -11,9 +11,9 @@ class Scheduler:
     本地调度器
 
     扩展功能（当启用全局池化时）：
-    - prefill 阶段：通过 GlobalScheduler.route_sequence 决定序列归属 GPU
-    - decode 阶段：本地空闲不足时，通过 GlobalScheduler.rebalance 触发跨 GPU swap
-    - 序列可能被标记为远程前缀（pending_swap_in 非空），后续由 ModelRunner 拉取
+    - prefill 阶段：由入口控制面决定序列归属 GPU
+    - decode 阶段：本地空闲不足时，通过 GlobalScheduler.rebalance 触发跨 GPU transfer
+    - 序列可能被标记为远程前缀（pending_swap_in 非空，legacy internal name），后续由 ModelRunner 拉取
     """
 
     def __init__(
@@ -36,6 +36,7 @@ class Scheduler:
         self.eos = eos
         self._rebalance_cooldown_until: dict[tuple, float] = {}
         self._rebalance_cooldown_s = 0.25
+        self.enable_foreground_rebalance = True
 
         # --------------------------------------------- #
         # 全局调度器接口
@@ -66,6 +67,12 @@ class Scheduler:
             self.global_scheduler.report_block_state(
                 len(self.block_manager.free_block_ids),
                 self.block_manager.get_local_block_hashes(),
+                self.block_manager.get_evictable_block_hashes(),
+                self.block_manager.get_pinned_block_hashes(),
+                len(self.waiting),
+                len(self.running),
+                sum(len(seq) for seq in self.waiting),
+                sum(len(seq) for seq in self.running),
             )
             return
         gbm = self.global_scheduler.gbm
@@ -132,9 +139,10 @@ class Scheduler:
 
             if not can_alloc:
                 # 本地空闲不足：优先走控制面 rebalance 计划
-                shortage = max(0, seq.num_blocks - len(self.block_manager.free_block_ids))
+                required_new_blocks = self.block_manager.num_required_new_blocks(seq)
+                shortage = max(0, required_new_blocks - len(self.block_manager.free_block_ids))
                 cooldown_key = ("prefill", self.rank, shortage)
-                if self.global_scheduler is not None:
+                if self.global_scheduler is not None and self.enable_foreground_rebalance:
                     rebalance_success = False
                     if shortage > 0 and not self._rebalance_on_cooldown(cooldown_key):
                         rebalance_success = self.global_scheduler.rebalance(self.rank, shortage)
@@ -149,7 +157,7 @@ class Scheduler:
                         scheduled_sequences.append(seq)
                         self._sync_local_state_to_global()
                         continue
-                # swap 失败或未启用全局池化：抢占一个 running 序列腾空间。
+                # transfer 失败或未启用全局池化：抢占一个 running 序列腾空间。
                 # 这覆盖源端 prepare 因 ref_count>0 拒绝 eviction 的情况，避免
                 # waiting 队首请求反复触发同一个不可执行 rebalance 计划。
                 if scheduled_sequences:
@@ -187,7 +195,7 @@ class Scheduler:
                 # 全局 rebalance：尝试腾出 1 个块
                 # ---------------------------------------------------- #
                 rebalance_success = False
-                if self.global_scheduler is not None:
+                if self.global_scheduler is not None and self.enable_foreground_rebalance:
                     cooldown_key = ("decode", self.rank, 1)
                     if not self._rebalance_on_cooldown(cooldown_key):
                         rebalance_success = self.global_scheduler.rebalance(self.rank, 1)

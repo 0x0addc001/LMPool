@@ -58,6 +58,7 @@ def data_plane_process(
         eos=config.get("eos", 50256),
         global_scheduler=control_plane_client,
     )
+    scheduler.enable_foreground_rebalance = bool(config.get("enable_foreground_rebalance", True))
     prepared_rebalance_blocks: dict[str, dict[tuple[int, tuple[int, ...]], list[int]]] = {}
 
     def execute_rebalance_plan(plan: dict):
@@ -76,10 +77,11 @@ def data_plane_process(
 
         if phase == "prepare":
             prepared: dict[tuple[int, tuple[int, ...]], list[int]] = {}
+            is_background = bool(plan.get("background"))
             source_blocks = [
                 block_id
                 for transfer in transfers
-                if rank == transfer["src_gpu"]
+                if rank == transfer["src_gpu"] and transfer.get("mode", "move") != "copy"
                 for block_id in transfer["src_blocks"]
             ]
             pinned_blocks = [
@@ -88,6 +90,15 @@ def data_plane_process(
                 if scheduler.block_manager.blocks[block_id].ref_count != 0
             ]
             if pinned_blocks:
+                if is_background:
+                    send_queue.put({
+                        "type": "runtime_stats",
+                        "rank": rank,
+                        "data": {
+                            "background_copy_fail": 1,
+                            "background_copy_fail_reasons": {"pinned_source": 1},
+                        },
+                    })
                 send_block_state()
                 return {
                     "success": False,
@@ -102,6 +113,15 @@ def data_plane_process(
                 if rank == transfer["dst_gpu"]
             )
             if len(scheduler.block_manager.free_block_ids) < needed:
+                if is_background:
+                    send_queue.put({
+                        "type": "runtime_stats",
+                        "rank": rank,
+                        "data": {
+                            "background_copy_fail": 1,
+                            "background_copy_fail_reasons": {"no_target_space": 1},
+                        },
+                    })
                 send_block_state()
                 return {
                     "success": False,
@@ -131,14 +151,23 @@ def data_plane_process(
             dst_gpu = transfer["dst_gpu"]
             src_blocks = transfer["src_blocks"]
             hashes = transfer.get("hashes", [-1] * len(src_blocks))
+            mode = transfer.get("mode", plan.get("mode", "move"))
 
             if rank == src_gpu:
                 model_runner.execute_swap_out(src_blocks, dst_gpu)
-                scheduler.block_manager.release_blocks(src_blocks)
+                if mode != "copy":
+                    scheduler.block_manager.release_blocks(src_blocks)
+                stats = {
+                    "transfer_count": len(src_blocks),
+                    "swap_count": len(src_blocks),
+                    "transfer_copy_count": len(src_blocks) if mode == "copy" else 0,
+                }
+                if plan.get("background") and mode == "copy":
+                    stats["background_copy_success"] = 1
                 send_queue.put({
                     "type": "runtime_stats",
                     "rank": rank,
-                    "data": {"swap_count": len(src_blocks)},
+                    "data": stats,
                 })
             elif rank == dst_gpu:
                 prepared = prepared_rebalance_blocks.get(plan_id, {})
@@ -182,6 +211,10 @@ def data_plane_process(
             scheduler.block_manager.get_local_block_hashes(),
             scheduler.block_manager.get_evictable_block_hashes(),
             scheduler.block_manager.get_pinned_block_hashes(),
+            len(scheduler.waiting),
+            len(scheduler.running),
+            sum(len(seq) for seq in scheduler.waiting),
+            sum(len(seq) for seq in scheduler.running),
         )
 
     send_block_state()

@@ -81,11 +81,41 @@ class BlockManager:
 
     # whether we can allocate a block for this sequence
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= self.num_required_new_blocks(seq)
+
+    def num_required_new_blocks(self, seq: Sequence) -> int:
+        """
+        Return how many physical blocks must be newly allocated for seq.
+
+        Cached full blocks already present in hash_to_block_id do not consume a
+        free block. This matters for shared-prefix routing: requiring
+        seq.num_blocks free blocks would reject requests that can mostly reuse
+        local KV cache and would unnecessarily trigger foreground rebalance.
+        """
+        required = 0
+        h = -1
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            if len(token_ids) != self.block_size:
+                required += 1
+                h = -1
+                continue
+
+            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1:
+                required += 1
+                continue
+
+            cached_tokens = self.blocks[block_id].token_ids
+            if cached_tokens is not None and cached_tokens != token_ids:
+                required += 1
+        return required
 
 
     def allocate(self, seq: Sequence) -> None:
         h = -1
+        contiguous_prefix_hit = True
         for i in range(seq.num_blocks):
             no_cache_found = False
 
@@ -95,12 +125,17 @@ class BlockManager:
             block_id = self.hash_to_block_id.get(h, -1)
             
             # if cache miss or hash collision
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if block_id == -1:
                 no_cache_found = True
+            else:
+                cached_tokens = self.blocks[block_id].token_ids
+                if cached_tokens is not None and cached_tokens != token_ids:
+                    no_cache_found = True
 
             if not no_cache_found:
                 # update sequence information
-                seq.num_cached_tokens += self.block_size  # which == len(token_ids)
+                if contiguous_prefix_hit:
+                    seq.num_cached_tokens += self.block_size  # which == len(token_ids)
                 # update block information, considering the edge case that the block is not allocated yet but with hash code
                 if block_id not in self.used_block_ids:
                     block = self._allocate_block(block_id)
@@ -109,6 +144,7 @@ class BlockManager:
                     block = self.blocks[self.hash_to_block_id[h]]
                     block.ref_count += 1
             else:
+                contiguous_prefix_hit = False
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
                 block.ref_count = 1
@@ -188,7 +224,7 @@ class BlockManager:
         流程:
         1. 计算序列前缀 hash
         2. 调用 gbm.lookup_prefix 查找远程命中
-        3. 若命中，标记 seq 的远程前缀信息，后续由 ModelRunner 做 swap_in
+        3. 若命中，标记 seq 的远程前缀信息，后续由 ModelRunner 做 transfer in
 
         返回:
             (是否有远程前缀命中, 命中块所在的 GPU rank)
@@ -244,7 +280,7 @@ class BlockManager:
         # 标记序列的远程前缀信息
         seq.is_remote_prefix = True
         seq.remote_gpu_id = best_gpu
-        # 记录需要 swap_in 的远端块（按 block table 顺序）
+        # 记录需要 transfer in 的远端块（按 block table 顺序）
         seq.pending_swap_in = gpu_hit_count[best_gpu]
 
         return True, best_gpu
@@ -256,7 +292,7 @@ class BlockManager:
         流程:
         1. 检查本地空闲块是否够
         2. 不够则调用 gbm.select_eviction_candidates 获取换出候选
-        3. 标记需要 swap_out 的块（实际传输由 ModelRunner 执行）
+        3. 标记需要 transfer out 的块（实际传输由 ModelRunner 执行）
         4. 本地分配新块
 
         返回:
@@ -280,7 +316,7 @@ class BlockManager:
         if not candidates or len(candidates) < shortage:
             return False
 
-        # 释放被选中的本地冷块（数据已由 swap_out 搬走）
+        # 释放被选中的本地冷块（数据已由 transfer out 搬走）
         for local_block, target_gpu in candidates:
             # 从 used 移到 free（但不立即复用，等分配时再取）
             block = self.blocks[local_block]
@@ -302,9 +338,9 @@ class BlockManager:
 
     def append_with_swap(self, seq: Sequence) -> bool:
         """
-        解码追加时空间不足的 swap 版本
+        解码追加时空间不足的 transfer 版本
 
-        流程同 allocate_with_swap，但只分配 1 个块。
+        流程同 allocate_with_swap（legacy internal name），但只分配 1 个块。
 
         返回:
             是否成功
@@ -349,7 +385,7 @@ class BlockManager:
         预留指定数量的空闲块，返回被预留的 block_id 列表。
 
         这些块会从 free 集合移到 used 集合，但不会立刻绑定到某个
-        Sequence。用于控制平面下的 swap_in 目标块分配。
+        Sequence。用于控制平面下的 transfer-in 目标块分配。
         """
         if len(self.free_block_ids) < num_blocks:
             raise RuntimeError(
@@ -376,7 +412,7 @@ class BlockManager:
 
     def release_reserved_blocks(self, block_ids: list[int]) -> None:
         """
-        释放 prepare 阶段预留但尚未完成 swap-in 注册的块。
+        释放 prepare 阶段预留但尚未完成 transfer-in 注册的块。
         """
         for block_id in block_ids:
             if block_id not in self.used_block_ids:
@@ -388,7 +424,7 @@ class BlockManager:
 
     def register_swap_in_blocks(self, block_ids: list[int], hashes: list[int]) -> None:
         """
-        将已接收的 swap-in 块登记到本地 hash 表。
+        将已接收的 transfer-in 块登记到本地 hash 表。
 
         这一步不分配新的物理块，只更新 block.hash / hash_to_block_id，
         便于后续全局页表同步和前缀查找。
@@ -398,7 +434,9 @@ class BlockManager:
         for block_id, h in zip(block_ids, hashes):
             block = self.blocks[block_id]
             block.hash = h
-            block.token_ids = []
+            # transfer-in blocks already contain valid KV data but do not carry
+            # original token ids. Treat token_ids=None as a trusted hash match.
+            block.token_ids = None
             if h != -1:
                 self.hash_to_block_id[h] = block_id
 

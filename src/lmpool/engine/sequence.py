@@ -43,7 +43,8 @@ class Sequence:
         self.is_remote_prefix = False
         # 远程前缀所在的 GPU rank，-1 表示所有块都在本地
         self.remote_gpu_id = -1
-        # 等待从远端 swap_in 的块索引列表（远端 GPU 上的 physical block id）
+        # 等待从远端 transfer in 的块索引列表（远端 GPU 上的 physical block id）。
+        # 字段名保留 pending_swap_in 以兼容现有序列序列化和测试。
         self.pending_swap_in = []
 
     def __len__(self):

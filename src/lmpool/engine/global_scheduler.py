@@ -3,12 +3,12 @@
 
 负责跨 GPU 的两类决策：
 1. 请求路由：新序列应该在哪个 GPU 上执行（前缀复用 + 负载均衡）
-2. 显存重平衡：本地空闲块不足时，编排跨 GPU 的 swap 操作
+2. 显存重平衡：本地空闲块不足时，编排跨 GPU 的 transfer 操作
 
 设计要点：
 1. 依赖 GlobalBlockManager 获取全局页表和空闲块分布
 2. 依赖本地 BlockManager 做前缀 hash 计算
-3. swap 编排需要和目标 GPU 上的 GlobalBlockManager 协同
+3. transfer 编排需要和目标 GPU 上的 GlobalBlockManager 协同
 """
 
 import logging
@@ -26,8 +26,8 @@ class GlobalScheduler:
 
     职责：
     - route_sequence:   决定新序列的归属 GPU
-    - rebalance:        编排 swap，为本 GPU 腾出空闲块
-    - preempt_for_swap: 当 rebalance 失败时，选择序列回退
+    - rebalance:        编排 transfer，为本 GPU 腾出空闲块
+    - preempt_for_transfer: 当 rebalance 失败时，选择序列回退
     """
 
     def __init__(self, gbm, block_manager, model_runner=None):
@@ -41,6 +41,14 @@ class GlobalScheduler:
         self.block_manager = block_manager
         self.model_runner = model_runner
         self.last_rebalance_fail_reason = ""
+        self.prefix_hit_weight = 8.0
+        self.queue_pressure_weight = 1.0
+        self.free_block_weight = 0.05
+        self.load_weight = 0.01
+        self.waiting_token_weight = 1.0
+        self.running_token_weight = 0.25
+        self.running_sequence_weight = 32.0
+        self.load_bypass_threshold = 512.0
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -55,7 +63,7 @@ class GlobalScheduler:
         2. 查询 gbm.lookup_prefix 获取前缀命中的 GPU 列表
         3. 选择前缀命中数 × 拓扑权重最高的 GPU
         4. 若无命中，选择当前空闲块最多的 GPU
-        5. 如果命中 GPU 空闲块不足，选择最适合做 swap 的目标 GPU
+        5. 如果命中 GPU 空闲块不足，选择最适合做 transfer 的目标 GPU
 
         返回:
             target_gpu_id: 推荐的执行 GPU rank
@@ -135,18 +143,21 @@ class GlobalScheduler:
             gpu_hit_count[loc.gpu_id] = gpu_hit_count.get(loc.gpu_id, 0) + 1
 
         # 4. 加权打分
-        # score = 命中块数 × 拓扑权重
+        # score = 命中块数 × 拓扑权重 × prefix_hit_weight
+        #         - token-aware_load × load_weight
+        #         + free_blocks × free_block_weight
         # 拓扑权重：同 GPU=2.0, NVLink 伙伴=1.0, 其他 GPU=0.0
-        # 也就是说：prefix-hit 只在“本地 / NVLink 直连伙伴”之间竞争。
+        # 也就是说：prefix-hit 只在“本地 / NVLink 直连伙伴”之间竞争，
+        # 但不会无视 worker queue pressure。
         best_gpu = rank  # 默认本地
-        best_score = -1.0
+        best_score = float("-inf")
         failed_gpus = []  # 记录空闲不足的命中 GPU
 
         for gpu_id, hit_count in gpu_hit_count.items():
             topo_weight = self._get_topo_weight(rank, gpu_id)
             if topo_weight <= 0:
                 continue
-            score = hit_count * topo_weight
+            score = self._route_score(rank, gpu_id, hit_count)
 
             # 检查空闲块是否足够（需要 seq.num_blocks 个块）
             needed = num_blocks
@@ -158,12 +169,40 @@ class GlobalScheduler:
                 # 空闲不足，暂存作为备选
                 failed_gpus.append((gpu_id, score, hit_count))
 
-        if best_score >= 0:
+        if best_score > float("-inf"):
+            load_summary = self._load_summary(candidates)
+            least_loaded_gpu = min(candidates, key=lambda gpu_id: self._load_score(gpu_id))
+            if (
+                best_gpu != least_loaded_gpu
+                and self._load_score(best_gpu) > self._load_score(least_loaded_gpu) + self.load_bypass_threshold
+                and self.gbm.get_free_blocks_count(least_loaded_gpu) >= num_blocks
+            ):
+                route_info["prefix_hit"] = True
+                route_info["reason"] = "prefix_hit_load_bypass"
+                route_info["target_rank"] = least_loaded_gpu
+                route_info["hit_summary"] = hit_summary
+                route_info["scores"] = self._score_summary(rank, gpu_hit_count)
+                route_info["load_score"] = load_summary
+                route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+                logger.info(
+                    "route seq %s: prefix=%s hits=%s load=%s -> GPU %s "
+                    "(reason=prefix_hit_load_bypass, owner=%s)",
+                    seq_id,
+                    prefix_hash,
+                    hit_summary,
+                    load_summary,
+                    least_loaded_gpu,
+                    best_gpu,
+                )
+                return (least_loaded_gpu, route_info) if return_info else least_loaded_gpu
+
             route_info["prefix_hit"] = True
             route_info["reason"] = "prefix_hit"
             route_info["target_rank"] = best_gpu
             route_info["hit_summary"] = hit_summary
             route_info["scores"] = self._score_summary(rank, gpu_hit_count)
+            route_info["load_score"] = load_summary
+            route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s scores=%s "
                 "-> GPU %s (reason=prefix_hit, score=%.1f, target_free=%s/%s)",
@@ -189,6 +228,8 @@ class GlobalScheduler:
             route_info["target_rank"] = target
             route_info["hit_summary"] = hit_summary
             route_info["failed_gpus"] = [(g, s) for g, s, _ in failed_gpus]
+            route_info["load_score"] = self._load_summary(candidates)
+            route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s failed=%s "
                 "-> GPU %s (reason=prefix_hit_needs_rebalance)",
@@ -228,9 +269,35 @@ class GlobalScheduler:
 
     def _score_summary(self, rank: int, gpu_hit_count: dict[int, int]) -> dict[int, float]:
         return {
-            gpu_id: hit_count * self._get_topo_weight(rank, gpu_id)
+            gpu_id: self._route_score(rank, gpu_id, hit_count)
             for gpu_id, hit_count in gpu_hit_count.items()
         }
+
+    def _queue_pressure_summary(self, candidates: List[int]) -> dict[int, float]:
+        return {
+            gpu_id: self.gbm.get_queue_pressure(gpu_id)
+            for gpu_id in candidates
+        }
+
+    def _load_summary(self, candidates: List[int]) -> dict[int, float]:
+        return {
+            gpu_id: self._load_score(gpu_id)
+            for gpu_id in candidates
+        }
+
+    def _load_score(self, gpu_id: int) -> float:
+        return self.gbm.get_load_score(
+            gpu_id,
+            self.waiting_token_weight,
+            self.running_token_weight,
+            self.running_sequence_weight,
+        )
+
+    def _route_score(self, my_rank: int, gpu_id: int, hit_count: int) -> float:
+        prefix_score = hit_count * self._get_topo_weight(my_rank, gpu_id) * self.prefix_hit_weight
+        queue_penalty = self._load_score(gpu_id) * self.load_weight
+        free_bonus = self.gbm.get_free_blocks_count(gpu_id) * self.free_block_weight
+        return prefix_score - queue_penalty + free_bonus
 
     def _compute_prefix_hash(self, seq: Sequence) -> Optional[int]:
         """
@@ -280,21 +347,28 @@ class GlobalScheduler:
         return candidates
 
     def _select_best_candidate(self, my_rank: int, candidates: List[int]) -> int:
-        """只在本地 / NVLink 伙伴里选择空闲块最多的 GPU，同等条件优先本地"""
+        """只在本地 / NVLink 伙伴里选低负载且空闲块更多的 GPU，同等条件优先本地"""
         best_gpu = candidates[0]
-        best_free = self.gbm.get_free_blocks_count(best_gpu)
+        best_key = self._candidate_key(my_rank, best_gpu)
         for gpu_id in candidates:
-            free = self.gbm.get_free_blocks_count(gpu_id)
-            if free > best_free or (free == best_free and gpu_id == my_rank and my_rank >= 0):
-                best_free = free
+            key = self._candidate_key(my_rank, gpu_id)
+            if key > best_key:
+                best_key = key
                 best_gpu = gpu_id
         return best_gpu
+
+    def _candidate_key(self, my_rank: int, gpu_id: int) -> tuple[float, int, int]:
+        return (
+            -self._load_score(gpu_id),
+            self.gbm.get_free_blocks_count(gpu_id),
+            1 if gpu_id == my_rank and my_rank >= 0 else 0,
+        )
 
     # ------------------------------------------------------------------
     # 显存重平衡
     # ------------------------------------------------------------------
 
-    def plan_rebalance(self, gpu_id: int, needed_blocks: int) -> dict | None:
+    def plan_rebalance(self, gpu_id: int, needed_blocks: int, allow_copy: bool = False) -> dict | None:
         """
         生成一个可执行的 rebalance 计划，但不直接修改控制面的权威状态。
 
@@ -321,10 +395,8 @@ class GlobalScheduler:
         if not target_order:
             self.last_rebalance_fail_reason = "no_plan"
             return None
-        if not self.gbm.block_access_time[gpu_id]:
-            self.last_rebalance_fail_reason = (
-                "pinned_source" if self.gbm.block_hash[gpu_id] else "no_plan"
-            )
+        if not self.gbm.block_hash[gpu_id]:
+            self.last_rebalance_fail_reason = "no_plan"
             return None
         if sum(self.gbm.get_free_blocks_count(target) for target in target_order) < needed_blocks:
             self.last_rebalance_fail_reason = "no_target_space"
@@ -336,6 +408,10 @@ class GlobalScheduler:
             needed_blocks,
             allow_recursive=False,
         )
+        mode = "move"
+        if allow_copy and (not candidates or len(candidates) < needed_blocks):
+            candidates = self._select_copy_candidates(gpu_id, needed_blocks, target_order)
+            mode = "copy"
         if not candidates or len(candidates) < needed_blocks:
             self.last_rebalance_fail_reason = "no_plan"
             return None
@@ -356,13 +432,49 @@ class GlobalScheduler:
                 "dst_gpu": target_gpu,
                 "src_blocks": blocks,
                 "hashes": hashes,
+                "mode": mode,
             })
 
         return {
             "gpu_id": gpu_id,
             "needed_blocks": needed_blocks,
+            "mode": mode,
             "transfers": transfers,
         }
+
+    def _select_copy_candidates(
+        self,
+        gpu_id: int,
+        needed_blocks: int,
+        target_order: List[int],
+    ) -> List[Tuple[int, int]]:
+        """Select pinned blocks for replicated transfer when move eviction is impossible."""
+        if not target_order:
+            return []
+        target_free = {target: self.gbm.get_free_blocks_count(target) for target in target_order}
+        pinned_blocks = [
+            block_id
+            for block_id in self.gbm.block_hash[gpu_id]
+            if block_id not in self.gbm.block_access_time[gpu_id]
+        ]
+        if not pinned_blocks:
+            return []
+        candidates: List[Tuple[int, int]] = []
+        for block_id in pinned_blocks:
+            for target in target_order:
+                if target_free[target] <= 0:
+                    continue
+                block_hash = self.gbm.get_block_hash(gpu_id, block_id)
+                if block_hash is not None and any(
+                    loc.gpu_id == target for loc in self.gbm.get_block_location(block_hash)
+                ):
+                    continue
+                candidates.append((block_id, target))
+                target_free[target] -= 1
+                break
+            if len(candidates) >= needed_blocks:
+                break
+        return candidates
 
     def rebalance(self, gpu_id: int, needed_blocks: int) -> bool:
         """
@@ -370,7 +482,7 @@ class GlobalScheduler:
 
         流程:
         1. 调用 gbm.select_eviction_candidates 获取换出方案
-        2. 逐对执行 swap_out
+        2. 逐对执行 transfer out
         3. 更新受影响的序列 block_table
         4. 通知目标 GPU 的 GlobalBlockManager 更新页表
 
@@ -392,7 +504,7 @@ class GlobalScheduler:
 
         actual_candidates = candidates[:needed_blocks]
 
-        # 3. 执行 swap_out
+        # 3. 执行 transfer
         # 按 target_gpu 分组，一次 NCCL 操作处理同一目标的批量块
         groups: dict[int, List[int]] = {}
         for local_block, target_gpu in actual_candidates:
@@ -422,7 +534,7 @@ class GlobalScheduler:
     #     target_gpu: int,
     # ):
     #     """
-    #     在源 GPU 上执行 swap_out
+    #     在源 GPU 上执行 transfer out
     #     直接调用 kv_transfer 的 send 逻辑
     #     """
     #     from lmpool.engine.kv_transfer import _send_block_list, _compute_tag
@@ -432,8 +544,8 @@ class GlobalScheduler:
     #     # 这里需要 kv_cache 的引用，由外部 ModelRunner 提供
     #     # 暂时留空，由实际调用方注入
     #     raise NotImplementedError(
-    #         "swap_out 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
-    #         "kv_transfer.swap_out() 完成实际数据传输"
+    #         "transfer out 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
+    #         "kv_transfer 完成实际数据传输"
     #     )
 
     # def _execute_swap_in_accept(
@@ -443,11 +555,11 @@ class GlobalScheduler:
     #     local_gpu: int,
     # ):
     #     """
-    #     在目标 GPU 上接收 swap_out 的数据
+    #     在目标 GPU 上接收 transfer 数据
     #     """
     #     from lmpool.engine.kv_transfer import _recv_block_list
     #     raise NotImplementedError(
-    #         "swap_in_accept 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
+    #         "transfer in 需要 kv_cache 张量引用，请在 ModelRunner 中调用 "
     #         "kv_transfer 完成实际数据传输"
     #     )
 
@@ -470,7 +582,7 @@ class GlobalScheduler:
         needed_blocks: int,
     ) -> bool:
         """
-        当 swap 无法满足需求时，选择序列回退到 WAITING 状态
+        当 transfer 无法满足需求时，选择序列回退到 WAITING 状态
         
         策略：
         选择最短的 running 序列，释放其所有块，直到满足 needed_blocks。

@@ -1,11 +1,11 @@
 """
 全局块管理器 (Global Block Manager)
 
-负责跨 GPU 的 KV cache 块状态同步、全局 LRU 冷块选择和 swap 目标决策
+负责跨 GPU 的 KV cache 块状态同步、全局 LRU 冷块选择和 transfer 目标决策
 设计要点：
 1. 全局页表：hash -> 该 hash 的块分布在哪些 GPU 上（一对多）
-2. NVLink 拓扑感知的 swap 目标选择：只考虑 NVLink 直连伙伴
-3. 三级内存池枯竭应对：递归 swap -> 远端 LRU 覆盖 -> CPU fallback signal
+2. NVLink 拓扑感知的 transfer 目标选择：只考虑 NVLink 直连伙伴
+3. 三级内存池枯竭应对：递归 transfer -> 远端 LRU 覆盖 -> CPU fallback signal
 """
 
 import logging
@@ -155,6 +155,11 @@ class GlobalBlockManager:
         self.block_access_time: List[Dict[int, float]] = [{} for _ in range(world_size)]
         # 每 GPU 的块 hash 记录：gpu_id -> {block_id: hash}
         self.block_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
+        # 每 GPU 的调度队列快照，由 data-plane worker 随 block_state 上报
+        self.waiting_sequences_per_gpu: List[int] = [0] * world_size
+        self.running_sequences_per_gpu: List[int] = [0] * world_size
+        self.waiting_tokens_per_gpu: List[int] = [0] * world_size
+        self.running_tokens_per_gpu: List[int] = [0] * world_size
 
     @property
     def is_master(self) -> bool:
@@ -167,6 +172,10 @@ class GlobalBlockManager:
         block_hashes: Dict[int, int],
         evictable_block_hashes: Optional[Dict[int, int]] = None,
         pinned_block_hashes: Optional[Dict[int, int]] = None,
+        waiting_sequences: int = 0,
+        running_sequences: int = 0,
+        waiting_tokens: int = 0,
+        running_tokens: int = 0,
     ):
         """
         Master-only state ingestion boundary.
@@ -180,6 +189,10 @@ class GlobalBlockManager:
 
         now = time.time()
         self.free_blocks_per_gpu[gpu_id] = free_blocks
+        self.waiting_sequences_per_gpu[gpu_id] = max(0, int(waiting_sequences))
+        self.running_sequences_per_gpu[gpu_id] = max(0, int(running_sequences))
+        self.waiting_tokens_per_gpu[gpu_id] = max(0, int(waiting_tokens))
+        self.running_tokens_per_gpu[gpu_id] = max(0, int(running_tokens))
 
         old_hashes = self.block_hash[gpu_id]
         for block_id, old_hash in list(old_hashes.items()):
@@ -226,7 +239,7 @@ class GlobalBlockManager:
 
     def _get_target_gpu_order(self, gpu_id: int) -> List[int]:
         """
-        返回 swap 目标 GPU 的优先级顺序：
+        返回 transfer 目标 GPU 的优先级顺序：
         1. NVLink 直连伙伴（如果有的话）
         """
         partner = self._get_nvlink_partner(gpu_id)
@@ -268,13 +281,45 @@ class GlobalBlockManager:
     def can_allocate_global(self, gpu_id: int, num_blocks: int) -> bool:
         """
         检查指定 GPU 是否有足够空闲块。
-        如果不够，返回 False，由上层调用 select_eviction_candidates + swap。
+        如果不够，返回 False，由上层调用 select_eviction_candidates + transfer。
         """
         return self.free_blocks_per_gpu[gpu_id] >= num_blocks
 
     def get_free_blocks_count(self, gpu_id: int) -> int:
         """获取指定 GPU 当前空闲块数量"""
         return self.free_blocks_per_gpu[gpu_id]
+
+    def get_queue_pressure(self, gpu_id: int) -> float:
+        """
+        Return a lightweight queue pressure estimate for routing.
+
+        Running sequences are weighted higher because they already occupy decode
+        slots and KV blocks; waiting sequences mostly represent admission delay.
+        """
+        return (
+            float(self.waiting_sequences_per_gpu[gpu_id])
+            + 2.0 * float(self.running_sequences_per_gpu[gpu_id])
+        )
+
+    def get_load_score(
+        self,
+        gpu_id: int,
+        waiting_token_weight: float = 1.0,
+        running_token_weight: float = 0.25,
+        running_sequence_weight: float = 32.0,
+    ) -> float:
+        """
+        Token-aware load estimate used by global routing.
+
+        Waiting prompt tokens represent queued prefill work. Running tokens are
+        discounted because decode advances one token at a time, while running
+        sequence count captures scheduler/attention occupancy.
+        """
+        return (
+            waiting_token_weight * float(self.waiting_tokens_per_gpu[gpu_id])
+            + running_token_weight * float(self.running_tokens_per_gpu[gpu_id])
+            + running_sequence_weight * float(self.running_sequences_per_gpu[gpu_id])
+        )
 
     def get_global_free_blocks_count(self) -> int:
         """获取集群总空闲块数量"""
@@ -308,7 +353,7 @@ class GlobalBlockManager:
             self._commit_alloc(gpu_id, new_blocks, block_hashes)
             return new_blocks
         else:
-            # 本地不足：返回 None，由上层协调 swap
+            # 本地不足：返回 None，由上层协调 transfer
             return None
 
     def _commit_alloc(self, gpu_id: int, block_ids: List[int], hashes: List[int]):
@@ -354,9 +399,9 @@ class GlobalBlockManager:
         allow_recursive: bool = True,
     ) -> List[Tuple[int, int]]:
         """
-        从指定 GPU 选择 num_blocks 个 LRU 冷块作为 swap 候选
+        从指定 GPU 选择 num_blocks 个 LRU 冷块作为 transfer 候选
         
-        swap 目标选择策略：
+        transfer 目标选择策略：
         1. 只考虑 NVLink 直连伙伴作为目标 GPU
         2. 若伙伴无空闲块，allow_recursive=True 时尝试在伙伴上递归驱逐冷块
         3. 若伙伴也无块可驱逐，或可执行计划禁用递归驱逐，则返回空列表
@@ -463,6 +508,29 @@ class GlobalBlockManager:
                 del self.global_page_table[h]
 
         # 在目标 GPU 上注册
+        self.free_blocks_per_gpu[dst_gpu] -= 1
+        self.block_access_time[dst_gpu][new_block_id] = now
+        if h is not None:
+            self.block_hash[dst_gpu][new_block_id] = h
+            self.global_page_table.setdefault(h, []).append(
+                BlockLocation(dst_gpu, new_block_id, h, now)
+            )
+
+    def record_block_copy(
+        self,
+        block_id: int,
+        src_gpu: int,
+        dst_gpu: int,
+        new_block_id: int,
+    ):
+        """
+        复制式 transfer 后更新全局页表。
+
+        与 record_block_transfer 不同，copy 不释放源 GPU 的块，只在目标 GPU
+        注册一个新的副本位置。
+        """
+        now = time.time()
+        h = self.block_hash[src_gpu].get(block_id)
         self.free_blocks_per_gpu[dst_gpu] -= 1
         self.block_access_time[dst_gpu][new_block_id] = now
         if h is not None:

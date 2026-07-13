@@ -52,7 +52,8 @@ class ControlPlaneClient:
 
     def route_sequence(self, seq: Sequence, return_meta: bool = False) -> int | dict:
         request_id = uuid.uuid4().hex
-        prefix_hash = self._compute_prefix_hash(seq)
+        prefix_hashes = self._compute_prefix_hashes(seq)
+        prefix_hash = prefix_hashes[-1] if prefix_hashes else None
         self.request_queue.put({
             "type": "route_request",
             "request_id": request_id,
@@ -62,6 +63,7 @@ class ControlPlaneClient:
             "num_tokens": seq.num_tokens,
             "num_blocks": seq.num_blocks,
             "prefix_hash": prefix_hash,
+            "prefix_hashes": prefix_hashes,
         })
         while True:
             msg = self._next_response()
@@ -86,6 +88,10 @@ class ControlPlaneClient:
         block_hashes: dict[int, int],
         evictable_block_hashes: dict[int, int] | None = None,
         pinned_block_hashes: dict[int, int] | None = None,
+        waiting_sequences: int = 0,
+        running_sequences: int = 0,
+        waiting_tokens: int = 0,
+        running_tokens: int = 0,
     ):
         if self.rank < 0:
             return
@@ -96,9 +102,13 @@ class ControlPlaneClient:
             "block_hashes": block_hashes,
             "evictable_block_hashes": evictable_block_hashes,
             "pinned_block_hashes": pinned_block_hashes,
+            "waiting_sequences": waiting_sequences,
+            "running_sequences": running_sequences,
+            "waiting_tokens": waiting_tokens,
+            "running_tokens": running_tokens,
         })
 
-    def rebalance(self, gpu_id: int, needed_blocks: int) -> bool:
+    def rebalance(self, gpu_id: int, needed_blocks: int, allow_copy: bool = False) -> bool:
         request_id = uuid.uuid4().hex
         self.request_queue.put({
             "type": "rebalance_request",
@@ -106,6 +116,7 @@ class ControlPlaneClient:
             "reply_rank": self.rank,
             "gpu_id": gpu_id,
             "needed_blocks": needed_blocks,
+            "allow_copy": allow_copy,
         })
         while True:
             msg = self._next_response()
@@ -185,9 +196,14 @@ class ControlPlaneClient:
             self._handle_async_message(msg)
 
     def _compute_prefix_hash(self, seq: Sequence) -> Optional[int]:
+        prefix_hashes = self._compute_prefix_hashes(seq)
+        return prefix_hashes[-1] if prefix_hashes else None
+
+    def _compute_prefix_hashes(self, seq: Sequence) -> list[int]:
         full_blocks = int(seq.num_tokens // seq.block_size)
         if full_blocks == 0:
-            return None
+            return []
+        hashes = []
         if self.block_manager is None:
             hash_val = -1
             for i in range(full_blocks):
@@ -200,13 +216,15 @@ class ControlPlaneClient:
                 block_tokens = [t.item() if hasattr(t, "item") else t for t in block_tokens]
                 hasher.update(np.array(block_tokens, dtype=np.int32).tobytes())
                 hash_val = hasher.intdigest()
-            return hash_val
+                hashes.append(hash_val)
+            return hashes
 
         hash_val = -1
         for i in range(full_blocks):
             block_tokens = seq.token_ids[i * seq.block_size : (i + 1) * seq.block_size]
             hash_val = self.block_manager.compute_hash(block_tokens, hash_val)
-        return hash_val
+            hashes.append(hash_val)
+        return hashes
 
     def _next_response(self):
         if self._stashed_messages:
@@ -259,9 +277,23 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         nvlink_pairs=config.get("nvlink_topo", {}).get("pairs"),
     )
     scheduler = GlobalScheduler(gbm=gbm, block_manager=None)
+    scheduler.prefix_hit_weight = float(config.get("route_prefix_hit_weight", scheduler.prefix_hit_weight))
+    scheduler.queue_pressure_weight = float(config.get("route_queue_pressure_weight", scheduler.queue_pressure_weight))
+    scheduler.free_block_weight = float(config.get("route_free_block_weight", scheduler.free_block_weight))
+    scheduler.load_weight = float(config.get("route_load_weight", scheduler.load_weight))
+    scheduler.waiting_token_weight = float(config.get("route_waiting_token_weight", scheduler.waiting_token_weight))
+    scheduler.running_token_weight = float(config.get("route_running_token_weight", scheduler.running_token_weight))
+    scheduler.running_sequence_weight = float(config.get("route_running_sequence_weight", scheduler.running_sequence_weight))
+    scheduler.load_bypass_threshold = float(config.get("route_load_bypass_threshold", scheduler.load_bypass_threshold))
+    route_cache_queue_slack = float(config.get("route_cache_queue_slack", 2.0))
+    enable_background_copy = bool(config.get("enable_background_copy", False))
+    background_copy_max_blocks = max(1, int(config.get("background_copy_max_blocks", 1)))
+    background_copy_cooldown_s = max(0.0, float(config.get("background_copy_cooldown_s", 2.0)))
     logger.info("control plane process started")
 
     pending_rebalances: dict[str, dict] = {}
+    route_cache: dict[int, int] = {}
+    background_copy_recent: dict[tuple[int, int, int], float] = {}
     worker_last_heartbeat: dict[int, float] = {rank: time.monotonic() for rank in range(world_size)}
     worker_down: set[int] = set()
     last_control_heartbeat_sent = 0.0
@@ -287,13 +319,14 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 continue
             plan["pending_ranks"].discard(rank)
             if not plan["pending_ranks"]:
-                response_queues[plan["reply_rank"]].put({
-                    "type": "rebalance_response",
-                    "request_id": plan["request_id"],
-                    "success": False,
-                    "error": f"worker {rank} down",
-                    "plan_id": plan_id,
-                })
+                if plan.get("reply_rank") is not None:
+                    response_queues[plan["reply_rank"]].put({
+                        "type": "rebalance_response",
+                        "request_id": plan["request_id"],
+                        "success": False,
+                        "error": f"worker {rank} down",
+                        "plan_id": plan_id,
+                    })
                 del pending_rebalances[plan_id]
 
     def _send_rebalance_execute(plan_id: str, plan: dict):
@@ -328,6 +361,103 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 "role": "abort",
                 "plan": plan,
             })
+
+    def _enqueue_rebalance_plan(plan: dict, request_id: str | None, reply_rank: int | None) -> bool:
+        plan_id = uuid.uuid4().hex
+        plan["plan_id"] = plan_id
+        source_ranks = {
+            transfer["src_gpu"] for transfer in plan["transfers"]
+        }
+        target_ranks = {
+            transfer["dst_gpu"] for transfer in plan["transfers"]
+        }
+        execute_ranks = source_ranks | target_ranks
+        if not target_ranks:
+            return False
+
+        pending_rebalances[plan_id] = {
+            "request_id": request_id,
+            "reply_rank": reply_rank,
+            "phase": "prepare",
+            "pending_ranks": set(execute_ranks),
+            "execute_ranks": execute_ranks,
+            "plan": plan,
+        }
+
+        for prepare_rank in execute_ranks:
+            role = "source" if prepare_rank in source_ranks else "target"
+            response_queues[prepare_rank].put({
+                "type": "rebalance_prepare",
+                "plan_id": plan_id,
+                "role": role,
+                "plan": plan,
+            })
+        return True
+
+    def _maybe_schedule_background_copy(route_info: dict) -> None:
+        if not enable_background_copy or not route_info.get("prefix_hit"):
+            return
+        prefix_hash = route_info.get("prefix_hash")
+        prefix_hashes = route_info.get("prefix_hashes") or ([prefix_hash] if prefix_hash is not None else [])
+        hit_summary = route_info.get("hit_summary") or {}
+        if prefix_hash is None or not hit_summary:
+            return
+
+        target_rank = route_info.get("target_rank")
+        src_gpu = target_rank if target_rank in hit_summary else next(iter(hit_summary))
+        dst_gpu = gbm._get_nvlink_partner(src_gpu)
+        if dst_gpu is None or dst_gpu == src_gpu:
+            return
+        if gbm.get_free_blocks_count(dst_gpu) <= 0:
+            return
+
+        cooldown_key = (int(prefix_hash), int(src_gpu), int(dst_gpu))
+        now = time.monotonic()
+        if now - background_copy_recent.get(cooldown_key, 0.0) < background_copy_cooldown_s:
+            return
+
+        src_blocks = []
+        hashes = []
+        for block_hash in prefix_hashes:
+            if len(src_blocks) >= background_copy_max_blocks:
+                break
+            locations = [
+                loc for loc in gbm.get_block_location(block_hash)
+                if loc.gpu_id == src_gpu
+            ]
+            if not locations:
+                continue
+            if any(loc.gpu_id == dst_gpu for loc in gbm.get_block_location(block_hash)):
+                continue
+            block_id = locations[0].block_id
+            src_blocks.append(block_id)
+            hashes.append(block_hash)
+
+        if not src_blocks or gbm.get_free_blocks_count(dst_gpu) < len(src_blocks):
+            return
+
+        plan = {
+            "gpu_id": src_gpu,
+            "needed_blocks": len(src_blocks),
+            "mode": "copy",
+            "background": True,
+            "transfers": [{
+                "src_gpu": src_gpu,
+                "dst_gpu": dst_gpu,
+                "src_blocks": src_blocks,
+                "hashes": hashes,
+                "mode": "copy",
+            }],
+        }
+        if _enqueue_rebalance_plan(plan, request_id=None, reply_rank=None):
+            background_copy_recent[cooldown_key] = now
+            logger.info(
+                "background transfer copy scheduled: prefix=%s src=%s dst=%s blocks=%s",
+                prefix_hash,
+                src_gpu,
+                dst_gpu,
+                src_blocks,
+            )
 
     def service_heartbeats(force: bool = False):
         nonlocal last_control_heartbeat_sent
@@ -368,6 +498,10 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 msg["block_hashes"],
                 msg.get("evictable_block_hashes"),
                 msg.get("pinned_block_hashes"),
+                msg.get("waiting_sequences", 0),
+                msg.get("running_sequences", 0),
+                msg.get("waiting_tokens", 0),
+                msg.get("running_tokens", 0),
             )
             service_heartbeats()
             continue
@@ -390,14 +524,15 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 prepared_ranks = set(plan.get("prepared_ranks", set()))
                 if prepared_ranks:
                     _send_rebalance_abort(plan_id, plan["plan"], prepared_ranks)
-                response_queues[plan["reply_rank"]].put({
-                    "type": "rebalance_response",
-                    "request_id": plan["request_id"],
-                    "success": False,
-                    "error": result_error,
-                    "reason": result_reason,
-                    "plan_id": plan_id,
-                })
+                if plan.get("reply_rank") is not None:
+                    response_queues[plan["reply_rank"]].put({
+                        "type": "rebalance_response",
+                        "request_id": plan["request_id"],
+                        "success": False,
+                        "error": result_error,
+                        "reason": result_reason,
+                        "plan_id": plan_id,
+                    })
                 del pending_rebalances[plan_id]
                 service_heartbeats()
                 continue
@@ -412,29 +547,65 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     plan["pending_ranks"] = set(plan["execute_ranks"])
                     _send_rebalance_execute(plan_id, plan["plan"])
                 else:
-                    response_queues[plan["reply_rank"]].put({
-                        "type": "rebalance_response",
-                        "request_id": plan["request_id"],
-                        "success": True,
-                        "plan_id": plan_id,
-                    })
+                    if plan.get("reply_rank") is not None:
+                        response_queues[plan["reply_rank"]].put({
+                            "type": "rebalance_response",
+                            "request_id": plan["request_id"],
+                            "success": True,
+                            "plan_id": plan_id,
+                        })
                     del pending_rebalances[plan_id]
             service_heartbeats()
             continue
         if msg_type == "route_request":
             try:
-                target_rank = scheduler.route_sequence_meta(
-                    requester_rank=msg["requester_rank"],
-                    seq_id=msg["seq_id"],
-                    num_tokens=msg["num_tokens"],
-                    num_blocks=msg["num_blocks"],
-                    prefix_hash=msg["prefix_hash"],
-                    return_info=True,
-                )
-                if isinstance(target_rank, tuple):
-                    target_rank, route_info = target_rank
-                else:
-                    route_info = {}
+                prefix_hash = msg["prefix_hash"]
+                prefix_hashes = msg.get("prefix_hashes") or ([prefix_hash] if prefix_hash is not None else [])
+                cached_target = route_cache.get(prefix_hash) if prefix_hash is not None else None
+                target_rank = None
+                route_info = {}
+                if cached_target is not None and gbm.get_free_blocks_count(cached_target) >= msg["num_blocks"]:
+                    cached_locations = gbm.lookup_prefix(prefix_hash, requester_rank=msg["requester_rank"])
+                    candidates = scheduler._candidate_gpus(msg["requester_rank"])
+                    cached_pressure = scheduler._load_score(cached_target)
+                    min_candidate_pressure = min(scheduler._load_score(gpu_id) for gpu_id in candidates)
+                    cache_owner_is_available = any(loc.gpu_id == cached_target for loc in cached_locations)
+                    cache_owner_is_not_congested = (
+                        cached_target in candidates
+                        and cached_pressure <= min_candidate_pressure + route_cache_queue_slack
+                    )
+                    if cache_owner_is_available and cache_owner_is_not_congested:
+                        target_rank = cached_target
+                        route_info = {
+                            "requester_rank": msg["requester_rank"],
+                            "seq_id": msg["seq_id"],
+                            "num_tokens": msg["num_tokens"],
+                            "num_blocks": msg["num_blocks"],
+                            "prefix_hash": prefix_hash,
+                            "prefix_hashes": prefix_hashes,
+                            "prefix_hit": True,
+                            "reason": "route_cache",
+                            "target_rank": target_rank,
+                            "hit_summary": scheduler._hit_summary(cached_locations),
+                            "load_score": scheduler._load_summary(candidates),
+                        }
+                if target_rank is None:
+                    target_rank = scheduler.route_sequence_meta(
+                        requester_rank=msg["requester_rank"],
+                        seq_id=msg["seq_id"],
+                        num_tokens=msg["num_tokens"],
+                        num_blocks=msg["num_blocks"],
+                        prefix_hash=prefix_hash,
+                        return_info=True,
+                    )
+                    if isinstance(target_rank, tuple):
+                        target_rank, route_info = target_rank
+                    else:
+                        route_info = {}
+                    if route_info:
+                        route_info["prefix_hashes"] = prefix_hashes
+                    if prefix_hash is not None and route_info.get("prefix_hit"):
+                        route_cache[prefix_hash] = target_rank
                 gbm.reserve_blocks(target_rank, msg["num_blocks"])
                 response_queues[msg["reply_rank"]].put({
                     "type": "route_response",
@@ -442,6 +613,10 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     "target_rank": target_rank,
                     "route_info": route_info,
                 })
+                try:
+                    _maybe_schedule_background_copy(route_info)
+                except Exception:
+                    logger.exception("background transfer copy scheduling failed")
             except Exception as exc:
                 response_queues[msg["reply_rank"]].put({
                     "type": "error",
@@ -455,6 +630,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 plan = scheduler.plan_rebalance(
                     gpu_id=msg["gpu_id"],
                     needed_blocks=msg["needed_blocks"],
+                    allow_copy=bool(msg.get("allow_copy", False)),
                 )
                 if plan is None:
                     response_queues[msg["reply_rank"]].put({
@@ -465,16 +641,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     })
                     continue
 
-                plan_id = uuid.uuid4().hex
-                plan["plan_id"] = plan_id
-                source_ranks = {
-                    transfer["src_gpu"] for transfer in plan["transfers"]
-                }
-                target_ranks = {
-                    transfer["dst_gpu"] for transfer in plan["transfers"]
-                }
-                execute_ranks = source_ranks | target_ranks
-                if not target_ranks:
+                if not _enqueue_rebalance_plan(plan, msg["request_id"], msg["reply_rank"]):
                     response_queues[msg["reply_rank"]].put({
                         "type": "rebalance_response",
                         "request_id": msg["request_id"],
@@ -483,24 +650,6 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "reason": "no_plan",
                     })
                     continue
-
-                pending_rebalances[plan_id] = {
-                    "request_id": msg["request_id"],
-                    "reply_rank": msg["reply_rank"],
-                    "phase": "prepare",
-                    "pending_ranks": set(execute_ranks),
-                    "execute_ranks": execute_ranks,
-                    "plan": plan,
-                }
-
-                for prepare_rank in execute_ranks:
-                    role = "source" if prepare_rank in source_ranks else "target"
-                    response_queues[prepare_rank].put({
-                        "type": "rebalance_prepare",
-                        "plan_id": plan_id,
-                        "role": role,
-                        "plan": plan,
-                    })
                 # 先等待目标 rank 预留成功，再下发 execute，避免源端单边进入 NCCL send。
             except Exception as exc:
                 response_queues[msg["reply_rank"]].put({

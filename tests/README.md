@@ -8,6 +8,7 @@ The coverage is organized around the runtime structure:
 - data plane
 - global block manager
 - global scheduler
+- end-to-end orchestration
 - local scheduler
 - local block manager
 - model runner
@@ -45,9 +46,14 @@ The coverage is organized around the runtime structure:
   - free-space fallback
   - rebalance plan generation
 
+- `tests/test_e2e.py`
+  - LLMEngine ingress routing
+  - worker result aggregation
+  - runtime metric propagation
+
 - `tests/test_kv_transfer.py`
   - KV transfer helpers
-  - NCCL swap_out / swap_in round trip
+  - NCCL transfer round trip
   - hardware-gated integration path
 
 - `tests/test_llm_engine.py`
@@ -58,7 +64,7 @@ The coverage is organized around the runtime structure:
 - `tests/test_model_runner.py`
   - KV cache allocation
   - prefill / decode input preparation
-  - swap forwarding
+  - transfer forwarding
   - KV cache lookup helpers
 
 - `tests/test_scheduler.py`

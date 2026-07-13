@@ -20,7 +20,7 @@
 
 ## 1. Overview
 
-LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)'s Paged Attention, it adds KV Cache-aware cross-GPU routing and swapping.
+LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)'s Paged Attention, it adds KV Cache-aware cross-GPU routing and NVLink KV transfer.
 
 ### 1.1 Problem
 
@@ -35,7 +35,7 @@ LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cac
 1. `GlobalBlockManager` maintains a cross-GPU global page table.
 2. Block-level hash chains encode prefixes for reuse decisions.
 3. `GlobalScheduler` routes requests and plans rebalance.
-4. `kv_transfer` executes NCCL-based KV migration.
+4. `kv_transfer` executes NCCL-based KV transfer.
 5. `LLMEngine` runs as launcher / supervisor, with a dedicated control-plane process and per-rank data-plane workers.
 
 ---
@@ -62,7 +62,7 @@ Each worker owns a local `Scheduler`, `BlockManager`, and `ModelRunner`. The con
 4. `LLMEngine` forwards the `Sequence` to the chosen worker.
 5. The worker runs prefill / decode locally through `Scheduler` and `ModelRunner`.
 6. If memory pressure appears, the worker requests rebalance from the control plane.
-7. The control plane dispatches a swap plan and workers execute NCCL transfer.
+7. The control plane dispatches a transfer plan and workers execute NCCL transfer.
 
 ---
 
@@ -88,7 +88,7 @@ The control plane receives route and rebalance requests, updates the global page
 - `src/lmpool/engine/model_runner.py`
 - `src/lmpool/engine/kv_transfer.py`
 
-Each data-plane process binds one GPU. It schedules prefill / decode locally, allocates KV blocks, runs model forward passes, and performs swap in / swap out when instructed by the control plane.
+Each data-plane process binds one GPU. It schedules prefill / decode locally, allocates KV blocks, runs model forward passes, and performs KV transfer when instructed by the control plane.
 
 ### 4.3 Sequence
 
@@ -103,14 +103,14 @@ Each data-plane process binds one GPU. It schedules prefill / decode locally, al
 `GlobalScheduler` is the cross-GPU decision layer. In the current architecture it runs behind the control-plane process. It exposes two main entry points:
 
 - `route_sequence_meta()` for request routing
-- `plan_rebalance()` for swap planning
+- `plan_rebalance()` for transfer planning
 
 Routing policy:
 
 1. compute the hash of complete blocks only
 2. query the global page table for prefix hits
-3. prefer the GPU with the highest prefix-hit score
-4. otherwise fall back to the GPU with the most free blocks
+3. prefer the GPU with the best prefix-hit score after queue-pressure penalty
+4. otherwise fall back to the least-congested GPU with more free blocks
 5. reserve blocks optimistically after routing
 
 Topology weights in the current routing policy are:
@@ -176,7 +176,7 @@ Implements block migration with NCCL `send` / `recv`. Transfer is block-granular
 
 - `is_remote_prefix`
 - `remote_gpu_id`
-- `pending_swap_in`
+- `pending_swap_in` legacy field name for pending transfer-in blocks
 
 These fields survive cross-process transfer through `multiprocessing.Queue`.
 
@@ -199,6 +199,10 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 | `heartbeat_interval` | `float` | Heartbeat period between control and data planes |
 | `heartbeat_timeout` | `float` | Liveness timeout for control / worker detection |
 | `nvlink_topo.pairs` | `List[Tuple[int, int]]` | Optional NVLink direct-connect GPU pairs; if omitted, the code best-effort parses `nvidia-smi topo -m` |
+| `route_prefix_hit_weight` | `float` | Positive weight for reusable prefix blocks in global routing |
+| `route_queue_pressure_weight` | `float` | Penalty weight for worker waiting/running queue pressure |
+| `route_free_block_weight` | `float` | Small tie-breaker bonus for free KV blocks |
+| `route_cache_queue_slack` | `float` | Maximum queue-pressure slack for using a cached prefix route |
 
 ### 6.2 Running
 
@@ -226,7 +230,7 @@ The `benchmarks/` directory includes a shared-prefix workload benchmark with the
 - `single-gpu`
 - `multi-gpu`
 - `multi-gpu-kv-routing`
-- `multi-gpu-kv-swapping`
+- `multi-gpu-kv-transfer`
 - `multi-gpu-lmpool`
 
 Reported metrics:
@@ -240,7 +244,7 @@ Reported metrics:
 - GPU memory utilization mean / p95
 - prefix hit rate
 - route hit / prefix-owner hit
-- swap count and rebalance success / failure counts
+- transfer / copy count and rebalance success / failure counts
 
 The current `multi-gpu` baseline uses online round-robin dispatch. Control-plane scenarios should use a bounded `--submit-window` such as `4` or `8` when measuring prefix reuse, because routing can only hit prefixes that previous requests have already prefetched and reported to the global page table.
 The benchmark records TTFT from explicit first-token events emitted by data-plane workers. Local prefix hit is measured as worker-side prefill cache hit rate for every scenario, including round-robin baselines. Route hit and prefix-owner hit are reported separately for control-plane scenarios.

@@ -1,8 +1,8 @@
 """
 KV 块跨 GPU 传输模块
 
-提供 swap_out / swap_in 两个核心原语，基于 NCCL send/recv 实现 GPU 间
-KV cache 数据的直接搬运
+提供 transfer out / transfer in 语义的核心原语，基于 NCCL send/recv 实现 GPU 间
+KV cache 数据的直接搬运。函数名 `swap_out` / `swap_in` 暂时作为 legacy API 保留。
 
 设计要点：
 1. 传输粒度：逐块、逐层传输 KV 张量切片
@@ -141,7 +141,7 @@ def swap_out(
     返回:
         target_gpu 上新分配的块索引列表
     """
-    logger.info(f"swap_out: GPU{local_gpu} -> GPU{target_gpu} | blocks={blocks_to_evict}")
+    logger.info(f"transfer_out: GPU{local_gpu} -> GPU{target_gpu} | blocks={blocks_to_evict}")
 
     rank = dist.get_rank()
     num_blocks = len(blocks_to_evict)
@@ -167,11 +167,11 @@ def swap_out(
         _send_block_list(target_blocks, dst=local_gpu)
     else:
         # 本地传输或单 GPU 场景
-        target_blocks = blocks_to_evict  # 同 GPU 内 swap 直接复用
+        target_blocks = blocks_to_evict  # 同 GPU 内 transfer 直接复用
 
     if len(target_blocks) != num_blocks:
         raise RuntimeError(
-            f"swap_out negotiated mismatched block counts: "
+            f"transfer_out negotiated mismatched block counts: "
             f"src={len(blocks_to_evict)} dst={len(target_blocks)}"
         )
 
@@ -196,10 +196,9 @@ def swap_out(
                 layer_k[dst_block, ...].copy_(k_buf)
                 layer_v[dst_block, ...].copy_(v_buf)
 
-    # 3. 全层同步
-    barrier_tensor = torch.zeros(1, device=device)
-    dist.all_reduce(barrier_tensor)
-
+    # Blocking send/recv pairs are the synchronization boundary for this
+    # point-to-point transfer. Do not use a world-size collective here: in
+    # multi-pair runs only the source and target ranks enter this function.
     return target_blocks
 
 
@@ -217,7 +216,7 @@ def swap_in(
     """
     从 remote_gpu 拉取 KV 块到本地。
 
-    参数同 swap_out，方向相反。
+    参数同 transfer out，方向相反。
 
     协议:
         本地端                              远端
@@ -231,7 +230,7 @@ def swap_in(
     返回:
         本地新分配的块索引列表
     """
-    logger.info(f"swap_in: GPU{remote_gpu} -> GPU{local_gpu} | blocks={remote_blocks}")
+    logger.info(f"transfer_in: GPU{remote_gpu} -> GPU{local_gpu} | blocks={remote_blocks}")
 
     rank = dist.get_rank()
     device = f"cuda:{rank}"
@@ -255,7 +254,7 @@ def swap_in(
 
     if len(local_blocks) != len(remote_blocks):
         raise RuntimeError(
-            f"swap_in negotiated mismatched block counts: "
+            f"transfer_in negotiated mismatched block counts: "
             f"remote={len(remote_blocks)} local={len(local_blocks)}"
         )
 
@@ -278,10 +277,9 @@ def swap_in(
                 dist.send(k_slice, dst=local_gpu, tag=_compute_tag(src_block, layer_idx, is_k=True))
                 dist.send(v_slice, dst=local_gpu, tag=_compute_tag(src_block, layer_idx, is_k=False))
 
-    # 3. 全层同步
-    barrier_tensor = torch.zeros(1, device=device)
-    dist.all_reduce(barrier_tensor)
-
+    # Blocking send/recv pairs are the synchronization boundary for this
+    # point-to-point transfer. A world-size collective would deadlock when only
+    # one NVLink pair is transferring inside a larger process group.
     return local_blocks
 
 

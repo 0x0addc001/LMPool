@@ -26,7 +26,7 @@ class ModelRunner:
 
     扩展功能（当启用全局池化时）：
     - 初始化 GlobalBlockManager
-    - run() 前自动拉取 seq.pending_swap_in 中的远程块
+    - run() 前自动拉取 seq.pending_swap_in（legacy internal name）中的远程块
     - 提供 kv_cache 张量引用给 kv_transfer 做实际数据传输
     """
 
@@ -283,6 +283,8 @@ class ModelRunner:
         # compute the actual byte required of each block
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
         num_available_kv_blocks = int(available_mem // block_bytes)
+        configured_max_blocks = int(self.config.get('max_cached_blocks', num_available_kv_blocks))
+        num_available_kv_blocks = min(num_available_kv_blocks, configured_max_blocks)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
 
         if self.world_size > 1:
@@ -463,7 +465,7 @@ class ModelRunner:
         执行 prefill 或 decode
 
         全局池化扩展：
-        - 在执行模型 forward 之前，检查每个序列是否有 pending_swap_in
+        - 在执行模型 forward 之前，检查每个序列是否有待 transfer 的远端块
         - 如果有，调用 _swap_in_remote_blocks 拉取远端 KV 块到本地
         - 拉取完成后更新 seq.block_table，后续 attention 全部走本地
         """
@@ -597,7 +599,7 @@ class ModelRunner:
 
     def _swap_in_remote_blocks(self, seq: Sequence):
         """
-        将 seq.pending_swap_in 中的远程块拉取到本地，更新 block_table
+        将 seq.pending_swap_in（legacy internal name）中的远程块拉取到本地，更新 block_table
 
         流程：
         1. 从 seq.remote_gpu_id 拉取远程 KV 数据
@@ -623,9 +625,9 @@ class ModelRunner:
                 break
 
         if first_layer_kv is None:
-            raise RuntimeError("Cannot find k_cache in model layers for swap_in")
+            raise RuntimeError("Cannot find k_cache in model layers for transfer in")
 
-        # 扩展为 (2, ...) 形状，swap_in 期望 kv_cache[:, block_id, ...]
+        # 扩展为 (2, ...) 形状，transfer helper 期望 kv_cache[:, block_id, ...]
         # 实际上逐层传输，这里传引用即可
         local_blocks = swap_in(
             remote_gpu=remote_gpu,
@@ -641,7 +643,7 @@ class ModelRunner:
         )
 
         # 更新 block_table：把远程块对应的位置替换成本地块
-        # 假设 pending_swap_in 中的块顺序与 block_table 中前缀部分对应
+        # 假设 pending transfer 块顺序与 block_table 中前缀部分对应
         for i, local_block in enumerate(local_blocks):
             if i < len(seq.block_table):
                 seq.block_table[i] = local_block
@@ -659,15 +661,15 @@ class ModelRunner:
         target_gpu: int,
     ):
         """
-        执行 swap_out：将本地 blocks 的数据搬移到 target_gpu
-        在源 GPU 上响应目标 GPU 的 swap_in pull 请求。
+        执行 transfer out：将本地 blocks 的数据搬移到 target_gpu
+        在源 GPU 上响应目标 GPU 的 transfer pull 请求。
         """
         from lmpool.engine.kv_transfer import swap_in
         
         # 找到 kv_cache 引用
         kv_cache = self._get_kv_cache()
         
-        logger.info(f"execute_swap_out: GPU{self.rank} → GPU{target_gpu} | blocks={blocks}")
+        logger.info(f"execute_transfer_out: GPU{self.rank} → GPU{target_gpu} | blocks={blocks}")
         target_blocks = swap_in(
             remote_gpu=self.rank,
             remote_blocks=blocks,
@@ -679,7 +681,7 @@ class ModelRunner:
             head_dim=self.config['head_dim'] if 'head_dim' in self.config 
                      else self.config['hidden_size'] // self.config['num_heads'],
         )
-        logger.info(f"execute_swap_out done: blocks={blocks} → target_blocks={target_blocks}")
+        logger.info(f"execute_transfer_out done: blocks={blocks} → target_blocks={target_blocks}")
         return target_blocks
 
     def execute_swap_in(
@@ -689,14 +691,14 @@ class ModelRunner:
         local_target_blocks: Optional[List[int]] = None,
     ):
         """
-        执行 swap_in：从 remote_gpu 拉取 blocks 到本地
-        在目标 GPU 上接收 swap_out 的数据
+        执行 transfer in：从 remote_gpu 拉取 blocks 到本地
+        在目标 GPU 上接收 transfer out 的数据
         """
         from lmpool.engine.kv_transfer import swap_in
         
         kv_cache = self._get_kv_cache()
         
-        logger.info(f"execute_swap_in: GPU{remote_gpu} → GPU{self.rank} | blocks={remote_blocks}")
+        logger.info(f"execute_transfer_in: GPU{remote_gpu} → GPU{self.rank} | blocks={remote_blocks}")
         local_blocks = swap_in(
             remote_gpu=remote_gpu,
             remote_blocks=remote_blocks,
@@ -709,7 +711,7 @@ class ModelRunner:
                      else self.config['hidden_size'] // self.config['num_heads'],
             local_target_blocks=local_target_blocks,
         )
-        logger.info(f"execute_swap_in done: remote_blocks={remote_blocks} → local_blocks={local_blocks}")
+        logger.info(f"execute_transfer_in done: remote_blocks={remote_blocks} → local_blocks={local_blocks}")
         return local_blocks
 
     def _get_kv_cache(self):

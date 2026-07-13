@@ -10,11 +10,14 @@
     --prompt-repeat 10 \
     --max-tokens 16 \
     --temperature 0.6 \
-    --output-json ./benchmarks/results/shared_prefix_benchmark.json \
-    --nvlink-pairs 0,1 \
+    --world-size 2 \
+    --nvlink-pairs "0,1" \
     --submit-window 5 \
+    --background-copy-max-blocks 1 \
+    --background-copy-cooldown-s 2.0 \
     --goodput-e2e-sla-ms 10000 \
-    --output-figure ./benchmarks/results/shared_prefix_benchmark.png
+    --output-json ./benchmarks/results/shared_prefix_benchmark_202607121117.json \
+    --output-figure ./benchmarks/results/shared_prefix_benchmark_202607121117.png
 
 参数说明：
 1. `--num-prompts`：
@@ -25,7 +28,7 @@
   共享前缀重复多少次。值越大，公共前缀越长，越容易观察 prefix cache / 路由收益。
 
 3. `--max-tokens`：
-  每条请求最多生成多少个输出 token。值越大，decode 阶段占比越高，也更容易触发 swap 压力。
+  每条请求最多生成多少个输出 token。值越大，decode 阶段占比越高，也更容易触发 transfer 压力。
 
 4. `--temperature`：
   采样温度。benchmark 默认主要看系统性能，通常保持固定值即可，不建议在不同实验间频繁改动。
@@ -40,40 +43,60 @@
 7. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
-  可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。
+  可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
+  例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-8. `--routing-max-cached-blocks`：
+8. `--world-size`：
+  多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
+  该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
+
+9. `--routing-max-cached-blocks`：
   `multi-gpu-kv-routing` 场景的 KV block 上限。该场景启用控制面路由和全局页表，
-  但保留较大的缓存容量，主要用来观察 prefix-hit routing 的收益和控制面开销。
+  但显式关闭 foreground rebalance 和 background copy，主要用来观察 prefix-hit routing 的收益和控制面开销。
 
-9. `--eviction-max-cached-blocks`：
-  `multi-gpu-kv-swapping` 场景的 KV block 上限。通常设得更小，用来更容易触发
-  swap / rebalance；请求仍按 round-robin 下发，用来隔离驱逐/迁移开销。
+10. `--eviction-max-cached-blocks`：
+  `multi-gpu-kv-transfer` 场景的 KV block 上限。通常设得更小，用来更容易触发
+  transfer / rebalance；请求仍按 round-robin 下发，用来隔离跨 GPU KV 搬运开销。
 
-10. `--goodput-e2e-sla-ms`：
+11. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-11. `--skip-pool`：
-  跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 swapping。
+12. `--skip-pool`：
+  跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-12. `--output-figure`：
+13. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-13. `--submit-window`：
+14. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
+
+15. `--disable-background-copy`：
+  关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
+  伙伴，服务后续请求；关闭后只保留前台 move-style transfer。
+
+16. `--background-copy-max-blocks`：
+  每次后台 copy 最多复制多少个 prefix block。值越大越可能提高后续本地命中，但会占用更多
+  NCCL / worker 时间；排查功能正确性可先用 1，验证收益时建议尝试 2。
+
+17. `--background-copy-cooldown-s`：
+  同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
+  值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
 说明：
 1. 建议显式设置 CUDA_VISIBLE_DEVICES，避免在共享机器上误用其他 GPU。
 2. 如果物理 GPU 0 和 2 之间有 NVLink，可以使用 `CUDA_VISIBLE_DEVICES=0,2`。
    但脚本内部看到的是重映射后的逻辑 GPU `0,1`，因此 `--nvlink-pairs` 应写成 `0,1`，而不是 `0,2`。
-3. `multi-gpu`，`multi-gpu-kv-swapping` 场景当前采用 round-robin 分发。
+3. `multi-gpu`，`multi-gpu-kv-transfer` 场景当前采用 round-robin 分发。
 4. 表里的 prefix hit 是 worker 在 prefill 时实际观察到的本地 prefix cache 命中率，
    round-robin 基线也会统计，因此可横向对比。它不是控制面路由命中率。
 5. `multi-gpu-lmpool` 需要至少 2 张可见 CUDA GPU。
+6. 如果要专门验证后台 speculative copy-style transfer，建议先用
+   `--eviction-max-cached-blocks 32 --background-copy-max-blocks 2 --background-copy-cooldown-s 0.5`。
+   `--eviction-max-cached-blocks 8` 更适合压力/失败原因分析，不适合证明 copy 收益。
 """
 
 import argparse
@@ -139,6 +162,20 @@ MODEL_CONFIG = {
     "heartbeat_timeout": 3600.0,
     "distributed_timeout_s": 1800.0,
     "worker_join_timeout": 30.0,
+    "route_prefix_hit_weight": 8.0,
+    "route_queue_pressure_weight": 1.0,
+    "route_free_block_weight": 0.05,
+    "route_load_weight": 0.01,
+    "route_waiting_token_weight": 1.0,
+    "route_running_token_weight": 0.25,
+    "route_running_sequence_weight": 32.0,
+    "route_load_bypass_threshold": 512.0,
+    "route_cache_queue_slack": 512.0,
+    "enable_foreground_rebalance": True,
+    # 后台 speculative copy-style transfer：每次只复制少量热点 prefix block，避免抢占前台推理时间。
+    "enable_background_copy": True,
+    "background_copy_max_blocks": 1,
+    "background_copy_cooldown_s": 2.0,
 }
 
 
@@ -184,10 +221,14 @@ class ScenarioResult:
     route_hit_rate: float
     routed_to_prefix_owner_rate: float
     prefix_hit_rate: float
-    swap_count: int
+    transfer_count: int
+    transfer_copy_count: int
     rebalance_success: int
     rebalance_fail: int
     rebalance_fail_reasons: dict[str, int]
+    background_copy_success: int
+    background_copy_fail: int
+    background_copy_fail_reasons: dict[str, int]
     gpu_util_mean: float | None
     gpu_util_p95: float | None
     gpu_mem_util_mean: float | None
@@ -489,10 +530,14 @@ def run_independent_multi_gpu_benchmark(
             route_hit_rate=0.0,
             routed_to_prefix_owner_rate=0.0,
             prefix_hit_rate=prefix_hit_rate,
-            swap_count=0,
+            transfer_count=0,
+            transfer_copy_count=0,
             rebalance_success=0,
             rebalance_fail=0,
             rebalance_fail_reasons={},
+            background_copy_success=0,
+            background_copy_fail=0,
+            background_copy_fail_reasons={},
             gpu_util_mean=gpu_util_mean,
             gpu_util_p95=gpu_util_p95,
             gpu_mem_util_mean=gpu_mem_util_mean,
@@ -563,12 +608,16 @@ def run_engine_scenario(
     route_hits = 0
     routed_to_prefix_owner = 0
     route_count = 0
-    prefill_hits = 0
-    prefill_count = 0
-    swap_count = 0
+    prefill_seen_seq_ids: set[int] = set()
+    prefill_hit_seq_ids: set[int] = set()
+    transfer_count = 0
+    transfer_copy_count = 0
     rebalance_success = 0
     rebalance_fail = 0
     rebalance_fail_reasons: dict[str, int] = {}
+    background_copy_success = 0
+    background_copy_fail = 0
+    background_copy_fail_reasons: dict[str, int] = {}
     start_wall = time.perf_counter()
     sampler = GpuMetricSampler(interval_s=0.5)
 
@@ -602,7 +651,7 @@ def run_engine_scenario(
                     if target_rank in route_info.get("hit_summary", {}):
                         routed_to_prefix_owner += 1
             elif route_mode == "round_robin":
-                # round-robin 模式只用于剥离 swap 开销，不做全局路由打分
+                # round-robin 模式只用于剥离 transfer 开销，不做全局路由打分
                 target_rank = len(submit_times) % config["world_size"]
             # The launcher has already selected the destination worker. Keep
             # remote_gpu_id clear so the destination Scheduler treats this as a
@@ -621,18 +670,28 @@ def run_engine_scenario(
             finished, first_tokens, prefill_stats, runtime_stats = engine.step()
             now = time.perf_counter()
             for item in runtime_stats:
-                swap_count += int(item.get("swap_count", 0))
+                transfer_count += int(item.get("transfer_count", item.get("swap_count", 0)))
+                transfer_copy_count += int(item.get("transfer_copy_count", 0))
                 rebalance_success += int(item.get("rebalance_success", 0))
                 rebalance_fail += int(item.get("rebalance_fail", 0))
+                background_copy_success += int(item.get("background_copy_success", 0))
+                background_copy_fail += int(item.get("background_copy_fail", 0))
                 for reason, count in item.get("rebalance_fail_reasons", {}).items():
                     rebalance_fail_reasons[reason] = rebalance_fail_reasons.get(reason, 0) + int(count)
+                for reason, count in item.get("background_copy_fail_reasons", {}).items():
+                    background_copy_fail_reasons[reason] = (
+                        background_copy_fail_reasons.get(reason, 0) + int(count)
+                    )
             for seq_id, _token in first_tokens:
                 if seq_id in submit_times:
                     ttfts.append(now - submit_times[seq_id])
             for item in prefill_stats:
-                prefill_count += 1
+                seq_id = item.get("seq_id")
+                if seq_id is not None:
+                    prefill_seen_seq_ids.add(seq_id)
                 if item.get("prefix_hit", False):
-                    prefill_hits += 1
+                    if seq_id is not None:
+                        prefill_hit_seq_ids.add(seq_id)
             for seq_id, tokens in finished:
                 inflight.discard(seq_id)
                 finished_count += 1
@@ -676,11 +735,15 @@ def run_engine_scenario(
         p95_e2e_s=statistics.quantiles(e2es, n=20)[18] if len(e2es) >= 20 else (max(e2es) if e2es else 0.0),
         route_hit_rate=route_hits / max(route_count, 1),
         routed_to_prefix_owner_rate=routed_to_prefix_owner / max(route_count, 1),
-        prefix_hit_rate=prefill_hits / max(prefill_count, 1),
-        swap_count=swap_count,
+        prefix_hit_rate=len(prefill_hit_seq_ids) / max(len(prefill_seen_seq_ids), 1),
+        transfer_count=transfer_count,
+        transfer_copy_count=transfer_copy_count,
         rebalance_success=rebalance_success,
         rebalance_fail=rebalance_fail,
         rebalance_fail_reasons=rebalance_fail_reasons,
+        background_copy_success=background_copy_success,
+        background_copy_fail=background_copy_fail,
+        background_copy_fail_reasons=background_copy_fail_reasons,
         gpu_util_mean=gpu_util_mean,
         gpu_util_p95=gpu_util_p95,
         gpu_mem_util_mean=gpu_mem_util_mean,
@@ -707,12 +770,13 @@ def print_summary_table(results: list[ScenarioResult | None]):
     # 横向总表：把所有场景放在同一张表里，便于直接看五种配置的整体差异。
     valid_results = [result for result in results if result is not None]
     print("\nBenchmark Summary")
-    print("=" * 160)
+    print("=" * 180)
     print(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
         f"{'e2e(ms)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
-        f"{'route hit':>11} {'owner hit':>11} {'local hit':>11} {'swaps':>8} {'reb ok':>8} {'reb fail':>9} "
-        f"{'pinned':>8} {'no space':>9} {'no plan':>8}"
+        f"{'route hit':>11} {'owner hit':>11} {'local hit':>11} {'transfers':>9} {'copies':>8} "
+        f"{'fg ok':>7} {'fg fail':>8} {'bg ok':>7} {'bg fail':>8} "
+        f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'bg space':>8}"
     )
     for result in valid_results:
         print(
@@ -728,12 +792,16 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{fmt_pct(result.route_hit_rate):>11} "
             f"{fmt_pct(result.routed_to_prefix_owner_rate):>11} "
             f"{fmt_pct(result.prefix_hit_rate):>11} "
-            f"{result.swap_count:>8} "
-            f"{result.rebalance_success:>8} "
-            f"{result.rebalance_fail:>9} "
+            f"{result.transfer_count:>9} "
+            f"{result.transfer_copy_count:>8} "
+            f"{result.rebalance_success:>7} "
+            f"{result.rebalance_fail:>8} "
+            f"{result.background_copy_success:>7} "
+            f"{result.background_copy_fail:>8} "
             f"{result.rebalance_fail_reasons.get('pinned_source', 0):>8} "
             f"{result.rebalance_fail_reasons.get('no_target_space', 0):>9} "
-            f"{result.rebalance_fail_reasons.get('no_plan', 0):>8}"
+            f"{result.rebalance_fail_reasons.get('no_plan', 0):>8} "
+            f"{result.background_copy_fail_reasons.get('no_target_space', 0):>8}"
         )
 
 
@@ -854,12 +922,16 @@ def parse_args():
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--model-name-or-path", type=str, default=MODEL_CONFIG["model_name_or_path"])
     parser.add_argument("--nvlink-pairs", type=str, default="0,1")
+    parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--routing-max-cached-blocks", type=int, default=1024)
     parser.add_argument("--eviction-max-cached-blocks", type=int, default=256)
     parser.add_argument("--goodput-e2e-sla-ms", type=float, default=2000.0)
     parser.add_argument("--skip-pool", action="store_true")
     parser.add_argument("--output-figure", type=str, default="")
     parser.add_argument("--submit-window", type=int, default=8)
+    parser.add_argument("--disable-background-copy", action="store_true")
+    parser.add_argument("--background-copy-max-blocks", type=int, default=MODEL_CONFIG["background_copy_max_blocks"])
+    parser.add_argument("--background-copy-cooldown-s", type=float, default=MODEL_CONFIG["background_copy_cooldown_s"])
     return parser.parse_args()
 
 
@@ -874,16 +946,30 @@ def parse_pairs(raw: str) -> list[tuple[int, int]]:
     return pairs
 
 
+def apply_background_copy_args(config: dict, args) -> None:
+    config["enable_background_copy"] = not args.disable_background_copy
+    config["background_copy_max_blocks"] = args.background_copy_max_blocks
+    config["background_copy_cooldown_s"] = args.background_copy_cooldown_s
+
+
 def main():
     # 主流程：
     # 1) 准备 prompts
     # 2) 跑 single-gpu 基线
     # 3) 跑 multi-gpu 独立基线
-    # 4) 跑 routing / swapping / pool 场景
+    # 4) 跑 routing / transfer / pool 场景
     # 5) 打印和导出结果
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for this benchmark")
+    if args.world_size < 1:
+        raise SystemExit("--world-size must be >= 1")
+    visible_gpus = torch.cuda.device_count()
+    if args.world_size > visible_gpus:
+        raise SystemExit(
+            f"--world-size {args.world_size} exceeds visible CUDA devices {visible_gpus}. "
+            "Check CUDA_VISIBLE_DEVICES."
+        )
 
     model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -917,7 +1003,7 @@ def main():
     baseline.prefix_hit_rate = baseline_hit_rate
 
     # multi-gpu baseline：不共享 KV、不走控制面路由，但请求通过 round-robin 分发到多张卡
-    multi_gpu_config = make_config(2, False, None)
+    multi_gpu_config = make_config(args.world_size, False, None)
     multi_gpu_config["model_name_or_path"] = model_name
     independent_result = run_engine_scenario(
         "multi-gpu",
@@ -931,9 +1017,11 @@ def main():
     )
 
     # multi-gpu-kv-routing：走控制面路由，用来测 prefix 命中带来的收益
-    routing_config = make_config(2, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
+    routing_config = make_config(args.world_size, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     routing_config["model_name_or_path"] = model_name
     routing_config["max_cached_blocks"] = args.routing_max_cached_blocks
+    routing_config["enable_foreground_rebalance"] = False
+    routing_config["enable_background_copy"] = False
     kv_routing = run_engine_scenario(
         "multi-gpu-kv-routing",
         routing_config,
@@ -945,12 +1033,13 @@ def main():
         submit_window=args.submit_window,
     )
 
-    # multi-gpu-kv-swapping：用 round-robin 分发，尽量隔离出 swap / rebalance 的开销
-    eviction_config = make_config(2, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
+    # multi-gpu-kv-transfer：用 round-robin 分发，尽量隔离出 transfer / rebalance 的开销
+    eviction_config = make_config(args.world_size, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     eviction_config["model_name_or_path"] = model_name
     eviction_config["max_cached_blocks"] = args.eviction_max_cached_blocks
+    apply_background_copy_args(eviction_config, args)
     kv_eviction = run_engine_scenario(
-        "multi-gpu-kv-swapping",
+        "multi-gpu-kv-transfer",
         eviction_config,
         prompts,
         sampling_params,
@@ -962,13 +1051,14 @@ def main():
 
     pool_result = None
     if not args.skip_pool:
-        if torch.cuda.device_count() < 2:
-            print("pool scenario skipped: need at least 2 CUDA devices")
+        if visible_gpus < args.world_size:
+            print(f"pool scenario skipped: need {args.world_size} CUDA devices")
         else:
             # multi-gpu-lmpool：真实全局池化路径，控制面路由 + 数据面执行一起跑。
             pool_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None
-            pool_config = make_config(2, True, pool_pairs)
+            pool_config = make_config(args.world_size, True, pool_pairs)
             pool_config["model_name_or_path"] = model_name
+            apply_background_copy_args(pool_config, args)
             pool_result = run_engine_scenario(
                 "multi-gpu-lmpool",
                 pool_config,
@@ -994,7 +1084,7 @@ def main():
             "single-gpu": asdict(baseline),
             "multi-gpu": asdict(independent_result) if independent_result is not None else None,
             "multi-gpu-kv-routing": asdict(kv_routing) if kv_routing is not None else None,
-            "multi-gpu-kv-swapping": asdict(kv_eviction) if kv_eviction is not None else None,
+            "multi-gpu-kv-transfer": asdict(kv_eviction) if kv_eviction is not None else None,
             "multi-gpu-lmpool": asdict(pool_result) if pool_result is not None else None,
         }
         save_summary_json(payload, args.output_json)

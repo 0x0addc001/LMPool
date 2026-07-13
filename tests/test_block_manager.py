@@ -114,3 +114,48 @@ def test_shared_prefix_ref_count_keeps_block_out_of_free_list():
     bm.deallocate(seq2)
     assert bm.blocks[shared_block_id].ref_count == 0
     assert shared_block_id in bm.free_block_ids
+
+
+def test_transfer_in_block_can_be_reused_as_trusted_prefix_hit():
+    bm = BlockManager(num_blocks=4, block_size=2)
+    h = bm.compute_hash([1, 2], -1)
+
+    reserved = bm.reserve_free_blocks(1)
+    bm.register_swap_in_blocks(reserved, [h])
+
+    seq = Sequence([1, 2, 3, 4], block_size=2)
+    bm.allocate(seq)
+
+    assert seq.block_table[0] == reserved[0]
+    assert seq.num_cached_tokens == 2
+
+
+def test_non_contiguous_cache_hit_does_not_count_as_prefix_hit():
+    bm = BlockManager(num_blocks=4, block_size=2)
+    h0 = bm.compute_hash([1, 2], -1)
+    h1 = bm.compute_hash([3, 4], h0)
+
+    reserved = bm.reserve_free_blocks(1)
+    bm.register_swap_in_blocks(reserved, [h1])
+
+    seq = Sequence([1, 2, 3, 4], block_size=2)
+    bm.allocate(seq)
+
+    assert reserved[0] in seq.block_table
+    assert seq.num_cached_tokens == 0
+
+
+def test_can_allocate_counts_only_blocks_that_need_new_storage():
+    bm = BlockManager(num_blocks=2, block_size=2)
+    cached = Sequence([1, 2], block_size=2)
+    bm.allocate(cached)
+
+    seq = Sequence([1, 2, 3, 4], block_size=2)
+
+    assert len(bm.free_block_ids) == 1
+    assert seq.num_blocks == 2
+    assert bm.num_required_new_blocks(seq) == 1
+    assert bm.can_allocate(seq) is True
+
+    bm.allocate(seq)
+    assert seq.num_cached_tokens == 2
