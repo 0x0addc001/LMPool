@@ -15,6 +15,7 @@
     --submit-window 5 \
     --background-copy-max-blocks 1 \
     --background-copy-cooldown-s 2.0 \
+    --background-copy-hot-threshold 3 \
     --goodput-e2e-sla-ms 10000 \
     --output-json ./benchmarks/results/shared_prefix_benchmark_202607121117.json \
     --output-figure ./benchmarks/results/shared_prefix_benchmark_202607121117.png
@@ -85,6 +86,10 @@
 17. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
+
+18. `--background-copy-hot-threshold`：
+  同一个 prefix 至少被路由命中多少次后才允许后台 copy。值越大越保守，能减少无效 copy；
+  值为 1 时退化为旧的 eager speculative copy。
 
 说明：
 1. 建议显式设置 CUDA_VISIBLE_DEVICES，避免在共享机器上误用其他 GPU。
@@ -176,6 +181,7 @@ MODEL_CONFIG = {
     "enable_background_copy": True,
     "background_copy_max_blocks": 1,
     "background_copy_cooldown_s": 2.0,
+    "background_copy_hot_threshold": 3,
 }
 
 
@@ -211,12 +217,15 @@ class ScenarioResult:
     goodput_tok_s: float
     mean_ttft_s: float
     p50_ttft_s: float
+    p90_ttft_s: float
     p95_ttft_s: float
     mean_ttpt_s: float
     p50_ttpt_s: float
+    p90_ttpt_s: float
     p95_ttpt_s: float
     mean_e2e_s: float
     p50_e2e_s: float
+    p90_e2e_s: float
     p95_e2e_s: float
     route_hit_rate: float
     routed_to_prefix_owner_rate: float
@@ -441,12 +450,14 @@ def _run_independent_worker(
             "goodput_tokens": goodput_tokens,
             "mean_ttft_s": _mean(ttfts),
             "p50_ttft_s": _median(ttfts),
-            "p95_ttft_s": statistics.quantiles(ttfts, n=20)[18] if len(ttfts) >= 20 else (max(ttfts) if ttfts else 0.0),
+            "p90_ttft_s": _percentile(ttfts, 0.90),
+            "p95_ttft_s": _percentile(ttfts, 0.95),
             "ttfts": ttfts,
             "prefix_hit_rate": prefix_hits / max(seq_count, 1),
             "mean_e2e_s": _mean(e2es),
             "p50_e2e_s": _median(e2es),
-            "p95_e2e_s": statistics.quantiles(e2es, n=20)[18] if len(e2es) >= 20 else (max(e2es) if e2es else 0.0),
+            "p90_e2e_s": _percentile(e2es, 0.90),
+            "p95_e2e_s": _percentile(e2es, 0.95),
             "e2es": e2es,
         }
     )
@@ -520,13 +531,16 @@ def run_independent_multi_gpu_benchmark(
             goodput_tok_s=goodput_tokens / max(elapsed, 1e-9),
             mean_ttft_s=_mean(ttfts),
             p50_ttft_s=_median(ttfts),
-            p95_ttft_s=statistics.quantiles(ttfts, n=20)[18] if len(ttfts) >= 20 else (max(ttfts) if ttfts else 0.0),
+            p90_ttft_s=_percentile(ttfts, 0.90),
+            p95_ttft_s=_percentile(ttfts, 0.95),
             mean_ttpt_s=_mean(ttfts),
             p50_ttpt_s=_median(ttfts),
-            p95_ttpt_s=statistics.quantiles(ttfts, n=20)[18] if len(ttfts) >= 20 else (max(ttfts) if ttfts else 0.0),
+            p90_ttpt_s=_percentile(ttfts, 0.90),
+            p95_ttpt_s=_percentile(ttfts, 0.95),
             mean_e2e_s=_mean(e2es),
             p50_e2e_s=_median(e2es),
-            p95_e2e_s=statistics.quantiles(e2es, n=20)[18] if len(e2es) >= 20 else (max(e2es) if e2es else 0.0),
+            p90_e2e_s=_percentile(e2es, 0.90),
+            p95_e2e_s=_percentile(e2es, 0.95),
             route_hit_rate=0.0,
             routed_to_prefix_owner_rate=0.0,
             prefix_hit_rate=prefix_hit_rate,
@@ -726,13 +740,16 @@ def run_engine_scenario(
         goodput_tok_s=goodput_tokens / max(elapsed, 1e-9),
         mean_ttft_s=_mean(ttfts),
         p50_ttft_s=_median(ttfts),
-        p95_ttft_s=statistics.quantiles(ttfts, n=20)[18] if len(ttfts) >= 20 else (max(ttfts) if ttfts else 0.0),
+        p90_ttft_s=_percentile(ttfts, 0.90),
+        p95_ttft_s=_percentile(ttfts, 0.95),
         mean_ttpt_s=_mean(ttpts),
         p50_ttpt_s=_median(ttpts),
-        p95_ttpt_s=statistics.quantiles(ttpts, n=20)[18] if len(ttpts) >= 20 else (max(ttpts) if ttpts else 0.0),
+        p90_ttpt_s=_percentile(ttpts, 0.90),
+        p95_ttpt_s=_percentile(ttpts, 0.95),
         mean_e2e_s=_mean(e2es),
         p50_e2e_s=_median(e2es),
-        p95_e2e_s=statistics.quantiles(e2es, n=20)[18] if len(e2es) >= 20 else (max(e2es) if e2es else 0.0),
+        p90_e2e_s=_percentile(e2es, 0.90),
+        p95_e2e_s=_percentile(e2es, 0.95),
         route_hit_rate=route_hits / max(route_count, 1),
         routed_to_prefix_owner_rate=routed_to_prefix_owner / max(route_count, 1),
         prefix_hit_rate=len(prefill_hit_seq_ids) / max(len(prefill_seen_seq_ids), 1),
@@ -773,7 +790,7 @@ def print_summary_table(results: list[ScenarioResult | None]):
     print("=" * 180)
     print(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
-        f"{'e2e(ms)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
+        f"{'e2e(ms)':>12} {'p90(e2e)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
         f"{'route hit':>11} {'owner hit':>11} {'local hit':>11} {'transfers':>9} {'copies':>8} "
         f"{'fg ok':>7} {'fg fail':>8} {'bg ok':>7} {'bg fail':>8} "
         f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'bg space':>8}"
@@ -786,6 +803,7 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{result.mean_ttft_s * 1000:>12.2f} "
             f"{result.mean_ttpt_s * 1000:>12.2f} "
             f"{result.mean_e2e_s * 1000:>12.2f} "
+            f"{result.p90_e2e_s * 1000:>12.2f} "
             f"{result.p95_e2e_s * 1000:>12.2f} "
             f"{(result.gpu_util_mean if result.gpu_util_mean is not None else float('nan')):>10.2f} "
             f"{(result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else float('nan')):>10.2f} "
@@ -827,6 +845,7 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     ttft_ms = [result.mean_ttft_s * 1000.0 for result in valid_results]
     ttpt_ms = [result.mean_ttpt_s * 1000.0 for result in valid_results]
     e2e_ms = [result.mean_e2e_s * 1000.0 for result in valid_results]
+    p90_e2e_ms = [result.p90_e2e_s * 1000.0 for result in valid_results]
     route_hit_pct = [result.route_hit_rate * 100.0 for result in valid_results]
     owner_hit_pct = [result.routed_to_prefix_owner_rate * 100.0 for result in valid_results]
     local_hit_pct = [result.prefix_hit_rate * 100.0 for result in valid_results]
@@ -866,12 +885,14 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     axes[0, 0].set_xticks(x, names, rotation=15, ha="right")
     axes[0, 0].legend()
 
-    latency_width = 0.25
-    bars = axes[0, 1].bar([i - latency_width for i in x], ttft_ms, width=latency_width, label="TTFT")
+    latency_width = 0.2
+    bars = axes[0, 1].bar([i - 1.5 * latency_width for i in x], ttft_ms, width=latency_width, label="TTFT mean")
     annotate_bars(axes[0, 1], bars, decimals=0)
-    bars = axes[0, 1].bar(x, ttpt_ms, width=latency_width, label="TTPT")
+    bars = axes[0, 1].bar([i - 0.5 * latency_width for i in x], ttpt_ms, width=latency_width, label="TTPT mean")
     annotate_bars(axes[0, 1], bars, decimals=0)
-    bars = axes[0, 1].bar([i + latency_width for i in x], e2e_ms, width=latency_width, label="E2E")
+    bars = axes[0, 1].bar([i + 0.5 * latency_width for i in x], e2e_ms, width=latency_width, label="E2E mean")
+    annotate_bars(axes[0, 1], bars, decimals=0)
+    bars = axes[0, 1].bar([i + 1.5 * latency_width for i in x], p90_e2e_ms, width=latency_width, label="E2E p90")
     annotate_bars(axes[0, 1], bars, decimals=0)
     axes[0, 1].set_title("Latency")
     axes[0, 1].set_ylabel("ms")
@@ -932,6 +953,7 @@ def parse_args():
     parser.add_argument("--disable-background-copy", action="store_true")
     parser.add_argument("--background-copy-max-blocks", type=int, default=MODEL_CONFIG["background_copy_max_blocks"])
     parser.add_argument("--background-copy-cooldown-s", type=float, default=MODEL_CONFIG["background_copy_cooldown_s"])
+    parser.add_argument("--background-copy-hot-threshold", type=int, default=MODEL_CONFIG["background_copy_hot_threshold"])
     return parser.parse_args()
 
 
@@ -950,6 +972,7 @@ def apply_background_copy_args(config: dict, args) -> None:
     config["enable_background_copy"] = not args.disable_background_copy
     config["background_copy_max_blocks"] = args.background_copy_max_blocks
     config["background_copy_cooldown_s"] = args.background_copy_cooldown_s
+    config["background_copy_hot_threshold"] = args.background_copy_hot_threshold
 
 
 def main():

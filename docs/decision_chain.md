@@ -371,3 +371,40 @@ decision demand, decision plan, decision implementation, and decision result.
 - Decision result: LMPool routing should be less likely to over-concentrate
   long shared-prefix requests on a few owner GPUs, improving throughput under
   request skew while preserving prefix locality when load is balanced.
+
+## 2026-07-13: Gate Background Copy By Hot Prefix
+
+- Decision demand: Benchmarks where routing-only already had high local hit
+  showed that eager speculative copy added transfer overhead while improving
+  local hit by less than one percentage point. Background copy needed to become
+  selective instead of firing on the first prefix hit.
+- Decision plan: Track route-time prefix hit counts in the control plane and
+  only allow background copy after a prefix becomes hot. Also prevent multiple
+  background copy plans from running concurrently on the same `src -> dst` pair.
+- Decision implementation: Added `background_copy_hot_threshold` to the control
+  plane and benchmark CLI. `control_plane_process()` now increments
+  `prefix_route_hits[prefix_hash]` for prefix-hit routes and returns early until
+  the threshold is reached. It also maintains `background_copy_inflight_pairs`
+  and releases the pair when the background plan succeeds, fails, aborts, or is
+  cleared after worker failure. Tests now cover threshold-gated copy behavior.
+- Decision result: Speculative transfer is now hot-prefix gated. The default
+  benchmark setting avoids eager copy overhead, while experiments can still set
+  `--background-copy-hot-threshold 1` to reproduce the previous eager policy.
+
+## 2026-07-13: Add P90 Latency Reporting And Visualization
+
+- Decision demand: Load-skew and transfer-relief experiments need tail-latency
+  visibility beyond the existing mean latency and p95 table column. The figure
+  did not show P90, making it harder to tell whether a mechanism primarily
+  improves average latency or tail latency.
+- Decision plan: Add P90 latency fields to benchmark results, include
+  `p90(e2e)` in the summary table, and draw P90 E2E in the latency subplot
+  alongside mean TTFT, mean TTPT, and mean E2E.
+- Decision implementation: Extended `ScenarioResult` with `p90_ttft_s`,
+  `p90_ttpt_s`, and `p90_e2e_s`. Reused the existing `_percentile()` helper for
+  both P90 and P95 calculations. Updated the summary table and PNG figure to
+  include `p90(e2e)`, and documented that TTFT/TTPT/E2E columns are
+  mean/average values while P90/P95 are tail-latency metrics.
+- Decision result: Future benchmark JSON, tables, and figures can directly
+  compare mean latency against P90/P95 tail latency, which is necessary for
+  evaluating load-skew relief and transfer-triggered tail improvements.

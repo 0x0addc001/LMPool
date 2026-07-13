@@ -266,6 +266,7 @@ def test_route_schedules_background_copy_without_blocking_response():
             "enable_background_copy": True,
             "background_copy_max_blocks": 1,
             "background_copy_cooldown_s": 0.0,
+            "background_copy_hot_threshold": 1,
         }
     )
     try:
@@ -330,6 +331,7 @@ def test_background_copy_uses_ordered_prefix_hash_chain():
             "enable_background_copy": True,
             "background_copy_max_blocks": 2,
             "background_copy_cooldown_s": 0.0,
+            "background_copy_hot_threshold": 1,
         }
     )
     try:
@@ -389,6 +391,70 @@ def test_background_copy_uses_ordered_prefix_hash_chain():
         transfer = source_plans[0]["transfers"][0]
         assert transfer["src_blocks"] == [0, 1]
         assert transfer["hashes"] == [h0, h1]
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_background_copy_waits_for_hot_prefix_threshold():
+    config, request_queue, response_queues, control_thread = _start_control_plane(
+        extra_config={
+            "enable_background_copy": True,
+            "background_copy_max_blocks": 1,
+            "background_copy_cooldown_s": 0.0,
+            "background_copy_hot_threshold": 2,
+        }
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        client0 = ControlPlaneClient(0, request_queue, response_queues[0])
+        client1 = ControlPlaneClient(1, request_queue, response_queues[1])
+        client0.block_manager = bm
+        seen = []
+
+        def make_executor(rank):
+            def _executor(plan):
+                seen.append((rank, plan["_phase"], plan["mode"], bool(plan.get("background"))))
+                return {"success": True}
+
+            return _executor
+
+        client0.set_rebalance_executor(make_executor(0))
+        client1.set_rebalance_executor(make_executor(1))
+
+        prefix_tokens = [11, 22]
+        prefix_hash = bm.compute_hash(prefix_tokens, -1)
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 4,
+            "block_hashes": {0: prefix_hash},
+            "evictable_block_hashes": {},
+            "pinned_block_hashes": {0: prefix_hash},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 4,
+            "block_hashes": {},
+        })
+        time.sleep(0.2)
+
+        client0.route_sequence(Sequence(token_ids=prefix_tokens + [33], block_size=2))
+        client0.pump_async_messages()
+        client1.pump_async_messages()
+        assert not seen
+
+        client0.route_sequence(Sequence(token_ids=prefix_tokens + [44], block_size=2))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            client0.pump_async_messages()
+            client1.pump_async_messages()
+            if (0, "execute", "copy", True) in seen and (1, "execute", "copy", True) in seen:
+                break
+            time.sleep(0.01)
+
+        assert (0, "execute", "copy", True) in seen
+        assert (1, "execute", "copy", True) in seen
     finally:
         _stop_control_plane(request_queue, control_thread)
 

@@ -22,9 +22,10 @@ Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py
 
 - `tput(tok/s)`: generated output tokens per second.
 - `goodput`: generated output tokens per second for requests whose end-to-end latency is within `--goodput-e2e-sla-ms`.
-- `ttft(ms)`: mean time from request submission to the first generated token event reported by the data-plane worker.
-- `ttpt(ms)`: mean per-output-token latency proxy, computed as request E2E latency divided by the number of generated output tokens.
-- `e2e(ms)`: mean end-to-end request latency.
+- `ttft(ms)`: mean/average time from request submission to the first generated token event reported by the data-plane worker.
+- `ttpt(ms)`: mean/average per-output-token latency proxy, computed as request E2E latency divided by the number of generated output tokens.
+- `e2e(ms)`: mean/average end-to-end request latency.
+- `p90(e2e)`: p90 end-to-end request latency.
 - `p95(e2e)`: p95 end-to-end request latency.
 - `gpu util`: mean GPU utilization sampled from `nvidia-smi`.
 - `mem util`: mean GPU memory utilization sampled from `nvidia-smi`.
@@ -78,6 +79,7 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
 - `--disable-background-copy`: disable background speculative copy-style transfer.
 - `--background-copy-max-blocks`: maximum prefix blocks copied by one background plan. Use `1` for correctness debugging and try `2` when measuring possible locality gains.
 - `--background-copy-cooldown-s`: cooldown before the same prefix can trigger another copy on the same source-target pair. Try `0.5` when evaluating background copy impact.
+- `--background-copy-hot-threshold`: number of routing-time prefix hits required before background copy is allowed for that prefix. `1` is eager copy; larger values reduce speculative transfer overhead.
 
 Routing load-score defaults are set in `MODEL_CONFIG` inside `shared_prefix_benchmark.py`:
 

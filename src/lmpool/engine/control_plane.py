@@ -289,11 +289,14 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     enable_background_copy = bool(config.get("enable_background_copy", False))
     background_copy_max_blocks = max(1, int(config.get("background_copy_max_blocks", 1)))
     background_copy_cooldown_s = max(0.0, float(config.get("background_copy_cooldown_s", 2.0)))
+    background_copy_hot_threshold = max(1, int(config.get("background_copy_hot_threshold", 3)))
     logger.info("control plane process started")
 
     pending_rebalances: dict[str, dict] = {}
     route_cache: dict[int, int] = {}
+    background_copy_inflight_pairs: set[tuple[int, int]] = set()
     background_copy_recent: dict[tuple[int, int, int], float] = {}
+    prefix_route_hits: dict[int, int] = defaultdict(int)
     worker_last_heartbeat: dict[int, float] = {rank: time.monotonic() for rank in range(world_size)}
     worker_down: set[int] = set()
     last_control_heartbeat_sent = 0.0
@@ -327,6 +330,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "error": f"worker {rank} down",
                         "plan_id": plan_id,
                     })
+                _release_background_copy_inflight(plan["plan"])
                 del pending_rebalances[plan_id]
 
     def _send_rebalance_execute(plan_id: str, plan: dict):
@@ -361,6 +365,15 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 "role": "abort",
                 "plan": plan,
             })
+
+    def _release_background_copy_inflight(plan: dict) -> None:
+        if not plan.get("background"):
+            return
+        for transfer in plan.get("transfers", []):
+            background_copy_inflight_pairs.discard((
+                int(transfer["src_gpu"]),
+                int(transfer["dst_gpu"]),
+            ))
 
     def _enqueue_rebalance_plan(plan: dict, request_id: str | None, reply_rank: int | None) -> bool:
         plan_id = uuid.uuid4().hex
@@ -402,11 +415,17 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         hit_summary = route_info.get("hit_summary") or {}
         if prefix_hash is None or not hit_summary:
             return
+        prefix_route_hits[int(prefix_hash)] += 1
+        if prefix_route_hits[int(prefix_hash)] < background_copy_hot_threshold:
+            return
 
         target_rank = route_info.get("target_rank")
         src_gpu = target_rank if target_rank in hit_summary else next(iter(hit_summary))
         dst_gpu = gbm._get_nvlink_partner(src_gpu)
         if dst_gpu is None or dst_gpu == src_gpu:
+            return
+        pair_key = (int(src_gpu), int(dst_gpu))
+        if pair_key in background_copy_inflight_pairs:
             return
         if gbm.get_free_blocks_count(dst_gpu) <= 0:
             return
@@ -450,6 +469,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             }],
         }
         if _enqueue_rebalance_plan(plan, request_id=None, reply_rank=None):
+            background_copy_inflight_pairs.add(pair_key)
             background_copy_recent[cooldown_key] = now
             logger.info(
                 "background transfer copy scheduled: prefix=%s src=%s dst=%s blocks=%s",
@@ -533,6 +553,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "reason": result_reason,
                         "plan_id": plan_id,
                     })
+                _release_background_copy_inflight(plan["plan"])
                 del pending_rebalances[plan_id]
                 service_heartbeats()
                 continue
@@ -554,6 +575,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                             "success": True,
                             "plan_id": plan_id,
                         })
+                    _release_background_copy_inflight(plan["plan"])
                     del pending_rebalances[plan_id]
             service_heartbeats()
             continue
