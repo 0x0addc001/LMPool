@@ -138,9 +138,13 @@ class GlobalScheduler:
             return (target, route_info) if return_info else target
 
         # 3. 按 GPU 聚合命中块数
-        gpu_hit_count: dict[int, int] = {}
+        gpu_hit_hashes: dict[int, set[int]] = {}
         for loc in hits:
-            gpu_hit_count[loc.gpu_id] = gpu_hit_count.get(loc.gpu_id, 0) + 1
+            gpu_hit_hashes.setdefault(loc.gpu_id, set()).add(loc.hash)
+        gpu_hit_count = {
+            gpu_id: len(block_hashes)
+            for gpu_id, block_hashes in gpu_hit_hashes.items()
+        }
 
         # 4. 加权打分
         # score = 命中块数 × 拓扑权重 × prefix_hit_weight
@@ -221,6 +225,36 @@ class GlobalScheduler:
             return (best_gpu, route_info) if return_info else best_gpu
 
         if failed_gpus:
+            allocatable_candidates = [
+                gpu_id
+                for gpu_id in candidates
+                if self.gbm.get_free_blocks_count(gpu_id) >= num_blocks
+            ]
+            if allocatable_candidates:
+                target = min(
+                    allocatable_candidates,
+                    key=lambda gpu_id: (
+                        self._load_score(gpu_id),
+                        -self.gbm.get_free_blocks_count(gpu_id),
+                        gpu_id,
+                    ),
+                )
+                route_info["prefix_hit"] = True
+                route_info["reason"] = "prefix_owner_full_fallback"
+                route_info["target_rank"] = target
+                route_info["hit_summary"] = hit_summary
+                route_info["failed_gpus"] = [(g, s) for g, s, _ in failed_gpus]
+                route_info["load_score"] = self._load_summary(candidates)
+                route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+                logger.info(
+                    "route seq %s: prefix owners lack space; free=%s -> GPU %s "
+                    "(reason=prefix_owner_full_fallback)",
+                    seq_id,
+                    free_snapshot,
+                    target,
+                )
+                return (target, route_info) if return_info else target
+
             failed_gpus.sort(key=lambda x: x[1], reverse=True)
             target = failed_gpus[0][0]
             route_info["prefix_hit"] = True

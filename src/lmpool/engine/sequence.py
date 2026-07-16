@@ -29,6 +29,10 @@ class Sequence:
         self.num_prompt_tokens = len(self.token_ids)
         # num_cached_tokens = 0
         self.num_cached_tokens = 0
+        # Runtime-only scheduling/measurement state. These counters travel
+        # with the sequence when it crosses process queues.
+        self.prefill_attempts = 0
+        self.preemption_count = 0
         # block_table
         self.block_table = []
         # sampling_params' related things
@@ -78,6 +82,16 @@ class Sequence:
         return int(math.ceil(self.num_tokens / self.block_size))
 
     @property
+    def remaining_decode_blocks(self):
+        """Maximum additional blocks needed to finish configured decoding."""
+        remaining_tokens = max(0, self.max_tokens - self.num_completion_tokens)
+        final_tokens = self.num_tokens + remaining_tokens
+        if self.max_model_length is not None:
+            final_tokens = min(final_tokens, self.max_model_length)
+        final_blocks = int(math.ceil(final_tokens / self.block_size))
+        return max(0, final_blocks - self.num_blocks)
+
+    @property
     def last_block_num_tokens(self):
         full_blocks = int(math.floor(self.num_tokens / self.block_size))
         remainder = len(self.token_ids[full_blocks * self.block_size : ])
@@ -106,6 +120,8 @@ class Sequence:
             self.num_tokens, 
             self.num_prompt_tokens, 
             self.num_cached_tokens, 
+            self.prefill_attempts,
+            self.preemption_count,
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token,
             self.temperature,
@@ -128,6 +144,8 @@ class Sequence:
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.prefill_attempts,
+            self.preemption_count,
             self.block_table,
             last_token_or_ids,
             self.temperature,

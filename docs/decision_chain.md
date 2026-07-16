@@ -408,3 +408,306 @@ decision demand, decision plan, decision implementation, and decision result.
 - Decision result: Future benchmark JSON, tables, and figures can directly
   compare mean latency against P90/P95 tail latency, which is necessary for
   evaluating load-skew relief and transfer-triggered tail improvements.
+
+## 2026-07-15: Use Paper-Friendly Benchmark Figure Colors
+
+- Decision demand: The E2E benchmark figure reused matplotlib default colors
+  across subplots, making different metric groups harder to distinguish in
+  paper-style figures.
+- Decision plan: Assign explicit muted, colorblind-friendly palettes to each
+  subplot group so throughput, latency, prefix-hit, and utilization metrics use
+  distinct colors.
+- Decision implementation: Updated `save_summary_figure()` in
+  `benchmarks/shared_prefix_benchmark.py` with fixed Okabe-Ito / muted academic
+  color groups, thin bar outlines, and light horizontal grid lines. The latency
+  subplot keeps TTFT, TTPT, mean E2E, and P90 E2E as separate visible series.
+- Decision result: Future `--output-figure` PNGs are more suitable for paper
+  drafts and easier to read when multiple metric groups appear in the same
+  summary figure.
+
+## 2026-07-15: Strengthen Load-Aware Routing And Rank Diagnostics
+
+- Decision demand: Four-GPU E2E results showed that LMPool reduced TTFT and
+  tail latency but still lost throughput to round-robin multi-GPU baselines.
+  The likely causes were locality-heavy routing that underutilized some GPUs,
+  repeated foreground transfer attempts that produced `no_plan`, and missing
+  per-rank diagnostics to prove load skew.
+- Decision plan: Make routing more load-sensitive by default, expose the load
+  knobs through benchmark CLI, avoid foreground transfer for tiny one-block
+  shortages in benchmark runs, and persist per-rank execution counters in the
+  benchmark JSON.
+- Decision implementation: Updated benchmark defaults to
+  `route_load_weight=0.03`, `route_load_bypass_threshold=256`, and
+  `route_cache_queue_slack=256`, then added matching CLI arguments. Added
+  `foreground_transfer_min_blocks` and wired it into `Scheduler` through
+  `data_plane_process`, so benchmark foreground transfer only fires when a
+  shortage is large enough to justify control-plane and NCCL overhead. Added
+  `foreground_transfer_fail_cooldown_s=2.0` for benchmark runs to avoid rapid
+  repeated `no_plan` attempts. Preserved foreground transfer in
+  `multi-gpu-kv-transfer` so that scenario can still isolate transfer behavior.
+  Added rank attribution for `prefill_stats` and `runtime_stats` in `LLMEngine`,
+  and added `rank_stats` to benchmark JSON with submitted requests, local prefix
+  hits, execution tokens/time, transfer counts, and rebalance counters.
+- Decision result: LMPool experiments can now trade locality for parallelism
+  without source edits, repeated low-value foreground transfer attempts should
+  drop, and saved JSON can explain whether throughput loss comes from rank load
+  imbalance, transfer overhead, or cache-locality choices.
+
+## 2026-07-15: Split Benchmark Workloads And Add Per-Rank GPU Metrics
+
+- Decision demand: The previous optimization did not fully implement the
+  workload split between locality-oriented routing experiments and
+  load/memory-skew transfer experiments. It also lacked per-rank GPU utilization
+  in JSON, so load concentration still required inference from global averages.
+- Decision plan: Add an explicit workload selector to the E2E benchmark and
+  make GPU metric sampling respect `CUDA_VISIBLE_DEVICES`. Attach per-rank GPU
+  utilization and memory utilization to `rank_stats`.
+- Decision implementation: Added `--workload {locality,load-skew,memory-skew}`.
+  `locality` keeps the original single shared-prefix workload for routing,
+  `load-skew` mixes a hot prefix with cold prefixes, and `memory-skew` uses a
+  longer hot prefix to increase KV block pressure for transfer/rebalance
+  experiments. Reworked `GpuMetricSampler` to map logical ranks to physical GPU
+  IDs from `CUDA_VISIBLE_DEVICES`, sample only those GPUs, and expose
+  `summarize_by_rank()`. The benchmark now merges per-rank GPU util and memory
+  util into each scenario's JSON `rank_stats`.
+- Decision result: Future experiments can separate routing locality claims from
+  transfer/rebalance stress claims, and the saved JSON directly shows whether
+  poor throughput comes from per-rank request skew, token skew, execution time,
+  or GPU utilization imbalance.
+
+## 2026-07-15: Account For Optimistic Route Load
+
+- Decision demand: The locality benchmark showed `multi-gpu-lmpool` routing
+  109 of 128 requests to rank 1 while other ranks were nearly idle. Route hit
+  was high, but throughput collapsed because route cache/load scoring did not
+  account for requests already routed but not yet reflected in worker
+  block-state reports.
+- Decision plan: Treat every routing decision as an optimistic waiting-load
+  reservation in the authoritative control-plane state. The next worker
+  `block_state` snapshot still overwrites the estimate, but consecutive route
+  requests will see the pending load immediately.
+- Decision implementation: Added `GlobalBlockManager.reserve_route_load()` to
+  increment `waiting_sequences_per_gpu` and `waiting_tokens_per_gpu` after a
+  route decision. `control_plane_process()` now calls it immediately after
+  `reserve_blocks()`. Added a regression test that repeatedly routes a shared
+  prefix before any worker report and asserts the targets are not sticky to a
+  single cached owner.
+- Decision result: Route cache and load-aware scoring now include in-flight
+  routed work, so high-locality bursts should distribute across available ranks
+  instead of collapsing onto the first prefix owner.
+
+## 2026-07-15: Visualize Per-Rank Benchmark Diagnostics
+
+- Decision demand: `rank_stats` in benchmark JSON exposed request and GPU
+  imbalance, but reading raw JSON made it hard to quickly diagnose route
+  collapse or underutilized ranks from experiment artifacts.
+- Decision plan: Keep the existing summary figure unchanged and automatically
+  save a second per-rank diagnostics figure whenever `--output-figure` is used.
+- Decision implementation: Added `save_rank_stats_figure()` to
+  `benchmarks/shared_prefix_benchmark.py`. It derives a sibling filename using
+  the `_rank_stats` suffix and plots per-rank submitted requests, output tokens,
+  GPU utilization, and local prefix hit rate across all scenarios with distinct
+  muted paper-style colors.
+- Decision result: Each benchmark run with `--output-figure foo.png` now also
+  emits `foo_rank_stats.png`, making route skew and GPU imbalance visible
+  without manually inspecting JSON.
+
+## 2026-07-15: Make Route Cache Owner-Balanced
+
+- Decision demand: Locality benchmark rank diagnostics showed LMPool could
+  still collapse most requests onto one rank even when route hit was high.
+  A single-target route cache made prefix locality behave like sticky routing.
+- Decision plan: Keep the route cache as a fast path, but make it choose among
+  all currently valid prefix owners using current optimistic load instead of
+  blindly reusing the previously cached target.
+- Decision implementation: Updated `control_plane_process()` so a cached prefix
+  first gathers all owner GPUs that are valid candidates and have enough free
+  blocks, then selects the lowest-load owner with a free-block tiebreaker. If
+  the lightest owner is still too congested compared with the lightest
+  candidate, routing falls back to full global scoring. Added a regression test
+  covering multi-owner cache balancing.
+- Decision result: Prefix locality remains a fast path, but repeated shared
+  prefix requests should distribute across prefix owners instead of sticking to
+  the first cached rank.
+
+## 2026-07-15: Disable Route Cache By Default
+
+- Decision demand: The latest locality run still showed poor LMPool throughput.
+  Rank diagnostics showed requests were no longer confined to one GPU, but were
+  still confined to existing prefix owners. The route-cache fast path bypassed
+  full load-aware scoring, so non-owner GPUs were not seeded even when owners
+  were overloaded.
+- Decision plan: Keep route-cache code only as an opt-in test/experiment path
+  and make the default control plane always use full route scoring. This keeps
+  the runtime behavior simple: every request sees the same prefix/locality/load
+  policy.
+- Decision implementation: Added `enable_route_cache` config in
+  `control_plane_process()` with default `False`. Existing route-cache tests now
+  enable it explicitly. Added a global scheduler regression test showing ingress
+  routing can bypass an overloaded prefix owner and send work to a free GPU.
+- Decision result: Default LMPool routing no longer has a sticky cache fast path
+  that can override load-aware routing. High-locality bursts should now spread
+  beyond the first prefix owners when those owners accumulate optimistic load.
+
+## 2026-07-15: Remove Duplicate-Replica Prefix Score Amplification
+
+- Decision demand: Locality runs still showed routing collapse after disabling
+  the route-cache fast path. Rank diagnostics showed most requests were sent to
+  a single prefix owner. The root cause was that routing counted every physical
+  copy of the same prefix hash on a GPU as a separate prefix hit, so routing more
+  requests to one GPU created more duplicate copies and further increased that
+  GPU's future score.
+- Decision plan: Treat prefix locality as content presence, not duplicate
+  physical replica count. For a given prefix hash, each GPU should contribute at
+  most one hit to the routing score.
+- Decision implementation: Changed `GlobalScheduler.route_sequence_meta()` to
+  aggregate hit hashes as a set per GPU before computing `gpu_hit_count`.
+  Updated the scheduler regression test so duplicate replicas on a remote GPU no
+  longer outweigh an equivalent local prefix hit.
+- Decision result: Prefix-hit score can no longer self-amplify merely because a
+  GPU has served many duplicate requests. Load-aware routing should now be able
+  to seed idle GPUs instead of being dominated by duplicate KV replicas.
+
+## 2026-07-16: Preserve Pending Admission Load Across Worker Snapshots
+
+- Decision demand: Locality benchmarks still concentrated requests on one or
+  two ranks because newly routed work disappeared from the load estimate before
+  the destination worker admitted it.
+- Decision plan: Keep control-plane admission reservations separate from worker
+  snapshots and clear them only when the worker receives the sequence.
+- Decision implementation: Added pending sequence/token counters to
+  `GlobalBlockManager`. Routing load and queue pressure include these counters,
+  while `update_gpu_state()` cannot overwrite them. After receiving a batch,
+  `DataPlaneProcess` first publishes a block-state snapshot containing the new
+  waiting sequences, then sends sequence-specific `route_admitted` messages.
+  FIFO ordering guarantees that the control plane installs real waiting load
+  before clearing matching pending reservations. Added regression coverage for
+  stale snapshots, unrelated acknowledgements, and the final handoff from
+  pending to worker-reported load.
+- Decision result: There is no zero-load observation window between route
+  reservation and worker admission, so a synchronous burst cannot repeatedly
+  route to an owner that only appears idle because its acknowledgement raced
+  ahead of its state report.
+
+## 2026-07-16: Match Rank Charts To Metric Semantics
+
+- Decision demand: Connecting discrete rank IDs with lines obscured load skew.
+- Decision plan: Use pies for additive shares and bars for independent rates.
+- Decision implementation: Reworked `save_rank_stats_figure()` to render one
+  row per scenario. Request and output-token shares use pie charts; GPU
+  utilization and local prefix-hit rate use labeled bars.
+- Decision result: Request concentration is directly visible without treating
+  utilization and hit rates as parts of a whole.
+
+## 2026-07-16: Stop Routing Into A Full Prefix Owner
+
+- Decision demand: The `0957` locality result still sent 116 of 128 routing
+  requests to one rank and re-executed prefill 1061 times, while three ranks
+  stayed near 3% GPU utilization.
+- Decision plan: Inspect the exact capacity-failure route branch before changing
+  score weights. Preserve prefix-owner routing only while it is executable.
+- Decision implementation: Changed `GlobalScheduler.route_sequence_meta()` so
+  the `failed_gpus` branch first searches all topology-eligible candidates for
+  enough free blocks and selects the lowest-load candidate. It returns
+  `prefix_hit_needs_rebalance` only when no candidate can directly allocate the
+  request. Replaced the test that required routing into an undersized owner and
+  added separate fallback and all-candidates-full tests.
+- Decision result: A full prefix owner can no longer absorb the entire locality
+  workload while idle GPUs have capacity. Routing-only no longer depends on a
+  disabled transfer path, and LMPool invokes transfer only for a real global
+  capacity shortage.
+
+## 2026-07-16: Make E2E Comparisons Reproducible
+
+- Decision demand: The balanced `1021` run showed clear routing latency gains,
+  but scenario output totals differed because temperature sampling could emit
+  EOS early. Single-run throughput differences therefore mixed system behavior
+  with output-length and runtime variance.
+- Decision plan: Equalize generated work, seed every data-plane process, and
+  support repeated trials with explicit variability reporting.
+- Decision implementation: The E2E benchmark now defaults to `ignore_eos=True`,
+  accepts `--seed` and `--repetitions`, and propagates a rank-specific stable
+  seed before model initialization. Repeated scenarios are aggregated into
+  mean results with throughput, goodput, TTFT, and E2E population standard
+  deviations in JSON and a dedicated console table.
+- Decision result: Every request performs the configured decode work, and paper
+  comparisons can distinguish a stable gain from run-to-run noise.
+
+## 2026-07-16: Retain Completed Prefix Blocks Until LRU Reclamation
+
+- Decision demand: `route hit` and locality gains were timing-dependent because
+  `BlockManager.deallocate()` deleted a complete hashed block as soon as its
+  final active reference ended. The advertised prefix cache therefore retained
+  no KV state across non-overlapping requests.
+- Decision plan: Keep complete unreferenced KV blocks as evictable cache, reclaim
+  them only under capacity pressure, and preserve transfer as LMPool's first
+  pressure response.
+- Decision implementation: Complete blocks with `ref_count == 0` now remain in
+  `used_block_ids` and `hash_to_block_id` with an LRU timestamp; partial blocks
+  are still released immediately. Added protected-prefix-aware local LRU
+  reclamation. Scheduler first attempts configured foreground transfer, then
+  reclaims cold local cache before preempting a live sequence. Added tests for
+  reuse after request completion and LRU reclamation that protects the incoming
+  sequence's cached prefix.
+- Decision result: Prefix ownership and global page-table entries persist across
+  requests, while cold cache remains reclaimable and repeated prefill is avoided
+  when local cache pressure can be resolved without preemption.
+
+## 2026-07-16: Use Multiple Long Prefix Groups In The Locality Workload
+
+- Decision demand: With one shared prefix, round-robin warmed one replica on
+  every GPU and reached the same 95.31% worker-local hit rate as routing in the
+  six-GPU run, so final hit rate could not isolate routing locality.
+- Decision plan: Replace the single hotspot with a configurable balanced set of
+  long prefixes and decouple prefix order from the round-robin rank cycle.
+- Decision implementation: Added `--locality-prefix-groups` with a default of
+  16. Every locality group starts with a distinct stable marker and retains the
+  configured long repeated body. Requests are distributed evenly across groups
+  and shuffled with `--seed` before suffixes are attached. Made `benchmarks` an
+  importable package, added generator regression tests, argument validation,
+  and synchronized benchmark and repository documentation.
+- Decision result: Round-robin must build redundant copies of several prefix
+  groups across workers, while KV-aware routing can consolidate each group at
+  its existing owners. Worker local-hit rate, prefill work, and cache footprint
+  can now distinguish the two policies.
+
+## 2026-07-16: Prevent Prefill-Decode Preemption Ping-Pong
+
+- Decision demand: The six-GPU multi-prefix run submitted 128 requests but
+  executed 4,791 to 7,090 prefill attempts per scenario. Waiting prefill could
+  displace live decode work; the preempted sequence then returned to the front
+  of the waiting queue and consumed the released blocks again.
+- Decision plan: Bound admission by immediate decode growth, preserve running
+  work when a new prompt does not fit, and avoid transfer attempts that only
+  increase concurrency rather than resolve a real allocation shortage.
+- Decision implementation: Added per-sequence remaining decode-block
+  calculation and scheduler admission headroom for the next growth block of
+  each active and incoming sequence. Prefill now reclaims cold unreferenced
+  cache first, triggers foreground transfer only when the request itself lacks
+  blocks, and falls through to decode instead of preempting a running sequence.
+  Prefill and decode transfer failures share one capacity cooldown. In the
+  exceptional decode victim path, the victim is queued at the back and the
+  blocked decode receives the newly freed block immediately. Added scheduler
+  tests for decode preservation and admission headroom.
+- Decision result: Long-prompt admission can no longer create the immediate
+  prefill/decode ping-pong responsible for repeated full-prompt execution, and
+  transfer is not invoked solely to consume reserved decode capacity.
+
+## 2026-07-16: Measure Initial Prefix Reuse Separately From Retries
+
+- Decision demand: A request counted as a local prefix hit if any retry hit
+  blocks left by its own earlier prefill, inflating round-robin local hit to
+  85.94% despite severe cache churn.
+- Decision plan: Make initial cache reuse the primary locality metric and expose
+  retry work directly instead of hiding it inside a binary hit rate.
+- Decision implementation: Sequence and data-plane messages now carry prefill
+  attempt and preemption counters. Benchmark `local hit` includes only the
+  first prefill per sequence. Added initial cached-token ratio, total prefill
+  attempts, preemption count, and redundant prefill-token count to scenario
+  JSON, rank statistics, and the horizontal summary table. Added an explicit
+  `kv_ready` block lifecycle: allocation computes hashes privately, while the
+  data plane publishes complete blocks to local/global prefix indexes only
+  after successful model execution writes their KV data. Updated metric
+  documentation accordingly.
+- Decision result: Routing locality and scheduler churn are now independently
+  measurable; retries can no longer improve the reported local-hit rate.

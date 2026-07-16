@@ -181,9 +181,15 @@ class LLMEngine:
                     elif msg_type == "first_token":
                         first_tokens.extend(msg.get("data", []))
                     elif msg_type == "prefill_stats":
-                        prefill_stats.extend(msg.get("data", []))
+                        for item in msg.get("data", []):
+                            if "rank" in msg:
+                                item.setdefault("rank", msg["rank"])
+                            prefill_stats.append(item)
                     elif msg_type == "runtime_stats":
-                        runtime_stats.append(msg.get("data", {}))
+                        data = msg.get("data", {})
+                        if "rank" in msg:
+                            data.setdefault("rank", msg["rank"])
+                        runtime_stats.append(data)
                     elif msg_type == "idle":
                         self.remote_finished.add(rank)
             except Empty:

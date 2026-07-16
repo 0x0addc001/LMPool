@@ -20,7 +20,12 @@ The coverage is organized around the runtime structure:
 
 - `tests/conftest.py`
   - pytest path setup
-  - adds `src/` to `sys.path` so tests can import `lmpool.*` directly
+  - adds the repository root and `src/` to `sys.path` so tests can import
+    `lmpool.*` and reusable benchmark helpers directly
+
+- `tests/test_benchmark_e2e.py`
+  - balanced multi-prefix locality workload generation
+  - deterministic seeded request ordering
 
 - `tests/test_control_plane.py`
   - control-plane routing
@@ -71,11 +76,13 @@ The coverage is organized around the runtime structure:
   - local waiting / running queue transitions
   - prefill scheduling
   - decode scheduling
+  - decode-headroom admission and preemption avoidance
   - local rebalance trigger path
 
 - `tests/test_sequence.py`
   - `Sequence` state and serialization
   - block accounting
+  - remaining decode-block accounting and runtime counters
   - remote-prefix metadata
 
 ## Running

@@ -160,6 +160,12 @@ class GlobalBlockManager:
         self.running_sequences_per_gpu: List[int] = [0] * world_size
         self.waiting_tokens_per_gpu: List[int] = [0] * world_size
         self.running_tokens_per_gpu: List[int] = [0] * world_size
+        # Requests routed by the control plane but not yet admitted by a
+        # worker. Keep these separate because block_state is an older worker
+        # snapshot and must not erase control-plane admission reservations.
+        self.pending_sequences_per_gpu: List[int] = [0] * world_size
+        self.pending_tokens_per_gpu: List[int] = [0] * world_size
+        self.pending_route_tokens: List[Dict[int, int]] = [{} for _ in range(world_size)]
 
     @property
     def is_master(self) -> bool:
@@ -227,6 +233,50 @@ class GlobalBlockManager:
         self.free_blocks_per_gpu[gpu_id] = max(
             0,
             self.free_blocks_per_gpu[gpu_id] - num_blocks,
+        )
+
+    def reserve_route_load(
+        self,
+        gpu_id: int,
+        num_tokens: int,
+        num_sequences: int = 1,
+        seq_id: Optional[int] = None,
+    ):
+        """
+        Optimistically account for routed requests before the worker reports
+        them in its next block-state snapshot.
+        """
+        if not self.is_master:
+            return
+        if seq_id is not None:
+            if seq_id in self.pending_route_tokens[gpu_id]:
+                return
+            self.pending_route_tokens[gpu_id][seq_id] = max(0, int(num_tokens))
+        self.pending_sequences_per_gpu[gpu_id] += max(0, int(num_sequences))
+        self.pending_tokens_per_gpu[gpu_id] += max(0, int(num_tokens))
+
+    def acknowledge_route_load(
+        self,
+        gpu_id: int,
+        num_tokens: int,
+        num_sequences: int = 1,
+        seq_id: Optional[int] = None,
+    ):
+        """Remove an optimistic reservation after the worker admits it."""
+        if not self.is_master:
+            return
+        if seq_id is not None:
+            reserved_tokens = self.pending_route_tokens[gpu_id].pop(seq_id, None)
+            if reserved_tokens is None:
+                return
+            num_tokens = reserved_tokens
+        self.pending_sequences_per_gpu[gpu_id] = max(
+            0,
+            self.pending_sequences_per_gpu[gpu_id] - max(0, int(num_sequences)),
+        )
+        self.pending_tokens_per_gpu[gpu_id] = max(
+            0,
+            self.pending_tokens_per_gpu[gpu_id] - max(0, int(num_tokens)),
         )
 
     # ------------------------------------------------------------------
@@ -298,6 +348,7 @@ class GlobalBlockManager:
         """
         return (
             float(self.waiting_sequences_per_gpu[gpu_id])
+            + float(self.pending_sequences_per_gpu[gpu_id])
             + 2.0 * float(self.running_sequences_per_gpu[gpu_id])
         )
 
@@ -316,9 +367,13 @@ class GlobalBlockManager:
         sequence count captures scheduler/attention occupancy.
         """
         return (
-            waiting_token_weight * float(self.waiting_tokens_per_gpu[gpu_id])
+            waiting_token_weight * float(
+                self.waiting_tokens_per_gpu[gpu_id] + self.pending_tokens_per_gpu[gpu_id]
+            )
             + running_token_weight * float(self.running_tokens_per_gpu[gpu_id])
-            + running_sequence_weight * float(self.running_sequences_per_gpu[gpu_id])
+            + running_sequence_weight * float(
+                self.running_sequences_per_gpu[gpu_id] + self.pending_sequences_per_gpu[gpu_id]
+            )
         )
 
     def get_global_free_blocks_count(self) -> int:

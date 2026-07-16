@@ -4,6 +4,7 @@ from collections import deque
 from typing import Tuple, Optional
 import torch
 import torch.distributed as dist
+import time
 
 from lmpool.engine.sequence import Sequence
 
@@ -14,16 +15,24 @@ class Block:
         self.hash = -1 
         self.ref_count = 0
         self.token_ids = []
+        self.kv_ready = False
+        self.last_access_time = time.monotonic()
 
 
     def update(self, h: int, token_ids: list[int]):
         self.hash = h 
         self.token_ids = token_ids
+        self.last_access_time = time.monotonic()
 
     def reset(self):
         self.hash = -1 
         self.ref_count = 0
         self.token_ids = []
+        self.kv_ready = False
+        self.last_access_time = time.monotonic()
+
+    def touch(self):
+        self.last_access_time = time.monotonic()
 
 
 class BlockManager:
@@ -112,6 +121,47 @@ class BlockManager:
                 required += 1
         return required
 
+    def reclaim_cached_blocks(self, num_blocks: int, protected_block_ids: set[int] | None = None) -> int:
+        """Release up to ``num_blocks`` least-recently-used unreferenced cache blocks."""
+        protected = protected_block_ids or set()
+        candidates = sorted(
+            (
+                self.blocks[block_id]
+                for block_id in self.used_block_ids
+                if (
+                    block_id not in protected
+                    and self.blocks[block_id].ref_count == 0
+                    and self.blocks[block_id].hash != -1
+                    and self.blocks[block_id].kv_ready
+                )
+            ),
+            key=lambda block: (block.last_access_time, block.block_id),
+        )
+        reclaimed = 0
+        for block in candidates[:max(0, int(num_blocks))]:
+            self._deallocate_block(block.block_id)
+            reclaimed += 1
+        return reclaimed
+
+    def reclaim_for_sequence(self, seq: Sequence, reserve_blocks: int = 0) -> int:
+        """Reclaim cold cache while preserving ``seq`` and decode headroom."""
+        required = self.num_required_new_blocks(seq)
+        shortage = max(0, required + max(0, reserve_blocks) - len(self.free_block_ids))
+        if shortage == 0:
+            return 0
+
+        protected = set()
+        h = -1
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            if len(token_ids) != self.block_size:
+                break
+            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h)
+            block_id = self.hash_to_block_id.get(h)
+            if block_id is not None:
+                protected.add(block_id)
+        return self.reclaim_cached_blocks(shortage, protected)
+
 
     def allocate(self, seq: Sequence) -> None:
         h = -1
@@ -143,17 +193,13 @@ class BlockManager:
                     # update block information
                     block = self.blocks[self.hash_to_block_id[h]]
                     block.ref_count += 1
+                    block.touch()
             else:
                 contiguous_prefix_hit = False
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
                 block.ref_count = 1
                 block.update(h=h, token_ids=token_ids)
-                if h != -1:
-                    self.hash_to_block_id[h] = block.block_id
-                    if self.gbm is not None:
-                        rank = dist.get_rank() if dist.is_initialized() else 0
-                        self.gbm._commit_alloc(rank, [block.block_id], [h])
             seq.block_table.append(block.block_id)
 
     def deallocate(self, seq: Sequence) -> None:
@@ -162,7 +208,12 @@ class BlockManager:
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
-                self._deallocate_block(block_id)
+                if block.hash == -1 or not block.kv_ready:
+                    self._deallocate_block(block_id)
+                else:
+                    # A complete KV block remains addressable as an evictable
+                    # prefix-cache entry until capacity pressure reclaims it.
+                    block.touch()
         # update sequence information
         seq.block_table = []
         seq.num_cached_tokens = 0
@@ -194,12 +245,6 @@ class BlockManager:
             )
             block = self.blocks[last_block_for_seq_id]
             block.update(h=h, token_ids=seq.block(seq.num_blocks - 1))
-            self.hash_to_block_id[h] = block.block_id
-
-            # 注册到全局页表
-            if self.gbm is not None and h != -1:
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                self.gbm._commit_alloc(rank, [block.block_id], [h])
 
         # if one new block is needed
         elif seq.num_tokens % self.block_size == 1:
@@ -434,18 +479,36 @@ class BlockManager:
         for block_id, h in zip(block_ids, hashes):
             block = self.blocks[block_id]
             block.hash = h
+            block.kv_ready = True
             # transfer-in blocks already contain valid KV data but do not carry
             # original token ids. Treat token_ids=None as a trusted hash match.
             block.token_ids = None
             if h != -1:
                 self.hash_to_block_id[h] = block_id
 
+    def mark_kv_ready(self, seqs: list[Sequence]) -> None:
+        """Publish complete block hashes only after model execution wrote KV."""
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        for seq in seqs:
+            for block_id in seq.block_table:
+                block = self.blocks[block_id]
+                if block.hash == -1 or block.kv_ready:
+                    continue
+                block.kv_ready = True
+                self.hash_to_block_id[block.hash] = block_id
+                if self.gbm is not None:
+                    self.gbm._commit_alloc(rank, [block_id], [block.hash])
+
     def get_local_block_hashes(self) -> dict[int, int]:
         """
         获取本地所有已用块的 (block_id -> hash) 映射
         用于向 GlobalBlockManager 上报本地状态
         """
-        return {bid: self.blocks[bid].hash for bid in self.used_block_ids}
+        return {
+            bid: self.blocks[bid].hash
+            for bid in self.used_block_ids
+            if self.blocks[bid].kv_ready
+        }
 
     def get_evictable_block_hashes(self) -> dict[int, int]:
         """
@@ -457,7 +520,7 @@ class BlockManager:
         return {
             bid: self.blocks[bid].hash
             for bid in self.used_block_ids
-            if self.blocks[bid].ref_count == 0
+            if self.blocks[bid].ref_count == 0 and self.blocks[bid].kv_ready
         }
 
     def get_pinned_block_hashes(self) -> dict[int, int]:
@@ -465,7 +528,7 @@ class BlockManager:
         return {
             bid: self.blocks[bid].hash
             for bid in self.used_block_ids
-            if self.blocks[bid].ref_count > 0
+            if self.blocks[bid].ref_count > 0 and self.blocks[bid].kv_ready
         }
 
     def sync_with_global(self):

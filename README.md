@@ -152,9 +152,13 @@ Each worker owns one `BlockManager` for its local KV cache blocks.
 Main responsibilities:
 
 - compute chained block hashes
-- allocate / deallocate blocks
+- allocate blocks and reclaim cold cached blocks with local LRU
 - append decode tokens
 - maintain local prefix cache state
+
+Complete hashed blocks remain cached after their active reference count reaches
+zero. Partial blocks are released immediately; complete cached blocks remain
+globally discoverable and evictable until capacity pressure reclaims them.
 
 ### 4.8 Model Runner
 
@@ -247,7 +251,14 @@ Reported metrics:
 - transfer / copy count and rebalance success / failure counts
 
 The current `multi-gpu` baseline uses online round-robin dispatch. Control-plane scenarios should use a bounded `--submit-window` such as `4` or `8` when measuring prefix reuse, because routing can only hit prefixes that previous requests have already prefetched and reported to the global page table.
-The benchmark records TTFT from explicit first-token events emitted by data-plane workers. Local prefix hit is measured as worker-side prefill cache hit rate for every scenario, including round-robin baselines. Route hit and prefix-owner hit are reported separately for control-plane scenarios.
+The benchmark records TTFT from explicit first-token events emitted by data-plane workers. Local prefix hit is measured only on each request's initial prefill, excluding retry hits after preemption. Cached-token ratio, prefill attempts, preemptions, and redundant prefill tokens are reported separately. Route hit and prefix-owner hit are reported separately for control-plane scenarios.
+The `locality` workload uses 16 distinct long shared-prefix groups by default,
+with a deterministic shuffled request order. Override this with
+`--locality-prefix-groups`; multiple groups prevent round-robin from matching
+routing simply by replicating one hot prefix onto every GPU.
+By default it ignores EOS so every request performs the configured decode work.
+Use `--seed` for reproducibility and `--repetitions 3` or more to report
+mean/standard-deviation results for paper experiments.
 
 See `benchmarks/README.md` for usage.
 

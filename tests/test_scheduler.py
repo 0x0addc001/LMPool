@@ -86,13 +86,13 @@ def test_decode_rebalance_prevents_preemption(monkeypatch):
     assert list(scheduler.running) == [seq]
 
 
-def test_prefill_rebalance_failure_preempts_running_sequence():
-    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=1, nvlink_pairs=[(0, 1)])
+def test_prefill_rebalance_failure_preserves_running_decode():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
     dummy = DummyGlobalScheduler(gbm, rebalance_result=False)
     scheduler = Scheduler(
         max_num_sequences=4,
         max_num_batched_tokens=16,
-        max_cached_blocks=1,
+        max_cached_blocks=2,
         block_size=2,
         eos=999,
         global_scheduler=dummy,
@@ -102,16 +102,17 @@ def test_prefill_rebalance_failure_preempts_running_sequence():
     running_seq.status = SequenceStatus.RUNNING
     scheduler.running.append(running_seq)
 
-    waiting_seq = Sequence([3, 4], block_size=2)
+    waiting_seq = Sequence([3, 4, 5, 6], block_size=2)
     scheduler.add_sequence(waiting_seq)
 
     scheduled, is_prefill = scheduler.schedule()
 
     assert is_prefill is False
-    assert scheduled == []
+    assert scheduled == [running_seq]
     assert dummy.rebalance_calls == [(0, 1)]
-    assert running_seq in scheduler.waiting
+    assert running_seq in scheduler.running
     assert waiting_seq in scheduler.waiting
+    assert scheduler.preemption_count == 0
 
 
 def test_prefill_rebalance_failure_does_not_preempt_current_batch():
@@ -149,12 +150,16 @@ def test_prefill_capacity_uses_cached_prefix_blocks():
         eos=999,
         global_scheduler=None,
     )
-    cached = Sequence([1, 2], block_size=2)
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    cached = Sequence([1, 2], block_size=2, sampling_params=no_decode)
     scheduler.block_manager.allocate(cached)
+    scheduler.block_manager.mark_kv_ready([cached])
     cached.status = SequenceStatus.RUNNING
     scheduler.running.append(cached)
 
-    seq = Sequence([1, 2, 3, 4], block_size=2)
+    seq = Sequence([1, 2, 3, 4], block_size=2, sampling_params=no_decode)
     scheduler.add_sequence(seq)
 
     scheduled, is_prefill = scheduler.schedule()
@@ -162,6 +167,33 @@ def test_prefill_capacity_uses_cached_prefix_blocks():
     assert is_prefill is True
     assert scheduled == [seq]
     assert seq.num_cached_tokens == 2
+
+
+def test_prefill_admission_reserves_next_decode_block():
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=3,
+        block_size=2,
+        eos=999,
+        global_scheduler=None,
+    )
+    params = SimpleNamespace(
+        temperature=1.0, max_tokens=1, ignore_eos=True, max_model_length=None
+    )
+    running = Sequence([1, 2], block_size=2, sampling_params=params)
+    scheduler.block_manager.allocate(running)
+    running.status = SequenceStatus.RUNNING
+    scheduler.running.append(running)
+    waiting = Sequence([3, 4], block_size=2, sampling_params=params)
+    scheduler.add_sequence(waiting)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is False
+    assert scheduled == [running]
+    assert waiting in scheduler.waiting
+    assert scheduler.preemption_count == 0
 
 
 def test_prefill_can_disable_foreground_rebalance():

@@ -11,7 +11,7 @@ class DummyBlockManager:
         return prefix_hash_value + sum(token_ids)
 
 
-def test_route_sequence_meta_prefers_prefix_hit_then_free_gpu():
+def test_route_sequence_meta_does_not_overweight_duplicate_prefix_replicas():
     gbm = GlobalBlockManager(rank=0, world_size=3, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [2, 3, 1]
     gbm.global_page_table = {
@@ -30,10 +30,10 @@ def test_route_sequence_meta_prefers_prefix_hit_then_free_gpu():
         num_tokens=seq.num_tokens,
         num_blocks=seq.num_blocks,
         prefix_hash=123,
-    ) == 1
+    ) == 0
 
 
-def test_route_sequence_meta_prefers_hit_even_when_free_is_insufficient():
+def test_route_sequence_meta_falls_back_when_prefix_owner_has_no_space():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [4, 1]
     gbm.global_page_table = {
@@ -45,13 +45,36 @@ def test_route_sequence_meta_prefers_hit_even_when_free_is_insufficient():
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
     seq = Sequence([1, 2, 3, 4], block_size=2)
 
-    assert scheduler.route_sequence_meta(
+    target, info = scheduler.route_sequence_meta(
         requester_rank=0,
         seq_id=seq.seq_id,
         num_tokens=seq.num_tokens,
         num_blocks=seq.num_blocks,
         prefix_hash=456,
-    ) == 1
+        return_info=True,
+    )
+
+    assert target == 0
+    assert info["reason"] == "prefix_owner_full_fallback"
+
+
+def test_route_sequence_meta_requests_rebalance_only_when_all_candidates_are_full():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [1, 1]
+    gbm.global_page_table = {456: [BlockLocation(1, 0, 456, 1.0)]}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=0,
+        seq_id=11,
+        num_tokens=4,
+        num_blocks=2,
+        prefix_hash=456,
+        return_info=True,
+    )
+
+    assert target == 1
+    assert info["reason"] == "prefix_hit_needs_rebalance"
 
 
 def test_route_sequence_meta_falls_back_to_free_gpu_on_prefix_miss():
@@ -137,6 +160,31 @@ def test_route_sequence_meta_bypasses_overloaded_prefix_owner():
     assert info["prefix_hit"] is True
     assert info["reason"] == "prefix_hit_load_bypass"
     assert info["load_score"][1] > info["load_score"][0]
+
+
+def test_route_sequence_meta_ingress_bypasses_overloaded_owner_to_seed_free_gpu():
+    gbm = GlobalBlockManager(rank=0, world_size=4, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1), (2, 3)])
+    gbm.free_blocks_per_gpu = [4, 4, 4, 4]
+    gbm.waiting_tokens_per_gpu = [0, 4096, 0, 0]
+    gbm.global_page_table = {
+        777: [
+            BlockLocation(1, 0, 777, 1.0),
+        ]
+    }
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=-1,
+        seq_id=10,
+        num_tokens=512,
+        num_blocks=2,
+        prefix_hash=777,
+        return_info=True,
+    )
+
+    assert target != 1
+    assert info["prefix_hit"] is True
+    assert info["reason"] == "prefix_hit_load_bypass"
 
 
 def test_route_sequence_meta_no_hit_uses_queue_pressure_before_free_blocks():

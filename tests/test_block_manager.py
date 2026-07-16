@@ -47,6 +47,10 @@ def test_allocate_deallocate_and_global_commit(monkeypatch):
 
     assert seq.block_table == [0, 1]
     assert seq.num_cached_tokens == 0
+    assert gbm.commits == []
+    assert bm.get_local_block_hashes() == {}
+
+    bm.mark_kv_ready([seq])
     assert len(gbm.commits) == 2
     assert bm.get_local_block_hashes()
 
@@ -101,6 +105,7 @@ def test_shared_prefix_ref_count_keeps_block_out_of_free_list():
     seq2 = Sequence([1, 2], block_size=2)
 
     bm.allocate(seq1)
+    bm.mark_kv_ready([seq1])
     bm.allocate(seq2)
 
     shared_block_id = seq1.block_table[0]
@@ -113,7 +118,34 @@ def test_shared_prefix_ref_count_keeps_block_out_of_free_list():
 
     bm.deallocate(seq2)
     assert bm.blocks[shared_block_id].ref_count == 0
-    assert shared_block_id in bm.free_block_ids
+    assert shared_block_id not in bm.free_block_ids
+    assert shared_block_id in bm.get_evictable_block_hashes()
+
+    seq3 = Sequence([1, 2], block_size=2)
+    bm.allocate(seq3)
+    assert seq3.block_table == [shared_block_id]
+    assert seq3.num_cached_tokens == 2
+
+
+def test_reclaim_for_sequence_evicts_lru_cache_but_keeps_required_prefix():
+    bm = BlockManager(num_blocks=2, block_size=2)
+    old = Sequence([1, 2], block_size=2)
+    keep = Sequence([3, 4], block_size=2)
+    bm.allocate(old)
+    bm.mark_kv_ready([old])
+    bm.deallocate(old)
+    bm.allocate(keep)
+    bm.mark_kv_ready([keep])
+    bm.deallocate(keep)
+
+    old_id = bm.hash_to_block_id[bm.compute_hash([1, 2], -1)]
+    keep_id = bm.hash_to_block_id[bm.compute_hash([3, 4], -1)]
+    incoming = Sequence([3, 4, 5], block_size=2)
+
+    assert bm.reclaim_for_sequence(incoming) == 1
+    assert old_id in bm.free_block_ids
+    assert keep_id not in bm.free_block_ids
+    assert bm.can_allocate(incoming) is True
 
 
 def test_transfer_in_block_can_be_reused_as_trusted_prefix_hit():
@@ -149,6 +181,7 @@ def test_can_allocate_counts_only_blocks_that_need_new_storage():
     bm = BlockManager(num_blocks=2, block_size=2)
     cached = Sequence([1, 2], block_size=2)
     bm.allocate(cached)
+    bm.mark_kv_ready([cached])
 
     seq = Sequence([1, 2, 3, 4], block_size=2)
 

@@ -152,9 +152,12 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 主要职责：
 
 - 计算链式 block hash
-- 分配 / 释放 block
+- 分配 block，并通过本地 LRU 回收冷缓存 block
 - 追加 decode token
 - 维护本地前缀缓存状态
+
+完整且带 hash 的 block 在活跃引用数降为 0 后仍保留为前缀缓存；partial block 会立即释放。
+缓存 block 会继续出现在全局页表中并保持可驱逐状态，直到容量压力触发回收。
 
 ### 4.8 Model Runner（模型执行器）
 
@@ -249,9 +252,16 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 当前 `multi-gpu` 基线采用在线 round-robin 分发。控制面场景如果要观察 prefix reuse，建议使用
 `--submit-window 4` 或 `--submit-window 8`，因为只有前序请求完成 prefill 并上报全局页表后，
 后续请求的路由决策才可能产生前缀命中。
-当前 benchmark 的 TTFT 来自 data-plane worker 上报的 first-token 事件。local prefix hit 统计
-worker 在 prefill 时实际发生的本地 prefix cache 命中率，因此 round-robin 基线也会有可比数值。
+当前 benchmark 的 TTFT 来自 data-plane worker 上报的 first-token 事件。local prefix hit 只统计
+每个请求第一次 prefill 的本地命中，排除抢占后重试产生的命中；同时单独报告首次 cached-token
+比例、prefill attempt、preemption 和重复处理的 prefill token，因此 round-robin 与 routing 的
+真实 locality 收益可以直接比较。
 控制面 route hit 和 prefix-owner hit 会单独报告。
+`locality` workload 默认使用 16 组不同的长共享前缀，并按固定 seed 打乱请求顺序；可通过
+`--locality-prefix-groups` 调整。多前缀组可以避免 round-robin 仅靠在每张 GPU 上复制同一个
+热点前缀，就获得与 routing 接近的稳态命中率。
+benchmark 默认忽略 EOS，保证每条请求执行相同的 decode 工作量。论文实验建议显式设置
+`--seed`，并使用 `--repetitions 3` 或更高次数报告 mean/std。
 
 具体用法见 `benchmarks/README.md`。
 

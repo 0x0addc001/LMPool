@@ -1,11 +1,13 @@
 import logging
 import os
+import random
 import sys
 import time
 from multiprocessing import Queue
 from queue import Empty
 
 import torch
+import numpy as np
 
 from lmpool.engine.control_plane import ControlPlaneClient
 from lmpool.engine.model_runner import ModelRunner
@@ -37,6 +39,12 @@ def data_plane_process(
 ):
     """Per-rank data-plane process that initializes ModelRunner and enters loop."""
     _configure_logging(config)
+    seed = int(config.get("random_seed", 0)) + int(rank)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
 
@@ -59,6 +67,14 @@ def data_plane_process(
         global_scheduler=control_plane_client,
     )
     scheduler.enable_foreground_rebalance = bool(config.get("enable_foreground_rebalance", True))
+    scheduler.foreground_transfer_min_blocks = max(
+        1,
+        int(config.get("foreground_transfer_min_blocks", getattr(scheduler, "foreground_transfer_min_blocks", 1))),
+    )
+    scheduler._rebalance_cooldown_s = max(
+        0.0,
+        float(config.get("foreground_transfer_fail_cooldown_s", getattr(scheduler, "_rebalance_cooldown_s", 0.25))),
+    )
     prepared_rebalance_blocks: dict[str, dict[tuple[int, tuple[int, ...]], list[int]]] = {}
 
     def execute_rebalance_plan(plan: dict):
@@ -226,6 +242,7 @@ def data_plane_process(
     last_rebalance_success_count = 0
     last_rebalance_fail_count = 0
     last_rebalance_fail_reasons: dict[str, int] = {}
+    last_preemption_count = 0
 
     def maybe_send_worker_heartbeat():
         nonlocal last_worker_heartbeat_sent
@@ -242,7 +259,7 @@ def data_plane_process(
         return control_plane_client.check_control_health()
 
     while True:
-        received_seq_ids = []
+        received_sequences = []
         try:
             if control_plane_client is not None:
                 control_plane_client.pump_async_messages()
@@ -252,21 +269,30 @@ def data_plane_process(
             if not handle_message(msg):
                 return
             if msg.get("type") == "sequence":
-                received_seq_ids.append(msg["seq"].seq_id)
+                received_sequences.append(msg["seq"])
 
             while True:
                 msg = recv_queue.get_nowait()
                 if not handle_message(msg):
                     return
                 if msg.get("type") == "sequence":
-                    received_seq_ids.append(msg["seq"].seq_id)
+                    received_sequences.append(msg["seq"])
         except Exception as e:
             if isinstance(e, Empty):
                 pass
             else:
                 logger.warning("rank %s recv error: %s", rank, e)
 
-        if received_seq_ids:
+        if received_sequences:
+            # Publish the admitted waiting load before clearing optimistic
+            # route reservations. Messages from this worker share one FIFO
+            # queue, so the control plane never observes an idle snapshot in
+            # between admission and acknowledgement.
+            send_block_state()
+            if control_plane_client is not None:
+                for seq in received_sequences:
+                    control_plane_client.acknowledge_route_admission(seq.seq_id, seq.num_tokens)
+            received_seq_ids = [seq.seq_id for seq in received_sequences]
             logger.info("rank %s received %s seqs: %s", rank, len(received_seq_ids), received_seq_ids)
             idle_sent = False
 
@@ -278,6 +304,15 @@ def data_plane_process(
                 control_down_reported = True
 
         scheduled, is_prefill = scheduler.schedule()
+        scheduler_preemptions = int(getattr(scheduler, "preemption_count", 0))
+        preemption_delta = scheduler_preemptions - last_preemption_count
+        if preemption_delta:
+            send_queue.put({
+                "type": "runtime_stats",
+                "rank": rank,
+                "data": {"preemption_count": preemption_delta},
+            })
+            last_preemption_count = scheduler_preemptions
         if control_plane_client is not None:
             success_delta = control_plane_client.rebalance_success_count - last_rebalance_success_count
             fail_delta = control_plane_client.rebalance_fail_count - last_rebalance_fail_count
@@ -317,6 +352,7 @@ def data_plane_process(
             send_queue.put({"type": "sequence", "target": seq.remote_gpu_id, "seq": seq})
 
         if local_seqs:
+            run_tokens = sum(len(seq) for seq in local_seqs) if is_prefill else len(local_seqs)
             if is_prefill:
                 missing_blocks = [
                     (seq.seq_id, seq.remote_gpu_id, seq.num_blocks, list(seq.block_table))
@@ -328,17 +364,36 @@ def data_plane_process(
                         f"rank {rank} scheduled local prefill without enough blocks: "
                         f"{missing_blocks}"
                     )
-                prefill_stats = [
-                    {
+                prefill_stats = []
+                for seq in local_seqs:
+                    is_initial_prefill = seq.prefill_attempts == 0
+                    seq.prefill_attempts += 1
+                    prefill_stats.append({
                         "seq_id": seq.seq_id,
                         "prefix_hit": seq.num_cached_tokens > 0,
                         "num_cached_tokens": seq.num_cached_tokens,
-                    }
-                    for seq in local_seqs
-                ]
+                        "num_prompt_tokens": seq.num_prompt_tokens,
+                        "prefill_attempt": seq.prefill_attempts,
+                        "is_initial_prefill": is_initial_prefill,
+                        "preemption_count": seq.preemption_count,
+                    })
                 if prefill_stats:
                     send_queue.put({"type": "prefill_stats", "rank": rank, "data": prefill_stats})
+            run_started = time.perf_counter()
             outputs = model_runner.run(local_seqs, is_prefill)
+            run_elapsed = time.perf_counter() - run_started
+            scheduler.block_manager.mark_kv_ready(local_seqs)
+            send_queue.put({
+                "type": "runtime_stats",
+                "rank": rank,
+                "data": {
+                    "prefill_tokens": run_tokens if is_prefill else 0,
+                    "decode_tokens": 0 if is_prefill else run_tokens,
+                    "prefill_time_s": run_elapsed if is_prefill else 0.0,
+                    "decode_time_s": 0.0 if is_prefill else run_elapsed,
+                    "first_tokens": sum(1 for seq in local_seqs if seq.num_completion_tokens == 0),
+                },
+            })
             scheduler.postprocess(local_seqs, outputs)
             first_tokens = [
                 (seq.seq_id, _as_token_list([seq.completion_token_ids[-1]])[0])
@@ -356,4 +411,12 @@ def data_plane_process(
         ]
         if finished:
             logger.info("rank %s finished seqs: %s", rank, [seq_id for seq_id, _ in finished])
+            send_queue.put({
+                "type": "runtime_stats",
+                "rank": rank,
+                "data": {
+                    "finished": len(finished),
+                    "output_tokens": sum(len(tokens) for _, tokens in finished),
+                },
+            })
             send_queue.put({"type": "finished", "data": finished})

@@ -66,6 +66,43 @@ def test_update_gpu_state_tracks_queue_pressure_snapshot():
     assert gbm.get_queue_pressure(0) == 11.0
 
 
+def test_worker_snapshot_does_not_erase_pending_route_load():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.reserve_route_load(1, num_tokens=2048, seq_id=17)
+
+    # This snapshot may have been produced before the routed request reached
+    # the worker. The pending admission must remain visible to routing.
+    gbm.update_gpu_state(
+        1,
+        free_blocks=4,
+        block_hashes={},
+        waiting_sequences=0,
+        running_sequences=0,
+        waiting_tokens=0,
+        running_tokens=0,
+    )
+    assert gbm.get_load_score(1) == 2080.0
+
+    # An unrelated admission must not consume this sequence's reservation.
+    gbm.acknowledge_route_load(1, num_tokens=2048, seq_id=18)
+    assert gbm.get_load_score(1) == 2080.0
+
+    # The worker publishes its admitted waiting state before acknowledging the
+    # optimistic reservation. Removing pending load must therefore leave the
+    # real waiting load visible.
+    gbm.update_gpu_state(
+        1,
+        free_blocks=4,
+        block_hashes={},
+        waiting_sequences=1,
+        running_sequences=0,
+        waiting_tokens=2048,
+        running_tokens=0,
+    )
+    gbm.acknowledge_route_load(1, num_tokens=2048, seq_id=17)
+    assert gbm.get_load_score(1) == 2048.0
+
+
 def test_select_eviction_candidates_can_recurse_to_nvlink_partner():
     gbm = GlobalBlockManager(
         rank=0,

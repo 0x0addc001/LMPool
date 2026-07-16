@@ -31,7 +31,15 @@ Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py
 - `mem util`: mean GPU memory utilization sampled from `nvidia-smi`.
 - `route hit`: control-plane routing-time prefix-hit rate, including validated route-cache hits. Round-robin baselines report zero because they do not query the routing policy.
 - `owner hit`: fraction of requests routed to a GPU that already owned the matched prefix block.
-- `local hit`: request-level worker-side local prefix-cache hit rate. A request counts as a local hit if any prefill attempt observes cached prefix tokens. This is reported for all scenarios, including round-robin baselines, so the number is comparable across dispatch policies without being diluted by preemption/retry events.
+- `local hit`: worker-side prefix-cache hit rate on each request's initial
+  prefill only. Retry hits after preemption are excluded, so cache churn cannot
+  inflate this metric.
+- `cached tok`: fraction of prompt tokens already cached on the initial
+  prefill. Unlike binary `local hit`, this measures how much prefill work is
+  actually avoided.
+- `attempts`: total prefill executions, including retries.
+- `preempt`: number of live sequences preempted by the local scheduler.
+- `redund tok`: prefill tokens reprocessed beyond the initial prompt work.
 - `transfers`: number of KV blocks actually transferred by the data plane during rebalance.
 - `copies`: number of transferred KV blocks that used copy-style transfer and kept the source block live.
 - `fg ok` / `fg fail`: number of successful / failed foreground rebalance requests. Foreground rebalance is the current-request path that tries to free local KV blocks with move-style transfer.
@@ -51,6 +59,10 @@ CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benc
   --prompt-repeat 10 \
   --max-tokens 16 \
   --temperature 0.6 \
+  --ignore-eos \
+  --seed 0 \
+  --repetitions 3 \
+  --locality-prefix-groups 16 \
   --output-json /tmp/shared_prefix_benchmark.json \
   --nvlink-pairs 0,1 \
   --submit-window 4 \
@@ -66,6 +78,21 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
 - `--prompt-repeat`: lengthens the shared prefix by repeating a fixed instruction block; larger values make prefix reuse easier to observe.
 - `--max-tokens`: maximum generated tokens per request.
 - `--temperature`: sampling temperature.
+- `--ignore-eos` / `--no-ignore-eos`: keep generating until `--max-tokens`
+  (default), or allow EOS to end a request early. Keep the default for fair
+  system comparisons with equal decode work.
+- `--seed`: base random seed. Data-plane rank `r` uses `seed + r`.
+- `--repetitions`: number of complete runs per scenario. Results are reported as
+  means; JSON and the console variability table include throughput, goodput,
+  TTFT, and E2E population standard deviations. Use at least `3` for paper
+  results; the default `1` is intended for development runs.
+- `--workload`: `locality`, `load-skew`, or `memory-skew`.
+- `--locality-prefix-groups`: number of distinct long shared-prefix groups in
+  the `locality` workload (default `16`). Requests are balanced across groups
+  and deterministically shuffled with `--seed`, preventing prefix IDs from
+  accidentally aligning with round-robin ranks. More groups expose redundant
+  per-GPU caching without routing; keep the value no larger than
+  `--num-prompts`.
 - `--output-json`: write raw scenario results to JSON. Parent directories are created automatically, and the script prints `saved json: ...` on success.
 - `--model-name-or-path`: model name or local model path. The default config targets `Qwen/Qwen3-0.6B`.
 - `--nvlink-pairs`: logical NVLink pairs after `CUDA_VISIBLE_DEVICES` remapping, e.g. `0,1` or `0,1;2,3`. Quote values containing semicolons, e.g. `--nvlink-pairs "0,2;1,3;4,5;6,7"`. Pass an empty string to let the engine try `nvidia-smi topo -m` detection.
@@ -92,6 +119,19 @@ Routing load-score defaults are set in `MODEL_CONFIG` inside `shared_prefix_benc
 ## Notes
 
 - Prefix-hit rates depend on online timing and cache placement. With `--submit-window 0`, all requests are submitted in a burst before workers have finished prefill, so control-plane routing has less opportunity to use newly reported page-table state.
+- Complete prefix blocks remain cached after their active reference count reaches
+  zero. They are reported as evictable global-page-table entries and reclaimed
+  locally in LRU order only after configured transfer cannot resolve capacity
+  pressure. Partial blocks are released immediately.
+- Prefill admission reserves the next possible decode-growth block for every
+  active sequence. If that headroom is unavailable, the scheduler drains
+  running decode work instead of preempting it to admit another long prompt.
+  Cold unreferenced cache is reclaimed before foreground transfer, and
+  foreground transfer is attempted only for a real allocation shortage.
+- For publishable comparisons, keep `--ignore-eos`, set an explicit `--seed`,
+  and use `--repetitions 3` or more. A repeated JSON result includes
+  `repetitions`, `throughput_tok_s_std`, `goodput_tok_s_std`,
+  `mean_ttft_s_std`, and `mean_e2e_s_std`.
 - `multi-gpu` is an online round-robin baseline, not static offline sharding.
 - `multi-gpu-kv-transfer` also uses round-robin dispatch, but enables the global pool with a smaller block budget to exercise transfer / rebalance behavior.
 - Rebalance requests are based on the actual block shortage, not the full sequence block count. Move-style eviction plans filter out `ref_count > 0` blocks; those pinned blocks are candidates for future copy-style replication, but they are not released from the source GPU.

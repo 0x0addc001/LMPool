@@ -10,19 +10,27 @@
     --prompt-repeat 10 \
     --max-tokens 16 \
     --temperature 0.6 \
+    --ignore-eos \
+    --seed 0 \
+    --repetitions 3 \
+    --workload locality \
+    --locality-prefix-groups 16 \
     --world-size 2 \
     --nvlink-pairs "0,1" \
     --submit-window 5 \
     --background-copy-max-blocks 1 \
     --background-copy-cooldown-s 2.0 \
     --background-copy-hot-threshold 3 \
+    --route-load-weight 0.03 \
+    --route-load-bypass-threshold 256 \
+    --route-cache-queue-slack 256 \
     --goodput-e2e-sla-ms 10000 \
     --output-json ./benchmarks/results/shared_prefix_benchmark_202607121117.json \
     --output-figure ./benchmarks/results/shared_prefix_benchmark_202607121117.png
 
 参数说明：
 1. `--num-prompts`：
-  本次压测总共生成多少条请求。脚本会为每条请求构造同一个共享前缀和不同后缀；
+  本次压测总共生成多少条请求。脚本会按 workload 构造共享前缀组和不同后缀；
   值越大，并发压力越高，统计结果也更稳定。
 
 2. `--prompt-repeat`：
@@ -34,62 +42,95 @@
 4. `--temperature`：
   采样温度。benchmark 默认主要看系统性能，通常保持固定值即可，不建议在不同实验间频繁改动。
 
-5. `--output-json`：
+5. `--ignore-eos` / `--no-ignore-eos`：
+  默认启用 `--ignore-eos`，每条请求固定生成 `--max-tokens` 个 token，保证不同场景执行相同
+  decode 工作量。只有需要模拟真实 EOS 提前结束时才使用 `--no-ignore-eos`。
+
+6. `--seed`：
+  data-plane 随机种子基值；rank `r` 使用 `seed + r`，用于复现实验。
+
+7. `--repetitions`：
+  每个场景完整重复运行次数，默认 1。论文实验建议至少设为 3；多次运行时输出 mean/std，
+  JSON 额外保存 throughput、goodput、TTFT 和 E2E 的标准差。
+
+8. `--workload`：
+  workload 类型。`locality` 用多组长共享前缀验证 KVCache-aware routing；
+  `load-skew` 用一个热点前缀加少量冷前缀制造请求负载倾斜；
+  `memory-skew` 用更长热点前缀制造 KV block 压力，更适合观察 transfer/rebalance。
+
+9. `--locality-prefix-groups`：
+  `locality` workload 中不同长共享前缀的组数，默认 16。每组请求数保持均衡，并按 `--seed`
+  打乱提交顺序，避免前缀组编号与 round-robin rank 周期重合。组数必须在 1 和
+  `--num-prompts` 之间；组数越多，未启用 routing 时跨 GPU 重复缓存和 cache churn 越明显。
+
+10. `--output-json`：
   将各场景统计结果导出到指定 JSON 文件。脚本会自动创建父目录，并在成功后打印
   `saved json: ...`。
 
-6. `--model-name-or-path`：
+11. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
-7. `--nvlink-pairs`：
+12. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
   可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
   例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-8. `--world-size`：
+13. `--world-size`：
   多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
   该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
 
-9. `--routing-max-cached-blocks`：
+14. `--routing-max-cached-blocks`：
   `multi-gpu-kv-routing` 场景的 KV block 上限。该场景启用控制面路由和全局页表，
   但显式关闭 foreground rebalance 和 background copy，主要用来观察 prefix-hit routing 的收益和控制面开销。
 
-10. `--eviction-max-cached-blocks`：
+15. `--eviction-max-cached-blocks`：
   `multi-gpu-kv-transfer` 场景的 KV block 上限。通常设得更小，用来更容易触发
   transfer / rebalance；请求仍按 round-robin 下发，用来隔离跨 GPU KV 搬运开销。
 
-11. `--goodput-e2e-sla-ms`：
+16. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-12. `--skip-pool`：
+17. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-13. `--output-figure`：
+18. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-14. `--submit-window`：
+19. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
-15. `--disable-background-copy`：
+20. `--disable-background-copy`：
   关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
   伙伴，服务后续请求；关闭后只保留前台 move-style transfer。
 
-16. `--background-copy-max-blocks`：
+21. `--background-copy-max-blocks`：
   每次后台 copy 最多复制多少个 prefix block。值越大越可能提高后续本地命中，但会占用更多
   NCCL / worker 时间；排查功能正确性可先用 1，验证收益时建议尝试 2。
 
-17. `--background-copy-cooldown-s`：
+22. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
-18. `--background-copy-hot-threshold`：
+23. `--background-copy-hot-threshold`：
   同一个 prefix 至少被路由命中多少次后才允许后台 copy。值越大越保守，能减少无效 copy；
   值为 1 时退化为旧的 eager speculative copy。
+
+24. `--route-load-weight`：
+  路由打分里 token-aware load 的惩罚权重。值越大越倾向负载均衡，可能降低 route hit，
+  但可以避免热点 prefix owner 吞吐成为瓶颈。
+
+25. `--route-load-bypass-threshold`：
+  prefix owner 比最空闲候选 GPU 高出多少 load score 后，允许绕过 owner。
+  值越小越激进，越容易牺牲 locality 换并行度。
+
+26. `--route-cache-queue-slack`：
+  route cache 命中时允许 cached owner 相比最轻载候选多出的 load score。
+  值越小，缓存路由越容易被负载不均打破。
 
 说明：
 1. 建议显式设置 CUDA_VISIBLE_DEVICES，避免在共享机器上误用其他 GPU。
@@ -108,6 +149,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import random
 import subprocess
 import statistics
 import sys
@@ -170,13 +212,15 @@ MODEL_CONFIG = {
     "route_prefix_hit_weight": 8.0,
     "route_queue_pressure_weight": 1.0,
     "route_free_block_weight": 0.05,
-    "route_load_weight": 0.01,
+    "route_load_weight": 0.03,
     "route_waiting_token_weight": 1.0,
     "route_running_token_weight": 0.25,
     "route_running_sequence_weight": 32.0,
-    "route_load_bypass_threshold": 512.0,
-    "route_cache_queue_slack": 512.0,
+    "route_load_bypass_threshold": 256.0,
+    "route_cache_queue_slack": 256.0,
     "enable_foreground_rebalance": True,
+    "foreground_transfer_min_blocks": 2,
+    "foreground_transfer_fail_cooldown_s": 2.0,
     # 后台 speculative copy-style transfer：每次只复制少量热点 prefix block，避免抢占前台推理时间。
     "enable_background_copy": True,
     "background_copy_max_blocks": 1,
@@ -230,6 +274,10 @@ class ScenarioResult:
     route_hit_rate: float
     routed_to_prefix_owner_rate: float
     prefix_hit_rate: float
+    initial_cached_token_ratio: float
+    prefill_attempts: int
+    preemption_count: int
+    redundant_prefill_tokens: int
     transfer_count: int
     transfer_copy_count: int
     rebalance_success: int
@@ -242,9 +290,15 @@ class ScenarioResult:
     gpu_util_p95: float | None
     gpu_mem_util_mean: float | None
     gpu_mem_util_p95: float | None
+    rank_stats: dict[int, dict]
+    repetitions: int = 1
+    throughput_tok_s_std: float = 0.0
+    goodput_tok_s_std: float = 0.0
+    mean_ttft_s_std: float = 0.0
+    mean_e2e_s_std: float = 0.0
 
 
-def build_shared_prefix(prompt_repeat: int) -> str:
+def build_shared_prefix(prompt_repeat: int, prefix_group: str = "shared") -> str:
     # 用重复的长文本构造可控的共享前缀，长度越大，越容易触发 prefix cache 命中
     block = (
         "Artificial intelligence is a field of computer science that aims to create systems "
@@ -256,15 +310,51 @@ def build_shared_prefix(prompt_repeat: int) -> str:
         "booms and busts. Efficient inference techniques like quantization, pruning, and "
         "knowledge distillation are active research areas. "
     )
-    return " ".join([block] * prompt_repeat)
+    # 标识放在第一个 token block 内。块 hash 是前缀链式 hash，因此后续内容相同也不会
+    # 让不同组错误地共享 KV block。
+    group_header = f"LMPool deterministic prefix group {prefix_group}. "
+    return group_header + " ".join([block] * prompt_repeat)
 
 
-def build_prompts(tokenizer, num_prompts: int, prompt_repeat: int) -> list[str]:
-    # 每个 prompt 都共享同一段前缀，只在尾部附加不同任务，适合测前缀复用和路由收益
-    shared_prefix = build_shared_prefix(prompt_repeat)
+def build_prompts(
+    tokenizer,
+    num_prompts: int,
+    prompt_repeat: int,
+    workload: str = "locality",
+    locality_prefix_groups: int = 16,
+    seed: int = 0,
+) -> list[str]:
+    # locality: 多组长共享前缀，主要验证 KVCache-aware routing，避免单一前缀被每卡复制后
+    # round-robin 也自然获得接近 100% 的本地命中。
+    # load-skew: 多数请求共享热点前缀，少数请求落到冷前缀，观察 routing 是否能兼顾 locality 和 load。
+    # memory-skew: 更长热点前缀，制造更多 KV blocks，主要用于 transfer / rebalance 压力实验。
+    if workload == "locality":
+        locality_prefixes = [
+            build_shared_prefix(prompt_repeat, f"locality-{group:04d}")
+            for group in range(locality_prefix_groups)
+        ]
+        locality_group_order = [i % locality_prefix_groups for i in range(num_prompts)]
+        random.Random(seed).shuffle(locality_group_order)
+    else:
+        hot_prefix = build_shared_prefix(
+            prompt_repeat * (2 if workload == "memory-skew" else 1),
+            "hot",
+        )
+        cold_prefixes = [
+            build_shared_prefix(max(1, prompt_repeat // 2), f"cold-{group:04d}")
+            for group in range(4)
+        ]
     prompts = []
     for i in range(num_prompts):
         suffix = SUFFIXES[i % len(SUFFIXES)]
+        if workload == "locality":
+            shared_prefix = locality_prefixes[locality_group_order[i]]
+        elif workload == "load-skew":
+            shared_prefix = hot_prefix if i % 4 != 0 else cold_prefixes[(i // 4) % len(cold_prefixes)]
+        elif workload == "memory-skew":
+            shared_prefix = hot_prefix if i % 2 == 0 else cold_prefixes[(i // 2) % len(cold_prefixes)]
+        else:
+            raise ValueError(f"unknown workload: {workload}")
         prompt = f"{shared_prefix} Now answer the following request: {suffix}"
         prompts.append(
             tokenizer.apply_chat_template(
@@ -307,7 +397,23 @@ def _median(values: list[float]) -> float:
     return statistics.median(values) if values else 0.0
 
 
-def _sample_gpu_metrics_once() -> list[tuple[float, float]]:
+def _visible_physical_gpu_ids(world_size: int) -> list[int]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if raw:
+        ids = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                ids.append(int(item))
+            except ValueError:
+                return list(range(world_size))
+        return ids[:world_size]
+    return list(range(world_size))
+
+
+def _sample_gpu_metrics_once(physical_gpu_ids: list[int]) -> list[tuple[float, float]]:
     # 通过 nvidia-smi 采样 GPU 利用率和显存利用率，属于外部观测面，不参与调度决策
     cmd = [
         "nvidia-smi",
@@ -319,7 +425,10 @@ def _sample_gpu_metrics_once() -> list[tuple[float, float]]:
     except Exception:
         return []
     samples = []
-    for line in output.strip().splitlines():
+    wanted = set(physical_gpu_ids)
+    for physical_idx, line in enumerate(output.strip().splitlines()):
+        if physical_idx not in wanted:
+            continue
         parts = [part.strip() for part in line.split(",")]
         if len(parts) != 3:
             continue
@@ -336,15 +445,16 @@ def _sample_gpu_metrics_once() -> list[tuple[float, float]]:
 
 class GpuMetricSampler:
     # 后台定时采样器：benchmark 跑的同时持续抓 GPU 状态，最后再汇总 mean / p95
-    def __init__(self, interval_s: float = 0.5):
+    def __init__(self, interval_s: float = 0.5, world_size: int = 1):
         self.interval_s = interval_s
+        self.physical_gpu_ids = _visible_physical_gpu_ids(world_size)
         self.samples: list[list[tuple[float, float]]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self):
         while not self._stop.is_set():
-            samples = _sample_gpu_metrics_once()
+            samples = _sample_gpu_metrics_once(self.physical_gpu_ids)
             if samples:
                 self.samples.append(samples)
             self._stop.wait(self.interval_s)
@@ -367,6 +477,32 @@ class GpuMetricSampler:
             statistics.mean(mem_values),
             _percentile(mem_values, 0.95),
         )
+
+    def summarize_by_rank(self) -> dict[int, dict[str, float]]:
+        summaries: dict[int, dict[str, float]] = {}
+        if not self.samples:
+            return summaries
+        for logical_rank in range(len(self.physical_gpu_ids)):
+            util_values = [
+                batch[logical_rank][0]
+                for batch in self.samples
+                if logical_rank < len(batch)
+            ]
+            mem_values = [
+                batch[logical_rank][1]
+                for batch in self.samples
+                if logical_rank < len(batch)
+            ]
+            if not util_values:
+                continue
+            summaries[logical_rank] = {
+                "gpu_util_mean": statistics.mean(util_values),
+                "gpu_util_p95": _percentile(util_values, 0.95),
+                "gpu_mem_util_mean": statistics.mean(mem_values),
+                "gpu_mem_util_p95": _percentile(mem_values, 0.95),
+                "physical_gpu_id": self.physical_gpu_ids[logical_rank],
+            }
+        return summaries
 
 
 def _run_independent_worker(
@@ -487,7 +623,7 @@ def run_independent_multi_gpu_benchmark(
     result_queue = ctx.Queue()
     procs = []
     start_wall = time.perf_counter()
-    sampler = GpuMetricSampler(interval_s=0.5)
+    sampler = GpuMetricSampler(interval_s=0.5, world_size=gpu_count)
     try:
         sampler.start()
         for gpu_index, shard in enumerate(shards):
@@ -522,6 +658,7 @@ def run_independent_multi_gpu_benchmark(
         ) / max(total_requests, 1)
         goodput_tokens = sum(item["goodput_tokens"] for item in results)
         gpu_util_mean, gpu_util_p95, gpu_mem_util_mean, gpu_mem_util_p95 = sampler.summarize()
+        rank_gpu_stats = sampler.summarize_by_rank()
         return ScenarioResult(
             name=name,
             total_requests=total_requests,
@@ -544,6 +681,10 @@ def run_independent_multi_gpu_benchmark(
             route_hit_rate=0.0,
             routed_to_prefix_owner_rate=0.0,
             prefix_hit_rate=prefix_hit_rate,
+            initial_cached_token_ratio=0.0,
+            prefill_attempts=total_requests,
+            preemption_count=0,
+            redundant_prefill_tokens=0,
             transfer_count=0,
             transfer_copy_count=0,
             rebalance_success=0,
@@ -556,6 +697,15 @@ def run_independent_multi_gpu_benchmark(
             gpu_util_p95=gpu_util_p95,
             gpu_mem_util_mean=gpu_mem_util_mean,
             gpu_mem_util_p95=gpu_mem_util_p95,
+            rank_stats={
+                item.get("rank", idx): {
+                    "requests": item.get("total_requests", 0),
+                    "output_tokens": item.get("total_tokens", 0),
+                    "prefix_hit_rate": item.get("prefix_hit_rate", 0.0),
+                    **rank_gpu_stats.get(item.get("rank", idx), {}),
+                }
+                for idx, item in enumerate(results)
+            },
         )
     finally:
         sampler.stop()
@@ -624,6 +774,10 @@ def run_engine_scenario(
     route_count = 0
     prefill_seen_seq_ids: set[int] = set()
     prefill_hit_seq_ids: set[int] = set()
+    initial_cached_tokens = 0
+    initial_prompt_tokens = 0
+    prefill_attempts = 0
+    preemption_count = 0
     transfer_count = 0
     transfer_copy_count = 0
     rebalance_success = 0
@@ -632,8 +786,36 @@ def run_engine_scenario(
     background_copy_success = 0
     background_copy_fail = 0
     background_copy_fail_reasons: dict[str, int] = {}
+    rank_stats: dict[int, dict] = {}
     start_wall = time.perf_counter()
-    sampler = GpuMetricSampler(interval_s=0.5)
+    sampler = GpuMetricSampler(interval_s=0.5, world_size=config["world_size"])
+
+    def get_rank_stats(rank: int) -> dict:
+        return rank_stats.setdefault(
+            int(rank),
+            {
+                "submitted": 0,
+                "finished": 0,
+                "output_tokens": 0,
+                "first_tokens": 0,
+                "prefill_requests": 0,
+                "prefill_attempts": 0,
+                "prefill_prefix_hits": 0,
+                "initial_cached_tokens": 0,
+                "initial_prompt_tokens": 0,
+                "preemption_count": 0,
+                "prefill_tokens": 0,
+                "decode_tokens": 0,
+                "prefill_time_s": 0.0,
+                "decode_time_s": 0.0,
+                "transfers": 0,
+                "copies": 0,
+                "rebalance_success": 0,
+                "rebalance_fail": 0,
+                "background_copy_success": 0,
+                "background_copy_fail": 0,
+            },
+        )
 
     try:
         sampler.start()
@@ -673,6 +855,7 @@ def run_engine_scenario(
             seq.remote_gpu_id = -1
             engine.send_queues[target_rank].put({"type": "sequence", "seq": seq})
             submit_times[seq.seq_id] = start
+            get_rank_stats(target_rank)["submitted"] += 1
             inflight.add(seq.seq_id)
 
         while next_prompt_idx < len(prompts) and len(inflight) < effective_submit_window:
@@ -684,12 +867,28 @@ def run_engine_scenario(
             finished, first_tokens, prefill_stats, runtime_stats = engine.step()
             now = time.perf_counter()
             for item in runtime_stats:
+                rank_data = get_rank_stats(item.get("rank", -1))
                 transfer_count += int(item.get("transfer_count", item.get("swap_count", 0)))
                 transfer_copy_count += int(item.get("transfer_copy_count", 0))
                 rebalance_success += int(item.get("rebalance_success", 0))
                 rebalance_fail += int(item.get("rebalance_fail", 0))
                 background_copy_success += int(item.get("background_copy_success", 0))
                 background_copy_fail += int(item.get("background_copy_fail", 0))
+                preemption_count += int(item.get("preemption_count", 0))
+                rank_data["transfers"] += int(item.get("transfer_count", item.get("swap_count", 0)))
+                rank_data["copies"] += int(item.get("transfer_copy_count", 0))
+                rank_data["rebalance_success"] += int(item.get("rebalance_success", 0))
+                rank_data["rebalance_fail"] += int(item.get("rebalance_fail", 0))
+                rank_data["background_copy_success"] += int(item.get("background_copy_success", 0))
+                rank_data["background_copy_fail"] += int(item.get("background_copy_fail", 0))
+                rank_data["preemption_count"] += int(item.get("preemption_count", 0))
+                rank_data["prefill_tokens"] += int(item.get("prefill_tokens", 0))
+                rank_data["decode_tokens"] += int(item.get("decode_tokens", 0))
+                rank_data["prefill_time_s"] += float(item.get("prefill_time_s", 0.0))
+                rank_data["decode_time_s"] += float(item.get("decode_time_s", 0.0))
+                rank_data["first_tokens"] += int(item.get("first_tokens", 0))
+                rank_data["finished"] += int(item.get("finished", 0))
+                rank_data["output_tokens"] += int(item.get("output_tokens", 0))
                 for reason, count in item.get("rebalance_fail_reasons", {}).items():
                     rebalance_fail_reasons[reason] = rebalance_fail_reasons.get(reason, 0) + int(count)
                 for reason, count in item.get("background_copy_fail_reasons", {}).items():
@@ -699,13 +898,29 @@ def run_engine_scenario(
             for seq_id, _token in first_tokens:
                 if seq_id in submit_times:
                     ttfts.append(now - submit_times[seq_id])
+                # first_tokens are grouped by worker in engine.step().
+                # The rank is not attached to this tuple, so rank-level first-token
+                # counts are reported from the worker runtime stats instead.
             for item in prefill_stats:
+                rank_data = get_rank_stats(item.get("rank", -1))
                 seq_id = item.get("seq_id")
+                is_initial = bool(item.get("is_initial_prefill", item.get("prefill_attempt", 1) == 1))
                 if seq_id is not None:
+                    prefill_attempts += 1
+                    rank_data["prefill_attempts"] += 1
+                if seq_id is not None and is_initial:
                     prefill_seen_seq_ids.add(seq_id)
-                if item.get("prefix_hit", False):
+                    rank_data["prefill_requests"] += 1
+                    cached_tokens = int(item.get("num_cached_tokens", 0))
+                    prompt_tokens = int(item.get("num_prompt_tokens", 0))
+                    initial_cached_tokens += cached_tokens
+                    initial_prompt_tokens += prompt_tokens
+                    rank_data["initial_cached_tokens"] += cached_tokens
+                    rank_data["initial_prompt_tokens"] += prompt_tokens
+                if is_initial and item.get("prefix_hit", False):
                     if seq_id is not None:
                         prefill_hit_seq_ids.add(seq_id)
+                        rank_data["prefill_prefix_hits"] += 1
             for seq_id, tokens in finished:
                 inflight.discard(seq_id)
                 finished_count += 1
@@ -716,6 +931,13 @@ def run_engine_scenario(
                 e2es.append(latency)
                 completion_times[seq_id] = now
                 completion_token_counts[seq_id] = len(tokens)
+            for rank, stats in rank_stats.items():
+                stats["local_prefix_hit_rate"] = (
+                    stats["prefill_prefix_hits"] / max(stats["prefill_requests"], 1)
+                )
+                stats["initial_cached_token_ratio"] = (
+                    stats["initial_cached_tokens"] / max(stats["initial_prompt_tokens"], 1)
+                )
             while next_prompt_idx < len(prompts) and len(inflight) < effective_submit_window:
                 submit_prompt(prompts[next_prompt_idx])
                 next_prompt_idx += 1
@@ -725,6 +947,8 @@ def run_engine_scenario(
         engine.exit()
 
     gpu_util_mean, gpu_util_p95, gpu_mem_util_mean, gpu_mem_util_p95 = sampler.summarize()
+    for rank, gpu_stats in sampler.summarize_by_rank().items():
+        get_rank_stats(rank).update(gpu_stats)
     # goodput：只有在给定 e2e SLA 内完成的请求，才计入有效吞吐
     goodput_tokens = sum(
         completion_token_counts[seq_id] for seq_id, done_at in completion_times.items()
@@ -753,6 +977,13 @@ def run_engine_scenario(
         route_hit_rate=route_hits / max(route_count, 1),
         routed_to_prefix_owner_rate=routed_to_prefix_owner / max(route_count, 1),
         prefix_hit_rate=len(prefill_hit_seq_ids) / max(len(prefill_seen_seq_ids), 1),
+        initial_cached_token_ratio=initial_cached_tokens / max(initial_prompt_tokens, 1),
+        prefill_attempts=prefill_attempts,
+        preemption_count=preemption_count,
+        redundant_prefill_tokens=max(
+            0,
+            sum(int(stats["prefill_tokens"]) for stats in rank_stats.values()) - initial_prompt_tokens,
+        ),
         transfer_count=transfer_count,
         transfer_copy_count=transfer_copy_count,
         rebalance_success=rebalance_success,
@@ -765,6 +996,7 @@ def run_engine_scenario(
         gpu_util_p95=gpu_util_p95,
         gpu_mem_util_mean=gpu_mem_util_mean,
         gpu_mem_util_p95=gpu_mem_util_p95,
+        rank_stats=rank_stats,
     )
 
 
@@ -779,6 +1011,89 @@ def make_config(world_size: int, enable_global_pool: bool, nvlink_pairs: list[tu
     return config
 
 
+def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
+    """Return per-scenario means and key run-to-run standard deviations."""
+    if not trials:
+        raise ValueError("at least one scenario trial is required")
+    if len(trials) == 1:
+        return trials[0]
+
+    def mean_attr(name: str) -> float:
+        return statistics.fmean(float(getattr(result, name)) for result in trials)
+
+    def mean_reason_map(name: str) -> dict[str, int]:
+        keys = set().union(*(getattr(result, name).keys() for result in trials))
+        return {
+            key: round(statistics.fmean(getattr(result, name).get(key, 0) for result in trials))
+            for key in keys
+        }
+
+    rank_ids = sorted(set().union(*(result.rank_stats.keys() for result in trials)))
+    rank_stats = {}
+    for rank in rank_ids:
+        keys = set().union(*(result.rank_stats.get(rank, {}).keys() for result in trials))
+        rank_stats[rank] = {}
+        for key in keys:
+            values = [result.rank_stats.get(rank, {}).get(key, 0.0) for result in trials]
+            if all(isinstance(value, (int, float)) for value in values):
+                rank_stats[rank][key] = statistics.fmean(float(value) for value in values)
+
+    return ScenarioResult(
+        name=trials[0].name,
+        total_requests=round(mean_attr("total_requests")),
+        total_tokens=round(mean_attr("total_tokens")),
+        elapsed_s=mean_attr("elapsed_s"),
+        throughput_tok_s=mean_attr("throughput_tok_s"),
+        goodput_tok_s=mean_attr("goodput_tok_s"),
+        mean_ttft_s=mean_attr("mean_ttft_s"),
+        p50_ttft_s=mean_attr("p50_ttft_s"),
+        p90_ttft_s=mean_attr("p90_ttft_s"),
+        p95_ttft_s=mean_attr("p95_ttft_s"),
+        mean_ttpt_s=mean_attr("mean_ttpt_s"),
+        p50_ttpt_s=mean_attr("p50_ttpt_s"),
+        p90_ttpt_s=mean_attr("p90_ttpt_s"),
+        p95_ttpt_s=mean_attr("p95_ttpt_s"),
+        mean_e2e_s=mean_attr("mean_e2e_s"),
+        p50_e2e_s=mean_attr("p50_e2e_s"),
+        p90_e2e_s=mean_attr("p90_e2e_s"),
+        p95_e2e_s=mean_attr("p95_e2e_s"),
+        route_hit_rate=mean_attr("route_hit_rate"),
+        routed_to_prefix_owner_rate=mean_attr("routed_to_prefix_owner_rate"),
+        prefix_hit_rate=mean_attr("prefix_hit_rate"),
+        initial_cached_token_ratio=mean_attr("initial_cached_token_ratio"),
+        prefill_attempts=round(mean_attr("prefill_attempts")),
+        preemption_count=round(mean_attr("preemption_count")),
+        redundant_prefill_tokens=round(mean_attr("redundant_prefill_tokens")),
+        transfer_count=round(mean_attr("transfer_count")),
+        transfer_copy_count=round(mean_attr("transfer_copy_count")),
+        rebalance_success=round(mean_attr("rebalance_success")),
+        rebalance_fail=round(mean_attr("rebalance_fail")),
+        rebalance_fail_reasons=mean_reason_map("rebalance_fail_reasons"),
+        background_copy_success=round(mean_attr("background_copy_success")),
+        background_copy_fail=round(mean_attr("background_copy_fail")),
+        background_copy_fail_reasons=mean_reason_map("background_copy_fail_reasons"),
+        gpu_util_mean=mean_attr("gpu_util_mean"),
+        gpu_util_p95=mean_attr("gpu_util_p95"),
+        gpu_mem_util_mean=mean_attr("gpu_mem_util_mean"),
+        gpu_mem_util_p95=mean_attr("gpu_mem_util_p95"),
+        rank_stats=rank_stats,
+        repetitions=len(trials),
+        throughput_tok_s_std=statistics.pstdev(result.throughput_tok_s for result in trials),
+        goodput_tok_s_std=statistics.pstdev(result.goodput_tok_s for result in trials),
+        mean_ttft_s_std=statistics.pstdev(result.mean_ttft_s for result in trials),
+        mean_e2e_s_std=statistics.pstdev(result.mean_e2e_s for result in trials),
+    )
+
+
+def run_repeated_engine_scenario(repetitions: int, **kwargs) -> ScenarioResult:
+    trials = []
+    for trial in range(repetitions):
+        if repetitions > 1:
+            print(f"[{kwargs['name']}] trial {trial + 1}/{repetitions}")
+        trials.append(run_engine_scenario(**kwargs))
+    return aggregate_scenario_trials(trials)
+
+
 def fmt_pct(value: float) -> str:
     return f"{value * 100:.2f}%"
 
@@ -787,11 +1102,12 @@ def print_summary_table(results: list[ScenarioResult | None]):
     # 横向总表：把所有场景放在同一张表里，便于直接看五种配置的整体差异。
     valid_results = [result for result in results if result is not None]
     print("\nBenchmark Summary")
-    print("=" * 180)
+    print("=" * 225)
     print(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
         f"{'e2e(ms)':>12} {'p90(e2e)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
-        f"{'route hit':>11} {'owner hit':>11} {'local hit':>11} {'transfers':>9} {'copies':>8} "
+        f"{'route hit':>11} {'owner hit':>11} {'local hit':>11} {'cached tok':>11} "
+        f"{'attempts':>9} {'preempt':>8} {'redund tok':>10} {'transfers':>9} {'copies':>8} "
         f"{'fg ok':>7} {'fg fail':>8} {'bg ok':>7} {'bg fail':>8} "
         f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'bg space':>8}"
     )
@@ -810,6 +1126,10 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{fmt_pct(result.route_hit_rate):>11} "
             f"{fmt_pct(result.routed_to_prefix_owner_rate):>11} "
             f"{fmt_pct(result.prefix_hit_rate):>11} "
+            f"{fmt_pct(result.initial_cached_token_ratio):>11} "
+            f"{result.prefill_attempts:>9} "
+            f"{result.preemption_count:>8} "
+            f"{result.redundant_prefill_tokens:>10} "
             f"{result.transfer_count:>9} "
             f"{result.transfer_copy_count:>8} "
             f"{result.rebalance_success:>7} "
@@ -821,6 +1141,18 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{result.rebalance_fail_reasons.get('no_plan', 0):>8} "
             f"{result.background_copy_fail_reasons.get('no_target_space', 0):>8}"
         )
+
+    if any(result.repetitions > 1 for result in valid_results):
+        print("\nRepeated-run variability (mean +/- population stddev)")
+        print(f"{'scenario':<22} {'throughput(tok/s)':>24} {'goodput(tok/s)':>24} {'TTFT(ms)':>24} {'E2E(ms)':>24}")
+        for result in valid_results:
+            print(
+                f"{result.name:<22} "
+                f"{result.throughput_tok_s:>10.2f} +/- {result.throughput_tok_s_std:<8.2f} "
+                f"{result.goodput_tok_s:>10.2f} +/- {result.goodput_tok_s_std:<8.2f} "
+                f"{result.mean_ttft_s * 1000:>10.2f} +/- {result.mean_ttft_s_std * 1000:<8.2f} "
+                f"{result.mean_e2e_s * 1000:>10.2f} +/- {result.mean_e2e_s_std * 1000:<8.2f}"
+            )
 
 
 def save_summary_figure(results: list[ScenarioResult | None], output_path: str) -> None:
@@ -849,11 +1181,19 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     route_hit_pct = [result.route_hit_rate * 100.0 for result in valid_results]
     owner_hit_pct = [result.routed_to_prefix_owner_rate * 100.0 for result in valid_results]
     local_hit_pct = [result.prefix_hit_rate * 100.0 for result in valid_results]
+    cached_token_pct = [result.initial_cached_token_ratio * 100.0 for result in valid_results]
     gpu_util = [result.gpu_util_mean if result.gpu_util_mean is not None else 0.0 for result in valid_results]
     gpu_mem_util = [result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else 0.0 for result in valid_results]
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle("Shared Prefix Benchmark Summary", fontsize=16)
+    palettes = {
+        "throughput": ["#0072B2", "#E69F00"],
+        "latency": ["#009E73", "#D55E00", "#CC79A7", "#56B4E9"],
+        "hit": ["#332288", "#117733", "#DDCC77", "#CC6677"],
+        "util": ["#882255", "#44AA99"],
+    }
+    bar_style = {"edgecolor": "#333333", "linewidth": 0.45}
 
     def annotate_bars(ax, bars, suffix: str = "", decimals: int = 1):
         max_height = 0.0
@@ -876,54 +1216,224 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
             ax.set_ylim(top=max(top, max_height * 1.18))
 
     width = 0.38
-    bars = axes[0, 0].bar([i - width / 2 for i in x], throughput, width=width, label="throughput")
+    bars = axes[0, 0].bar(
+        [i - width / 2 for i in x],
+        throughput,
+        width=width,
+        label="throughput",
+        color=palettes["throughput"][0],
+        **bar_style,
+    )
     annotate_bars(axes[0, 0], bars)
-    bars = axes[0, 0].bar([i + width / 2 for i in x], goodput, width=width, label="goodput")
+    bars = axes[0, 0].bar(
+        [i + width / 2 for i in x],
+        goodput,
+        width=width,
+        label="goodput",
+        color=palettes["throughput"][1],
+        **bar_style,
+    )
     annotate_bars(axes[0, 0], bars)
     axes[0, 0].set_title("Throughput / Goodput")
     axes[0, 0].set_ylabel("tokens/s")
     axes[0, 0].set_xticks(x, names, rotation=15, ha="right")
     axes[0, 0].legend()
+    axes[0, 0].grid(axis="y", linestyle="--", alpha=0.25)
 
     latency_width = 0.2
-    bars = axes[0, 1].bar([i - 1.5 * latency_width for i in x], ttft_ms, width=latency_width, label="TTFT mean")
+    bars = axes[0, 1].bar(
+        [i - 1.5 * latency_width for i in x],
+        ttft_ms,
+        width=latency_width,
+        label="TTFT mean",
+        color=palettes["latency"][0],
+        **bar_style,
+    )
     annotate_bars(axes[0, 1], bars, decimals=0)
-    bars = axes[0, 1].bar([i - 0.5 * latency_width for i in x], ttpt_ms, width=latency_width, label="TTPT mean")
+    bars = axes[0, 1].bar(
+        [i - 0.5 * latency_width for i in x],
+        ttpt_ms,
+        width=latency_width,
+        label="TTPT mean",
+        color=palettes["latency"][1],
+        **bar_style,
+    )
     annotate_bars(axes[0, 1], bars, decimals=0)
-    bars = axes[0, 1].bar([i + 0.5 * latency_width for i in x], e2e_ms, width=latency_width, label="E2E mean")
+    bars = axes[0, 1].bar(
+        [i + 0.5 * latency_width for i in x],
+        e2e_ms,
+        width=latency_width,
+        label="E2E mean",
+        color=palettes["latency"][2],
+        **bar_style,
+    )
     annotate_bars(axes[0, 1], bars, decimals=0)
-    bars = axes[0, 1].bar([i + 1.5 * latency_width for i in x], p90_e2e_ms, width=latency_width, label="E2E p90")
+    bars = axes[0, 1].bar(
+        [i + 1.5 * latency_width for i in x],
+        p90_e2e_ms,
+        width=latency_width,
+        label="E2E p90",
+        color=palettes["latency"][3],
+        **bar_style,
+    )
     annotate_bars(axes[0, 1], bars, decimals=0)
     axes[0, 1].set_title("Latency")
     axes[0, 1].set_ylabel("ms")
     axes[0, 1].set_xticks(x, names, rotation=15, ha="right")
     axes[0, 1].legend()
+    axes[0, 1].grid(axis="y", linestyle="--", alpha=0.25)
 
-    hit_width = 0.25
-    bars = axes[1, 0].bar([i - hit_width for i in x], route_hit_pct, width=hit_width, label="route")
+    hit_width = 0.2
+    bars = axes[1, 0].bar(
+        [i - 1.5 * hit_width for i in x],
+        route_hit_pct,
+        width=hit_width,
+        label="route",
+        color=palettes["hit"][0],
+        **bar_style,
+    )
     annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
-    bars = axes[1, 0].bar(x, owner_hit_pct, width=hit_width, label="owner")
+    bars = axes[1, 0].bar(
+        [i - 0.5 * hit_width for i in x],
+        owner_hit_pct,
+        width=hit_width,
+        label="owner",
+        color=palettes["hit"][1],
+        **bar_style,
+    )
     annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
-    bars = axes[1, 0].bar([i + hit_width for i in x], local_hit_pct, width=hit_width, label="local")
+    bars = axes[1, 0].bar(
+        [i + 0.5 * hit_width for i in x],
+        local_hit_pct,
+        width=hit_width,
+        label="local",
+        color=palettes["hit"][2],
+        **bar_style,
+    )
+    annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
+    bars = axes[1, 0].bar(
+        [i + 1.5 * hit_width for i in x],
+        cached_token_pct,
+        width=hit_width,
+        label="cached tokens",
+        color=palettes["hit"][3],
+        **bar_style,
+    )
     annotate_bars(axes[1, 0], bars, suffix="%", decimals=1)
     axes[1, 0].set_title("Prefix Hit Rate")
     axes[1, 0].set_ylabel("%")
     axes[1, 0].set_xticks(x, names, rotation=15, ha="right")
     axes[1, 0].legend()
+    axes[1, 0].grid(axis="y", linestyle="--", alpha=0.25)
 
-    bars = axes[1, 1].bar([i - width / 2 for i in x], gpu_util, width=width, label="GPU util")
+    bars = axes[1, 1].bar(
+        [i - width / 2 for i in x],
+        gpu_util,
+        width=width,
+        label="GPU util",
+        color=palettes["util"][0],
+        **bar_style,
+    )
     annotate_bars(axes[1, 1], bars, suffix="%", decimals=1)
-    bars = axes[1, 1].bar([i + width / 2 for i in x], gpu_mem_util, width=width, label="GPU mem util")
+    bars = axes[1, 1].bar(
+        [i + width / 2 for i in x],
+        gpu_mem_util,
+        width=width,
+        label="GPU mem util",
+        color=palettes["util"][1],
+        **bar_style,
+    )
     annotate_bars(axes[1, 1], bars, suffix="%", decimals=1)
     axes[1, 1].set_title("GPU Utilization")
     axes[1, 1].set_ylabel("%")
     axes[1, 1].set_xticks(x, names, rotation=15, ha="right")
     axes[1, 1].legend()
+    axes[1, 1].grid(axis="y", linestyle="--", alpha=0.25)
 
     fig.tight_layout()
     fig.savefig(output, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"saved figure: {output}")
+
+
+def save_rank_stats_figure(results: list[ScenarioResult | None], output_path: str) -> None:
+    valid_results = [
+        result for result in results
+        if result is not None and result.rank_stats
+    ]
+    if not valid_results:
+        return
+
+    summary_output = Path(output_path)
+    output = summary_output.with_name(f"{summary_output.stem}_rank_stats{summary_output.suffix}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rank_ids = sorted({
+        int(rank)
+        for result in valid_results
+        for rank in result.rank_stats.keys()
+    })
+    if not rank_ids:
+        return
+
+    fig, axes = plt.subplots(
+        len(valid_results), 4,
+        figsize=(18, max(4, 3.5 * len(valid_results))),
+        squeeze=False,
+    )
+    fig.suptitle("Per-Rank Benchmark Diagnostics", fontsize=16)
+    rank_colors = ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377"]
+
+    def rank_value(result: ScenarioResult, rank: int, key: str, default: float = 0.0) -> float:
+        stats = result.rank_stats.get(rank, result.rank_stats.get(str(rank), {}))
+        return float(stats.get(key, default))
+
+    labels = [f"rank {rank}" for rank in rank_ids]
+    colors = [rank_colors[rank % len(rank_colors)] for rank in rank_ids]
+    for row, result in enumerate(valid_results):
+        submitted = [rank_value(result, rank, "submitted") for rank in rank_ids]
+        output_tokens = [rank_value(result, rank, "output_tokens") for rank in rank_ids]
+        gpu_util = [rank_value(result, rank, "gpu_util_mean") for rank in rank_ids]
+        local_hit = [rank_value(result, rank, "local_prefix_hit_rate") * 100.0 for rank in rank_ids]
+
+        for col, (title, values) in enumerate([
+            ("Request Share", submitted),
+            ("Output Token Share", output_tokens),
+        ]):
+            ax = axes[row, col]
+            if sum(values) > 0:
+                ax.pie(
+                    values, labels=labels, colors=colors,
+                    autopct=lambda pct: f"{pct:.1f}%" if pct >= 2.0 else "",
+                    startangle=90, textprops={"fontsize": 8},
+                )
+            ax.set_title(title)
+
+        for col, (title, values) in enumerate([
+            ("GPU Utilization", gpu_util),
+            ("Local Prefix Hit", local_hit),
+        ], start=2):
+            ax = axes[row, col]
+            bars = ax.bar(rank_ids, values, color=colors)
+            ax.bar_label(bars, fmt="%.1f", fontsize=8, padding=2)
+            ax.set_title(title)
+            ax.set_xlabel("rank")
+            ax.set_ylabel("%")
+            ax.set_xticks(rank_ids)
+            ax.set_ylim(0, max(100.0, max(values, default=0.0) * 1.15))
+            ax.grid(axis="y", linestyle="--", alpha=0.25)
+
+        axes[row, 0].set_ylabel(result.name, fontsize=10, fontweight="bold")
+
+    fig.tight_layout()
+    fig.savefig(output, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved rank stats figure: {output}")
 
 
 def save_summary_json(results: dict, output_path: str) -> None:
@@ -940,6 +1450,11 @@ def parse_args():
     parser.add_argument("--prompt-repeat", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--workload", choices=["locality", "load-skew", "memory-skew"], default="locality")
+    parser.add_argument("--locality-prefix-groups", type=int, default=16)
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--model-name-or-path", type=str, default=MODEL_CONFIG["model_name_or_path"])
     parser.add_argument("--nvlink-pairs", type=str, default="0,1")
@@ -954,6 +1469,13 @@ def parse_args():
     parser.add_argument("--background-copy-max-blocks", type=int, default=MODEL_CONFIG["background_copy_max_blocks"])
     parser.add_argument("--background-copy-cooldown-s", type=float, default=MODEL_CONFIG["background_copy_cooldown_s"])
     parser.add_argument("--background-copy-hot-threshold", type=int, default=MODEL_CONFIG["background_copy_hot_threshold"])
+    parser.add_argument("--route-load-weight", type=float, default=MODEL_CONFIG["route_load_weight"])
+    parser.add_argument(
+        "--route-load-bypass-threshold",
+        type=float,
+        default=MODEL_CONFIG["route_load_bypass_threshold"],
+    )
+    parser.add_argument("--route-cache-queue-slack", type=float, default=MODEL_CONFIG["route_cache_queue_slack"])
     return parser.parse_args()
 
 
@@ -975,6 +1497,12 @@ def apply_background_copy_args(config: dict, args) -> None:
     config["background_copy_hot_threshold"] = args.background_copy_hot_threshold
 
 
+def apply_route_args(config: dict, args) -> None:
+    config["route_load_weight"] = args.route_load_weight
+    config["route_load_bypass_threshold"] = args.route_load_bypass_threshold
+    config["route_cache_queue_slack"] = args.route_cache_queue_slack
+
+
 def main():
     # 主流程：
     # 1) 准备 prompts
@@ -987,6 +1515,10 @@ def main():
         raise SystemExit("CUDA is required for this benchmark")
     if args.world_size < 1:
         raise SystemExit("--world-size must be >= 1")
+    if args.repetitions < 1:
+        raise SystemExit("--repetitions must be >= 1")
+    if args.workload == "locality" and not 1 <= args.locality_prefix_groups <= args.num_prompts:
+        raise SystemExit("--locality-prefix-groups must be between 1 and --num-prompts")
     visible_gpus = torch.cuda.device_count()
     if args.world_size > visible_gpus:
         raise SystemExit(
@@ -996,11 +1528,19 @@ def main():
 
     model_name = args.model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    prompts = build_prompts(tokenizer, args.num_prompts, args.prompt_repeat)
+    prompts = build_prompts(
+        tokenizer,
+        args.num_prompts,
+        args.prompt_repeat,
+        args.workload,
+        locality_prefix_groups=args.locality_prefix_groups,
+        seed=args.seed,
+    )
 
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
         max_model_length=MODEL_CONFIG["max_model_length"],
     )
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
@@ -1008,12 +1548,14 @@ def main():
     # single-gpu baseline：单卡独立执行，不启用全局池
     baseline_config = make_config(1, False, None)
     baseline_config["model_name_or_path"] = model_name
-    baseline = run_engine_scenario(
-        "single-gpu",
-        baseline_config,
-        prompts,
-        sampling_params,
-        tokenizer,
+    baseline_config["random_seed"] = args.seed
+    baseline = run_repeated_engine_scenario(
+        args.repetitions,
+        name="single-gpu",
+        config=baseline_config,
+        prompts=prompts,
+        sampling_params=sampling_params,
+        tokenizer=tokenizer,
         goodput_e2e_sla_s=goodput_e2e_sla_s,
         submit_window=args.submit_window,
     )
@@ -1028,12 +1570,14 @@ def main():
     # multi-gpu baseline：不共享 KV、不走控制面路由，但请求通过 round-robin 分发到多张卡
     multi_gpu_config = make_config(args.world_size, False, None)
     multi_gpu_config["model_name_or_path"] = model_name
-    independent_result = run_engine_scenario(
-        "multi-gpu",
-        multi_gpu_config,
-        prompts,
-        sampling_params,
-        tokenizer,
+    multi_gpu_config["random_seed"] = args.seed
+    independent_result = run_repeated_engine_scenario(
+        args.repetitions,
+        name="multi-gpu",
+        config=multi_gpu_config,
+        prompts=prompts,
+        sampling_params=sampling_params,
+        tokenizer=tokenizer,
         route_mode="round_robin",
         goodput_e2e_sla_s=goodput_e2e_sla_s,
         submit_window=args.submit_window,
@@ -1045,12 +1589,15 @@ def main():
     routing_config["max_cached_blocks"] = args.routing_max_cached_blocks
     routing_config["enable_foreground_rebalance"] = False
     routing_config["enable_background_copy"] = False
-    kv_routing = run_engine_scenario(
-        "multi-gpu-kv-routing",
-        routing_config,
-        prompts,
-        sampling_params,
-        tokenizer,
+    routing_config["random_seed"] = args.seed
+    apply_route_args(routing_config, args)
+    kv_routing = run_repeated_engine_scenario(
+        args.repetitions,
+        name="multi-gpu-kv-routing",
+        config=routing_config,
+        prompts=prompts,
+        sampling_params=sampling_params,
+        tokenizer=tokenizer,
         route_mode="control_plane",
         goodput_e2e_sla_s=goodput_e2e_sla_s,
         submit_window=args.submit_window,
@@ -1060,13 +1607,15 @@ def main():
     eviction_config = make_config(args.world_size, True, parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None)
     eviction_config["model_name_or_path"] = model_name
     eviction_config["max_cached_blocks"] = args.eviction_max_cached_blocks
+    eviction_config["random_seed"] = args.seed
     apply_background_copy_args(eviction_config, args)
-    kv_eviction = run_engine_scenario(
-        "multi-gpu-kv-transfer",
-        eviction_config,
-        prompts,
-        sampling_params,
-        tokenizer,
+    kv_eviction = run_repeated_engine_scenario(
+        args.repetitions,
+        name="multi-gpu-kv-transfer",
+        config=eviction_config,
+        prompts=prompts,
+        sampling_params=sampling_params,
+        tokenizer=tokenizer,
         route_mode="round_robin",
         goodput_e2e_sla_s=goodput_e2e_sla_s,
         submit_window=args.submit_window,
@@ -1081,13 +1630,16 @@ def main():
             pool_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None
             pool_config = make_config(args.world_size, True, pool_pairs)
             pool_config["model_name_or_path"] = model_name
+            pool_config["random_seed"] = args.seed
             apply_background_copy_args(pool_config, args)
-            pool_result = run_engine_scenario(
-                "multi-gpu-lmpool",
-                pool_config,
-                prompts,
-                sampling_params,
-                tokenizer,
+            apply_route_args(pool_config, args)
+            pool_result = run_repeated_engine_scenario(
+                args.repetitions,
+                name="multi-gpu-lmpool",
+                config=pool_config,
+                prompts=prompts,
+                sampling_params=sampling_params,
+                tokenizer=tokenizer,
                 goodput_e2e_sla_s=goodput_e2e_sla_s,
                 submit_window=args.submit_window,
             )
@@ -1102,6 +1654,7 @@ def main():
     print_summary_table(all_results)
     if args.output_figure:
         save_summary_figure(all_results, args.output_figure)
+        save_rank_stats_figure(all_results, args.output_figure)
     if args.output_json:
         payload = {
             "single-gpu": asdict(baseline),

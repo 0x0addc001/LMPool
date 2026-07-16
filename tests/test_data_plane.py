@@ -100,6 +100,10 @@ def test_data_plane_process_handles_sequence_and_exit():
         while "finished" not in {msg["type"] for msg in seen}:
             seen.append(send_queue.get(timeout=10))
         assert "prefill_stats" in {msg["type"] for msg in seen}
+        prefill = next(msg for msg in seen if msg["type"] == "prefill_stats")["data"][0]
+        assert prefill["is_initial_prefill"] is True
+        assert prefill["prefill_attempt"] == 1
+        assert prefill["num_prompt_tokens"] == 2
         assert "first_token" in {msg["type"] for msg in seen}
         assert "finished" in {msg["type"] for msg in seen}
         recv_queue.put({"type": "exit"})

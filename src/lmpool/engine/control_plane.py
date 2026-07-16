@@ -108,6 +108,15 @@ class ControlPlaneClient:
             "running_tokens": running_tokens,
         })
 
+    def acknowledge_route_admission(self, seq_id: int, num_tokens: int) -> None:
+        """Tell the control plane that this worker has admitted one routed request."""
+        self.request_queue.put({
+            "type": "route_admitted",
+            "rank": self.rank,
+            "seq_id": int(seq_id),
+            "num_tokens": int(num_tokens),
+        })
+
     def rebalance(self, gpu_id: int, needed_blocks: int, allow_copy: bool = False) -> bool:
         request_id = uuid.uuid4().hex
         self.request_queue.put({
@@ -285,6 +294,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     scheduler.running_token_weight = float(config.get("route_running_token_weight", scheduler.running_token_weight))
     scheduler.running_sequence_weight = float(config.get("route_running_sequence_weight", scheduler.running_sequence_weight))
     scheduler.load_bypass_threshold = float(config.get("route_load_bypass_threshold", scheduler.load_bypass_threshold))
+    enable_route_cache = bool(config.get("enable_route_cache", False))
     route_cache_queue_slack = float(config.get("route_cache_queue_slack", 2.0))
     enable_background_copy = bool(config.get("enable_background_copy", False))
     background_copy_max_blocks = max(1, int(config.get("background_copy_max_blocks", 1)))
@@ -525,6 +535,14 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             )
             service_heartbeats()
             continue
+        if msg_type == "route_admitted":
+            gbm.acknowledge_route_load(
+                msg["rank"],
+                msg.get("num_tokens", 0),
+                seq_id=msg.get("seq_id"),
+            )
+            service_heartbeats()
+            continue
         if msg_type == "rebalance_done":
             plan_id = msg["plan_id"]
             plan = pending_rebalances.get(plan_id)
@@ -586,18 +604,39 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 cached_target = route_cache.get(prefix_hash) if prefix_hash is not None else None
                 target_rank = None
                 route_info = {}
-                if cached_target is not None and gbm.get_free_blocks_count(cached_target) >= msg["num_blocks"]:
+                if (
+                    enable_route_cache
+                    and cached_target is not None
+                    and gbm.get_free_blocks_count(cached_target) >= msg["num_blocks"]
+                ):
                     cached_locations = gbm.lookup_prefix(prefix_hash, requester_rank=msg["requester_rank"])
                     candidates = scheduler._candidate_gpus(msg["requester_rank"])
-                    cached_pressure = scheduler._load_score(cached_target)
                     min_candidate_pressure = min(scheduler._load_score(gpu_id) for gpu_id in candidates)
-                    cache_owner_is_available = any(loc.gpu_id == cached_target for loc in cached_locations)
+                    owner_candidates = sorted({
+                        loc.gpu_id
+                        for loc in cached_locations
+                        if (
+                            loc.gpu_id in candidates
+                            and gbm.get_free_blocks_count(loc.gpu_id) >= msg["num_blocks"]
+                        )
+                    })
+                    cache_owner = None
+                    if owner_candidates:
+                        cache_owner = min(
+                            owner_candidates,
+                            key=lambda gpu_id: (
+                                scheduler._load_score(gpu_id),
+                                -gbm.get_free_blocks_count(gpu_id),
+                                gpu_id,
+                            ),
+                        )
+                    cached_pressure = scheduler._load_score(cache_owner) if cache_owner is not None else float("inf")
                     cache_owner_is_not_congested = (
-                        cached_target in candidates
+                        cache_owner is not None
                         and cached_pressure <= min_candidate_pressure + route_cache_queue_slack
                     )
-                    if cache_owner_is_available and cache_owner_is_not_congested:
-                        target_rank = cached_target
+                    if cache_owner_is_not_congested:
+                        target_rank = cache_owner
                         route_info = {
                             "requester_rank": msg["requester_rank"],
                             "seq_id": msg["seq_id"],
@@ -629,6 +668,11 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     if prefix_hash is not None and route_info.get("prefix_hit"):
                         route_cache[prefix_hash] = target_rank
                 gbm.reserve_blocks(target_rank, msg["num_blocks"])
+                gbm.reserve_route_load(
+                    target_rank,
+                    msg["num_tokens"],
+                    seq_id=msg["seq_id"],
+                )
                 response_queues[msg["reply_rank"]].put({
                     "type": "route_response",
                     "request_id": msg["request_id"],

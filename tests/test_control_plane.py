@@ -11,6 +11,7 @@ from lmpool.engine.sequence import Sequence
 def _start_control_plane(world_size=2, max_cached_blocks=8, pairs=((0, 1),), extra_config=None):
     request_queue = queue.Queue()
     response_queues = {rank: queue.Queue() for rank in range(world_size)}
+    response_queues[-1] = queue.Queue()
     config = {
         "world_size": world_size,
         "max_cached_blocks": max_cached_blocks,
@@ -33,7 +34,7 @@ def _stop_control_plane(request_queue, thread, timeout=10):
     thread.join(timeout=timeout)
 
 
-def test_route_prefers_nvlink_and_capacity_fallback():
+def test_route_falls_back_when_nvlink_prefix_owner_has_no_capacity():
     config, request_queue, response_queues, thread = _start_control_plane()
     try:
         bm = BlockManager(num_blocks=8, block_size=2)
@@ -59,13 +60,15 @@ def test_route_prefers_nvlink_and_capacity_fallback():
         time.sleep(0.2)
 
         target = client0.route_sequence(seq)
-        assert target == 1
+        assert target == 0
     finally:
         _stop_control_plane(request_queue, thread)
 
 
 def test_route_cache_reuses_valid_prefix_owner():
-    config, request_queue, response_queues, thread = _start_control_plane()
+    config, request_queue, response_queues, thread = _start_control_plane(
+        extra_config={"enable_route_cache": True, "route_cache_queue_slack": 100000.0}
+    )
     try:
         bm = BlockManager(num_blocks=8, block_size=2)
         client0 = ControlPlaneClient(0, request_queue, response_queues[0])
@@ -98,7 +101,9 @@ def test_route_cache_reuses_valid_prefix_owner():
 
 
 def test_route_cache_bypasses_congested_cached_owner():
-    config, request_queue, response_queues, thread = _start_control_plane()
+    config, request_queue, response_queues, thread = _start_control_plane(
+        extra_config={"enable_route_cache": True}
+    )
     try:
         bm = BlockManager(num_blocks=8, block_size=2)
         client0 = ControlPlaneClient(0, request_queue, response_queues[0])
@@ -146,6 +151,97 @@ def test_route_cache_bypasses_congested_cached_owner():
         )
         assert second["target_rank"] == 0
         assert second["route_info"]["reason"] != "route_cache"
+    finally:
+        _stop_control_plane(request_queue, thread)
+
+
+def test_route_cache_counts_optimistic_load_before_worker_report():
+    config, request_queue, response_queues, thread = _start_control_plane(
+        world_size=4,
+        pairs=((0, 1), (2, 3)),
+        extra_config={
+            "enable_route_cache": True,
+            "route_load_weight": 0.03,
+            "route_load_bypass_threshold": 256,
+            "route_cache_queue_slack": 256,
+        },
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        client = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        client.block_manager = bm
+
+        prefix_tokens = [11, 22]
+        prefix_hash = bm.compute_hash(prefix_tokens, -1)
+        for rank in range(4):
+            request_queue.put({
+                "type": "block_state",
+                "rank": rank,
+                "free_blocks": 64,
+                "block_hashes": {0: prefix_hash},
+                "waiting_sequences": 0,
+                "running_sequences": 0,
+                "waiting_tokens": 0,
+                "running_tokens": 0,
+            })
+        time.sleep(0.2)
+
+        targets = [
+            client.route_sequence(
+                Sequence(token_ids=prefix_tokens + [idx] * 512, block_size=2),
+                return_meta=True,
+            )["target_rank"]
+            for idx in range(12)
+        ]
+
+        assert len(set(targets)) > 1
+        assert max(targets.count(rank) for rank in set(targets)) < 10
+    finally:
+        _stop_control_plane(request_queue, thread)
+
+
+def test_route_cache_balances_across_prefix_owners():
+    config, request_queue, response_queues, thread = _start_control_plane(
+        world_size=4,
+        pairs=((0, 1), (2, 3)),
+        extra_config={
+            "enable_route_cache": True,
+            "route_load_weight": 0.03,
+            "route_cache_queue_slack": 256,
+        },
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        client = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        client.block_manager = bm
+
+        prefix_tokens = [11, 22]
+        prefix_hash = bm.compute_hash(prefix_tokens, -1)
+        for rank in range(4):
+            request_queue.put({
+                "type": "block_state",
+                "rank": rank,
+                "free_blocks": 64,
+                "block_hashes": {0: prefix_hash},
+                "waiting_sequences": 0,
+                "running_sequences": 0,
+                "waiting_tokens": 4096 if rank == 0 else 0,
+                "running_tokens": 0,
+            })
+        time.sleep(0.2)
+
+        first = client.route_sequence(
+            Sequence(token_ids=prefix_tokens + [33], block_size=2),
+            return_meta=True,
+        )
+        second = client.route_sequence(
+            Sequence(token_ids=prefix_tokens + [44], block_size=2),
+            return_meta=True,
+        )
+
+        assert first["target_rank"] != 0
+        assert second["target_rank"] != 0
+        assert second["route_info"]["reason"] == "route_cache"
     finally:
         _stop_control_plane(request_queue, thread)
 
@@ -550,7 +646,7 @@ def test_lookup_prefix_uses_requester_rank_for_nvlink_affinity():
     assert [loc.gpu_id for loc in hits] == [1, 0]
 
 
-def test_allocate_registers_all_full_blocks_into_global_page_table():
+def test_ready_blocks_register_into_global_page_table_after_prefill():
     gbm = GlobalBlockManager(
         rank=0,
         world_size=2,
@@ -563,5 +659,8 @@ def test_allocate_registers_all_full_blocks_into_global_page_table():
     bm.allocate(seq)
 
     assert len(seq.block_table) == 2
+    assert gbm.global_page_table == {}
+
+    bm.mark_kv_ready([seq])
     hashes = list(gbm.global_page_table.keys())
     assert len(hashes) == 2

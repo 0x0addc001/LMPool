@@ -37,6 +37,8 @@ class Scheduler:
         self._rebalance_cooldown_until: dict[tuple, float] = {}
         self._rebalance_cooldown_s = 0.25
         self.enable_foreground_rebalance = True
+        self.foreground_transfer_min_blocks = 1
+        self.preemption_count = 0
 
         # --------------------------------------------- #
         # 全局调度器接口
@@ -59,6 +61,18 @@ class Scheduler:
 
     def add_sequence(self, sequence: Sequence):
         self.waiting.append(sequence)
+
+    def _decode_reserve_blocks(self, incoming: Sequence | None = None) -> int:
+        # Reserve the next growth block, not the entire completion, so long
+        # generations do not serialize admission unnecessarily.
+        reserve = sum(min(1, seq.remaining_decode_blocks) for seq in self.running)
+        if incoming is not None:
+            reserve += min(1, incoming.remaining_decode_blocks)
+        return reserve
+
+    def _can_admit_prefill(self, seq: Sequence) -> bool:
+        required = self.block_manager.num_required_new_blocks(seq)
+        return len(self.block_manager.free_block_ids) >= required + self._decode_reserve_blocks(seq)
 
     def _sync_local_state_to_global(self):
         if self.global_scheduler is None:
@@ -103,6 +117,9 @@ class Scheduler:
         while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
             seq = self.waiting[0]
 
+            if len(seq) + current_scheduled_tokens > self.max_num_batched_tokens:
+                break
+
             # -------------------------------------------------------- #
             # 全局路由决策
             # -------------------------------------------------------- #
@@ -134,41 +151,49 @@ class Scheduler:
                     continue
             # -------------------------------------------------------- #
 
-            # 检查是否可以分配
-            can_alloc = self.block_manager.can_allocate(seq)
+            # Admission includes enough headroom for every active sequence to
+            # finish its configured decode without immediately preempting one
+            # another at the next block boundary.
+            can_alloc = self._can_admit_prefill(seq)
 
             if not can_alloc:
-                # 本地空闲不足：优先走控制面 rebalance 计划
                 required_new_blocks = self.block_manager.num_required_new_blocks(seq)
+                reserve_blocks = self._decode_reserve_blocks(seq)
+                shortage = max(
+                    0,
+                    required_new_blocks + reserve_blocks - len(self.block_manager.free_block_ids),
+                )
+                # Dropping a cold reconstructable cache entry is cheaper than
+                # transferring it or preempting live decode work.
+                self.block_manager.reclaim_for_sequence(seq, reserve_blocks=reserve_blocks)
+                if self._can_admit_prefill(seq):
+                    continue
+
+                # The request itself fits, but admitting it would consume
+                # decode headroom. Wait for running work instead of moving KV
+                # merely to increase concurrency.
+                if self.block_manager.can_allocate(seq):
+                    break
+
+                # Local cache reclamation was insufficient. The full LMPool
+                # path may preserve cache value by moving evictable blocks.
                 shortage = max(0, required_new_blocks - len(self.block_manager.free_block_ids))
-                cooldown_key = ("prefill", self.rank, shortage)
-                if self.global_scheduler is not None and self.enable_foreground_rebalance:
+                cooldown_key = ("capacity", self.rank)
+                if (
+                    self.global_scheduler is not None
+                    and self.enable_foreground_rebalance
+                    and shortage >= self.foreground_transfer_min_blocks
+                ):
                     rebalance_success = False
                     if shortage > 0 and not self._rebalance_on_cooldown(cooldown_key):
                         rebalance_success = self.global_scheduler.rebalance(self.rank, shortage)
                         if not rebalance_success:
                             self._mark_rebalance_failed(cooldown_key)
-                    if rebalance_success and self.block_manager.can_allocate(seq):
-                        seq = self.waiting.popleft()
-                        self.block_manager.allocate(seq)
-                        seq.status = SequenceStatus.RUNNING
-                        self.running.append(seq)
-                        current_scheduled_tokens += len(seq)
-                        scheduled_sequences.append(seq)
-                        self._sync_local_state_to_global()
+                    if rebalance_success and self._can_admit_prefill(seq):
                         continue
-                # transfer 失败或未启用全局池化：抢占一个 running 序列腾空间。
-                # 这覆盖源端 prepare 因 ref_count>0 拒绝 eviction 的情况，避免
-                # waiting 队首请求反复触发同一个不可执行 rebalance 计划。
-                if scheduled_sequences:
-                    break
-                if self.running:
-                    self.preempt(self.running.pop())
-                    break
-                break
-
-            # 检查 token 预算
-            if len(seq) + current_scheduled_tokens > self.max_num_batched_tokens:
+                # Do not evict live decode work merely to admit new prefill.
+                # Falling through to the decode loop drains current work and
+                # naturally creates capacity for the waiting request.
                 break
 
             # 正常分配
@@ -191,12 +216,21 @@ class Scheduler:
 
             # 检查是否可以追加一个 token
             if not self.block_manager.can_append(seq):
+                if self.block_manager.reclaim_cached_blocks(1) > 0:
+                    self.block_manager.append(seq)
+                    scheduled_sequences.append(seq)
+                    current_scheduled_tokens += 1
+                    continue
                 # ---------------------------------------------------- #
                 # 全局 rebalance：尝试腾出 1 个块
                 # ---------------------------------------------------- #
                 rebalance_success = False
-                if self.global_scheduler is not None and self.enable_foreground_rebalance:
-                    cooldown_key = ("decode", self.rank, 1)
+                if (
+                    self.global_scheduler is not None
+                    and self.enable_foreground_rebalance
+                    and self.foreground_transfer_min_blocks <= 1
+                ):
+                    cooldown_key = ("capacity", self.rank)
                     if not self._rebalance_on_cooldown(cooldown_key):
                         rebalance_success = self.global_scheduler.rebalance(self.rank, 1)
                         if not rebalance_success:
@@ -212,7 +246,13 @@ class Scheduler:
                 # ---------------------------------------------------- #
                 if self.running:
                     self.running.appendleft(seq)
-                    self.preempt(self.running.pop())
+                    victim = self.running.pop()
+                    self.preempt(victim, front=False)
+                    if self.block_manager.can_append(seq):
+                        self.running.popleft()
+                        self.block_manager.append(seq)
+                        scheduled_sequences.append(seq)
+                        current_scheduled_tokens += 1
                 else:
                     self.preempt(seq)
                 break
@@ -238,9 +278,11 @@ class Scheduler:
         return scheduled_sequences, False
 
 
-    def preempt(self, seq: Sequence) -> None:
+    def preempt(self, seq: Sequence, front: bool = True) -> None:
         """抢占序列：释放块，放回 waiting 队首"""
         self.block_manager.deallocate(seq)
+        self.preemption_count += 1
+        seq.preemption_count += 1
         seq.status = SequenceStatus.WAITING
         seq.num_cached_tokens = 0
         seq.block_table = []
@@ -248,7 +290,10 @@ class Scheduler:
         seq.is_remote_prefix = False
         seq.remote_gpu_id = -1
         seq.pending_swap_in = []
-        self.waiting.appendleft(seq)
+        if front:
+            self.waiting.appendleft(seq)
+        else:
+            self.waiting.append(seq)
         self._sync_local_state_to_global()
 
 
