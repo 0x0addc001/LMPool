@@ -94,6 +94,25 @@ def data_plane_process(
         if phase == "prepare":
             prepared: dict[tuple[int, tuple[int, ...]], list[int]] = {}
             is_background = bool(plan.get("background"))
+            all_source_blocks = [
+                block_id
+                for transfer in transfers
+                if rank == transfer["src_gpu"]
+                for block_id in transfer["src_blocks"]
+            ]
+            stale_source_blocks = [
+                block_id
+                for block_id in all_source_blocks
+                if block_id not in scheduler.block_manager.used_block_ids
+            ]
+            if stale_source_blocks:
+                send_block_state()
+                return {
+                    "success": False,
+                    "rank": rank,
+                    "reason": "stale_source",
+                    "error": f"source blocks are no longer allocated: {stale_source_blocks}",
+                }
             source_blocks = [
                 block_id
                 for transfer in transfers

@@ -303,6 +303,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     logger.info("control plane process started")
 
     pending_rebalances: dict[str, dict] = {}
+    rebalance_source_blocks_inflight: set[tuple[int, int]] = set()
     route_cache: dict[int, int] = {}
     background_copy_inflight_pairs: set[tuple[int, int]] = set()
     background_copy_recent: dict[tuple[int, int, int], float] = {}
@@ -328,20 +329,22 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         worker_down.add(rank)
         logger.error("worker rank %s heartbeat timeout", rank)
         for plan_id, plan in list(pending_rebalances.items()):
-            if rank not in plan["pending_ranks"]:
+            if rank not in plan["execute_ranks"]:
                 continue
-            plan["pending_ranks"].discard(rank)
-            if not plan["pending_ranks"]:
-                if plan.get("reply_rank") is not None:
-                    response_queues[plan["reply_rank"]].put({
-                        "type": "rebalance_response",
-                        "request_id": plan["request_id"],
-                        "success": False,
-                        "error": f"worker {rank} down",
-                        "plan_id": plan_id,
-                    })
-                _release_background_copy_inflight(plan["plan"])
-                del pending_rebalances[plan_id]
+            prepared_ranks = set(plan.get("prepared_ranks", set())) - {rank}
+            if prepared_ranks:
+                _send_rebalance_abort(plan_id, plan["plan"], prepared_ranks)
+            if plan.get("reply_rank") is not None:
+                response_queues[plan["reply_rank"]].put({
+                    "type": "rebalance_response",
+                    "request_id": plan["request_id"],
+                    "success": False,
+                    "error": f"worker {rank} down",
+                    "reason": "worker_down",
+                    "plan_id": plan_id,
+                })
+            _release_rebalance_inflight(plan["plan"])
+            del pending_rebalances[plan_id]
 
     def _send_rebalance_execute(plan_id: str, plan: dict):
         source_ranks = {
@@ -376,7 +379,15 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 "plan": plan,
             })
 
-    def _release_background_copy_inflight(plan: dict) -> None:
+    def _source_block_keys(plan: dict) -> set[tuple[int, int]]:
+        return {
+            (int(transfer["src_gpu"]), int(block_id))
+            for transfer in plan.get("transfers", [])
+            for block_id in transfer.get("src_blocks", [])
+        }
+
+    def _release_rebalance_inflight(plan: dict) -> None:
+        rebalance_source_blocks_inflight.difference_update(_source_block_keys(plan))
         if not plan.get("background"):
             return
         for transfer in plan.get("transfers", []):
@@ -386,6 +397,9 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             ))
 
     def _enqueue_rebalance_plan(plan: dict, request_id: str | None, reply_rank: int | None) -> bool:
+        source_block_keys = _source_block_keys(plan)
+        if not source_block_keys or source_block_keys & rebalance_source_blocks_inflight:
+            return False
         plan_id = uuid.uuid4().hex
         plan["plan_id"] = plan_id
         source_ranks = {
@@ -397,6 +411,8 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         execute_ranks = source_ranks | target_ranks
         if not target_ranks:
             return False
+
+        rebalance_source_blocks_inflight.update(source_block_keys)
 
         pending_rebalances[plan_id] = {
             "request_id": request_id,
@@ -571,7 +587,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "reason": result_reason,
                         "plan_id": plan_id,
                     })
-                _release_background_copy_inflight(plan["plan"])
+                _release_rebalance_inflight(plan["plan"])
                 del pending_rebalances[plan_id]
                 service_heartbeats()
                 continue
@@ -593,7 +609,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                             "success": True,
                             "plan_id": plan_id,
                         })
-                    _release_background_copy_inflight(plan["plan"])
+                    _release_rebalance_inflight(plan["plan"])
                     del pending_rebalances[plan_id]
             service_heartbeats()
             continue
@@ -697,6 +713,11 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     gpu_id=msg["gpu_id"],
                     needed_blocks=msg["needed_blocks"],
                     allow_copy=bool(msg.get("allow_copy", False)),
+                    excluded_source_blocks={
+                        block_id
+                        for source_gpu, block_id in rebalance_source_blocks_inflight
+                        if source_gpu == msg["gpu_id"]
+                    },
                 )
                 if plan is None:
                     response_queues[msg["reply_rank"]].put({

@@ -34,6 +34,17 @@ def _stop_control_plane(request_queue, thread, timeout=10):
     thread.join(timeout=timeout)
 
 
+def _get_message_type(response_queue, message_type, timeout=5):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise queue.Empty(f"timed out waiting for {message_type}")
+        message = response_queue.get(timeout=remaining)
+        if message.get("type") == message_type:
+            return message
+
+
 def test_route_falls_back_when_nvlink_prefix_owner_has_no_capacity():
     config, request_queue, response_queues, thread = _start_control_plane()
     try:
@@ -297,6 +308,49 @@ def test_rebalance_round_trip_executes_on_source_and_target():
         assert ranks == {0, 1}
         assert all(entry[2] == 0 for entry in seen)
         assert any(1 in entry[3] for entry in seen)
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_concurrent_rebalance_plans_reserve_disjoint_source_blocks():
+    config, request_queue, response_queues, control_thread = _start_control_plane()
+    try:
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 0,
+            "block_hashes": {0: 101, 1: 202},
+            "evictable_block_hashes": {0: 101, 1: 202},
+            "pinned_block_hashes": {},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 4,
+            "block_hashes": {},
+            "evictable_block_hashes": {},
+            "pinned_block_hashes": {},
+        })
+        time.sleep(0.2)
+
+        for request_id in ("first", "second"):
+            request_queue.put({
+                "type": "rebalance_request",
+                "request_id": request_id,
+                "reply_rank": -1,
+                "gpu_id": 0,
+                "needed_blocks": 1,
+                "allow_copy": False,
+            })
+
+        first = _get_message_type(response_queues[0], "rebalance_prepare")
+        second = _get_message_type(response_queues[0], "rebalance_prepare")
+        first_blocks = set(first["plan"]["transfers"][0]["src_blocks"])
+        second_blocks = set(second["plan"]["transfers"][0]["src_blocks"])
+
+        assert first_blocks
+        assert second_blocks
+        assert first_blocks.isdisjoint(second_blocks)
     finally:
         _stop_control_plane(request_queue, control_thread)
 

@@ -450,6 +450,8 @@ class BlockManager:
         仅适用于 ref_count == 0 的块。
         """
         for block_id in block_ids:
+            if block_id not in self.used_block_ids:
+                raise RuntimeError(f"Cannot release block {block_id}: block is not allocated")
             block = self.blocks[block_id]
             if block.ref_count != 0:
                 raise RuntimeError(f"Cannot release block {block_id}: ref_count={block.ref_count}")

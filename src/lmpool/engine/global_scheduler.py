@@ -402,7 +402,13 @@ class GlobalScheduler:
     # 显存重平衡
     # ------------------------------------------------------------------
 
-    def plan_rebalance(self, gpu_id: int, needed_blocks: int, allow_copy: bool = False) -> dict | None:
+    def plan_rebalance(
+        self,
+        gpu_id: int,
+        needed_blocks: int,
+        allow_copy: bool = False,
+        excluded_source_blocks: set[int] | None = None,
+    ) -> dict | None:
         """
         生成一个可执行的 rebalance 计划，但不直接修改控制面的权威状态。
 
@@ -437,6 +443,9 @@ class GlobalScheduler:
             return None
 
         gbm_snapshot = copy.deepcopy(self.gbm)
+        excluded = set(excluded_source_blocks or ())
+        for block_id in excluded:
+            gbm_snapshot.block_access_time[gpu_id].pop(block_id, None)
         candidates = gbm_snapshot.select_eviction_candidates(
             gpu_id,
             needed_blocks,
@@ -444,7 +453,12 @@ class GlobalScheduler:
         )
         mode = "move"
         if allow_copy and (not candidates or len(candidates) < needed_blocks):
-            candidates = self._select_copy_candidates(gpu_id, needed_blocks, target_order)
+            candidates = self._select_copy_candidates(
+                gpu_id,
+                needed_blocks,
+                target_order,
+                excluded_source_blocks=excluded,
+            )
             mode = "copy"
         if not candidates or len(candidates) < needed_blocks:
             self.last_rebalance_fail_reason = "no_plan"
@@ -481,6 +495,7 @@ class GlobalScheduler:
         gpu_id: int,
         needed_blocks: int,
         target_order: List[int],
+        excluded_source_blocks: set[int] | None = None,
     ) -> List[Tuple[int, int]]:
         """Select pinned blocks for replicated transfer when move eviction is impossible."""
         if not target_order:
@@ -489,7 +504,10 @@ class GlobalScheduler:
         pinned_blocks = [
             block_id
             for block_id in self.gbm.block_hash[gpu_id]
-            if block_id not in self.gbm.block_access_time[gpu_id]
+            if (
+                block_id not in self.gbm.block_access_time[gpu_id]
+                and block_id not in set(excluded_source_blocks or ())
+            )
         ]
         if not pinned_blocks:
             return []

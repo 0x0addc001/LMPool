@@ -233,6 +233,23 @@ def test_plan_rebalance_groups_transfers():
     assert plan["transfers"][0]["mode"] == "move"
 
 
+def test_plan_rebalance_excludes_source_blocks_reserved_by_pending_plans():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_access_time[0] = {0: 5.0, 1: 10.0}
+    gbm.block_hash[0] = {0: 11, 1: 22}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    plan = scheduler.plan_rebalance(
+        gpu_id=0,
+        needed_blocks=1,
+        excluded_source_blocks={0},
+    )
+
+    assert plan is not None
+    assert plan["transfers"][0]["src_blocks"] == [1]
+
+
 def test_plan_rebalance_uses_copy_for_pinned_blocks_when_move_is_impossible():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [0, 2]

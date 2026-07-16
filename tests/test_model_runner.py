@@ -1,9 +1,29 @@
 from types import SimpleNamespace
+import json
 
 import torch
 
 from lmpool.engine import model_runner as model_runner_module
 from lmpool.engine.sequence import Sequence
+
+
+def test_resolve_model_family_from_repository_id():
+    assert model_runner_module._resolve_model_family({
+        "model_name_or_path": "Qwen/Qwen3-0.6B",
+    }) == "qwen3"
+
+
+def test_resolve_model_family_from_local_snapshot_metadata(tmp_path):
+    snapshot = tmp_path / "c1899de289a04d12100db370d81485cdf75e47ca"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(json.dumps({
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+    }), encoding="utf-8")
+
+    assert model_runner_module._resolve_model_family({
+        "model_name_or_path": str(snapshot),
+    }) == "qwen3"
 
 
 class FakeModule:

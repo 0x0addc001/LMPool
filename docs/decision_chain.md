@@ -711,3 +711,43 @@ decision demand, decision plan, decision implementation, and decision result.
   documentation accordingly.
 - Decision result: Routing locality and scheduler churn are now independently
   measurable; retries can no longer improve the reported local-hit rate.
+
+## 2026-07-16: Reserve Source Blocks Across Concurrent Transfer Plans
+
+- Decision demand: A six-GPU transfer trial crashed because concurrent
+  foreground rebalance plans selected the same source block; the first execute
+  released it and the second execute raised `KeyError` while releasing it
+  again. Ignoring the second release would still permit duplicate NCCL traffic
+  and possible send/recv divergence.
+- Decision plan: Give each pending transfer plan exclusive ownership of its
+  source blocks before prepare begins, and reject stale source state before any
+  NCCL operation starts.
+- Decision implementation: The control plane now tracks in-flight
+  `(source_rank, block_id)` reservations. Global rebalance planning excludes
+  reserved move and copy candidates, plan enqueue atomically claims all source
+  blocks, and every completion/failure/worker-down path releases the claims.
+  A participating worker failure now aborts the whole transfer transaction
+  immediately instead of allowing the remaining rank to complete a partial
+  plan.
+  Data-plane prepare verifies that every planned source block remains locally
+  allocated. `release_blocks()` now reports an explicit stale-allocation error
+  instead of leaking a set `KeyError`. Added concurrent-planning regression
+  coverage.
+- Decision result: Overlapping foreground plans cannot transfer or release the
+  same physical source block, eliminating this crash and the associated NCCL
+  deadlock risk.
+
+## 2026-07-16: Resolve Models from Snapshot Metadata
+
+- Decision demand: Offline benchmark execution passed a Hugging Face snapshot
+  directory whose basename is a commit hash, causing model selection based on
+  `Path(...).name` to reject a valid cached Qwen3 checkpoint.
+- Decision plan: Identify local models from checkpoint metadata while retaining
+  compatibility with repository IDs used by online execution.
+- Decision implementation: Added a model-family resolver that reads a local
+  `config.json` and recognizes its `architectures` or `model_type` fields. It
+  falls back to an explicit `model_architecture` value and then the original
+  model identifier. `ModelRunner` now selects Qwen3 or Llama through this
+  resolver, with tests for both repository IDs and hash-named local snapshots.
+- Decision result: `HF_HUB_OFFLINE=1` runs can use a cached snapshot path
+  directly without renaming it or contacting Hugging Face.

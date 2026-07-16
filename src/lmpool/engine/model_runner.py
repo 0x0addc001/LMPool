@@ -1,4 +1,5 @@
 import math
+import json
 import logging
 import time
 import torch
@@ -18,6 +19,34 @@ from lmpool.engine.global_block_manager import GlobalBlockManager
 from lmpool.utils import *
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_model_family(config: dict) -> str:
+    """Resolve the custom model implementation from metadata, not cache path names."""
+    model_path = Path(config["model_name_or_path"]).expanduser()
+    architecture = config.get("model_architecture")
+
+    config_path = model_path / "config.json"
+    if model_path.is_dir() and config_path.is_file():
+        try:
+            model_config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read model config {config_path}: {exc}") from exc
+        architectures = model_config.get("architectures") or []
+        architecture = architecture or (architectures[0] if architectures else None)
+        model_type = str(model_config.get("model_type", "")).lower()
+    else:
+        model_type = ""
+
+    identifier = str(architecture or model_path.name or config["model_name_or_path"]).lower()
+    if "qwen3" in identifier or model_type == "qwen3":
+        return "qwen3"
+    if "llama" in identifier or model_type == "llama":
+        return "llama"
+    raise ValueError(
+        f"Unsupported model: {config['model_name_or_path']}. "
+        "Expected a Qwen3/Llama model identifier or a local directory with config.json."
+    )
 
 
 class ModelRunner:
@@ -73,10 +102,9 @@ class ModelRunner:
             self.gbm = None
 
         # set model
-        path_str = self.config['model_name_or_path']
-        model_name = Path(path_str).name
-        match model_name:
-            case 'Qwen3-0.6B':
+        model_family = _resolve_model_family(self.config)
+        match model_family:
+            case 'qwen3':
                 self.model = Qwen3ForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -94,7 +122,7 @@ class ModelRunner:
                     tie_word_embeddings=config['tie_word_embeddings'],
                     block_size=self.block_size,
                 )
-            case 'Llama-3.2-1B-Instruct':
+            case 'llama':
                 self.model = LlamaForCausalLM(
                     vocab_size=config['vocab_size'],
                     hidden_size=config['hidden_size'],
@@ -111,8 +139,6 @@ class ModelRunner:
                     block_size=self.block_size,
                     tie_word_embeddings=config['tie_word_embeddings'],
                 )
-            case _:
-                raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
         # Load weights in GPU (model moved to GPU before loading weights)
         self.model = self.model.cuda(rank)
