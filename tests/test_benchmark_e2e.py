@@ -5,7 +5,10 @@ import pytest
 
 from benchmarks.shared_prefix_benchmark import (
     build_prompts,
+    compute_sequence_prefix_hashes,
     measure_single_gpu_prefix_hit_rate,
+    prepare_benchmark_rendezvous,
+    resolve_memory_skew_prefix_groups,
     resolve_memory_skew_source_ranks,
     resolve_kv_block_budget,
 )
@@ -19,6 +22,26 @@ class IdentityChatTokenizer:
 
     def encode(self, prompt):
         return [ord(char) for char in prompt]
+
+
+def test_benchmark_trials_use_unique_file_rendezvous():
+    first_config, first_path = prepare_benchmark_rendezvous({"world_size": 6})
+    second_config, second_path = prepare_benchmark_rendezvous({"world_size": 6})
+
+    assert first_path is not None
+    assert second_path is not None
+    assert first_path != second_path
+    assert first_config["distributed_init_method"] == first_path.resolve().as_uri()
+    assert second_config["distributed_init_method"] == second_path.resolve().as_uri()
+
+
+def test_benchmark_preserves_explicit_rendezvous_method():
+    config, path = prepare_benchmark_rendezvous(
+        {"distributed_init_method": "tcp://127.0.0.1:23456"}
+    )
+
+    assert config["distributed_init_method"] == "tcp://127.0.0.1:23456"
+    assert path is None
 
 
 def _locality_groups(prompts):
@@ -70,13 +93,28 @@ def test_memory_skew_workload_has_warmup_pressure_and_reuse_phases():
         num_prompts=16,
         prompt_repeat=4,
         workload="memory-skew",
+        memory_skew_prefix_groups=3,
         seed=0,
     )
 
     groups = [_prefix_group(prompt) for prompt in prompts]
-    assert groups[:4] == ["transfer-hot"] * 4
+    assert groups[:4] == [
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+        "transfer-hot-0000",
+    ]
     assert groups[4:8] == [f"pressure-{index:04d}" for index in range(4)]
-    assert groups[8:] == ["transfer-hot"] * 8
+    assert groups[8:] == [
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+    ]
 
 
 def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
@@ -86,6 +124,27 @@ def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
     }
 
     assert resolve_memory_skew_source_ranks(config) == [0, 2, 4]
+
+
+def test_memory_skew_prefix_groups_auto_fit_phase_and_avoid_even_period():
+    assert resolve_memory_skew_prefix_groups(128, 0) == 15
+    assert resolve_memory_skew_prefix_groups(32, 0) == 7
+    with pytest.raises(ValueError):
+        resolve_memory_skew_prefix_groups(16, 5)
+
+
+def test_sequence_prefix_hashes_are_cumulative_and_ignore_partial_block():
+    seq = SimpleNamespace(
+        token_ids=[1, 2, 3, 4, 5],
+        block_size=2,
+        num_tokens=5,
+        block=lambda index: [[1, 2], [3, 4], [5]][index],
+    )
+
+    hashes = compute_sequence_prefix_hashes(seq)
+
+    assert len(hashes) == 2
+    assert hashes[0] != hashes[1]
 
 
 def test_single_gpu_prefix_measurement_publishes_ready_kv_blocks():

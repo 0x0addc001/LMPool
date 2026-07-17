@@ -47,6 +47,10 @@ Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py
   workload trace; it is a reference, not an observed runtime hit rate.
 - `CP blk match` (`route_matched_block_ratio`): fraction of complete prompt blocks that the control plane
   believed reusable on the selected worker at routing time.
+- `CP reclaim` (`reclaimable_capacity_route_rate`): fraction of control-plane
+  routes admitted using local dependency-safe cache reclamation in addition to
+  immediately free blocks. This exposes whether routing restored parallelism
+  without changing the per-rank KV block budget.
 - `CP stale` (`stale_route_hit_rate`): fraction of control-plane request hits that reached the worker with zero
   initial cached tokens, indicating stale or structurally unusable page-table
   information.
@@ -61,9 +65,23 @@ Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py
   relieve local capacity pressure.
 - `chain plans` (`chain_transfer_count`): successful foreground plans that sent
   a usable root-to-leaf fragment and released selected leaves.
+- `hot sent` / `hot ratio`: transferred blocks belonging to the common complete
+  prefix learned during memory-skew warm-up, as a count and as a fraction of
+  all sent blocks. A high release count with a low hot ratio relieves capacity
+  but does not preserve the data reused in the final phase.
 - `reuse req hit` / `reuse tok ratio`: request hit rate and cached-token ratio
   in the final reuse phase of `memory-skew`; other workloads report zero.
+- `Memory-Skew Phase Latency`: request count plus mean/P90 TTFT and E2E for
+  warm-up, pressure, and reuse separately. Use the reuse row to evaluate
+  transfer benefit; the aggregate P90 can be dominated by source-side pressure.
 - `fg ok` / `fg fail`: number of successful / failed foreground rebalance requests. Foreground rebalance is the current-request path that tries to free local KV blocks with move-style transfer.
+
+Foreground transfer candidates use worker-reported KV heat. The control plane
+orders complete prefix chains by access frequency and reuse delivered per
+missing target block, then uses recency as a tie-breaker. Local cache pressure
+uses the same LFU-first, LRU-second ordering. This keeps one-shot pressure data
+from displacing a repeatedly reused prefix merely because it was accessed more
+recently.
 - `bg ok` / `bg fail`: number of successful / failed background speculative copy plans. Background copy is the non-blocking path that replicates hot prefix blocks to an NVLink peer for future requests.
 - `pinned`: rebalance failures caused by source blocks still being referenced (`ref_count > 0`), which are safe copy candidates but not safe move/eviction victims.
 - `no space`: rebalance failures caused by no NVLink target having enough free blocks.
@@ -123,6 +141,11 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
   accidentally aligning with round-robin ranks. More groups expose redundant
   per-GPU caching without routing; keep the value no larger than
   `--num-prompts`.
+- `--memory-skew-prefix-groups`: number of long hot prefixes preserved across
+  the three memory-skew phases. `0` automatically chooses the largest odd value
+  up to `15` that fits both warm-up and reuse. Each group is warmed repeatedly
+  on one source rank; the reuse phase interleaves groups so round-robin cannot
+  saturate its cache after one miss to a single global hotspot.
 - `--output-json`: write raw scenario results to JSON. Parent directories are created automatically, and the script prints `saved json: ...` on success.
 - `--model-name-or-path`: model name or local model path. The default config targets `Qwen/Qwen3-0.6B`.
 - `--nvlink-pairs`: logical NVLink pairs after `CUDA_VISIBLE_DEVICES` remapping, e.g. `0,1` or `0,1;2,3`. Quote values containing semicolons, e.g. `--nvlink-pairs "0,2;1,3;4,5;6,7"`. Pass an empty string to let the engine try `nvidia-smi topo -m` detection.
@@ -136,14 +159,25 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
 - `--background-copy-max-blocks`: maximum prefix blocks copied by one background plan. Use `1` for correctness debugging and try `2` when measuring possible locality gains.
 - `--background-copy-cooldown-s`: cooldown before the same prefix can trigger another copy on the same source-target pair. Try `0.5` when evaluating background copy impact.
 - `--background-copy-hot-threshold`: number of routing-time prefix hits required before background copy is allowed for that prefix. `1` is eager copy; larger values reduce speculative transfer overhead.
+- `--route-load-weight`: legacy tie-break weight for token-aware load in the prefix score.
+- `--route-load-bypass-threshold`: minimum token-equivalent cost advantage required before a cold target may bypass a prefix owner.
+- `--route-prefill-cost-weight`: cost assigned to each missing prefix token; the default `1.0` keeps it in the same units as queued tokens.
+- `--route-reclaim-cost-weight`: extra cost per reclaimable block, expressed as a fraction of one block of prefill work.
+- `--foreground-transfer-cost-weight`: transfer cost of one KV block in equivalent blocks of prefill work.
+- `--foreground-transfer-min-benefit-ratio`: minimum predicted saved-prefill / transfer-cost ratio required for foreground transfer. Low-value plans fall back to local reclamation.
+- `--route-cache-queue-slack`: token-equivalent cost slack allowed by the route-cache fast path.
 
-Routing load-score defaults are set in `MODEL_CONFIG` inside `shared_prefix_benchmark.py`:
+Routing cost-model defaults are set in `MODEL_CONFIG` inside `shared_prefix_benchmark.py`:
 
 - `route_load_weight`: multiplier for token-aware load in the route score.
 - `route_waiting_token_weight`: weight for queued prefill tokens.
 - `route_running_token_weight`: weight for tokens already owned by running sequences.
 - `route_running_sequence_weight`: fixed load weight per active running sequence.
-- `route_load_bypass_threshold`: how much higher a prefix owner's load can be before routing bypasses locality and chooses a less-loaded candidate.
+- `route_load_bypass_threshold`: minimum total-cost improvement required to bypass locality.
+- `route_prefill_cost_weight`: missing-prefix recomputation cost.
+- `route_reclaim_cost_weight`: local cache-reclamation cost and future-miss risk.
+- `foreground_transfer_cost_weight`: calibrated foreground transfer cost.
+- `foreground_transfer_min_benefit_ratio`: required safety margin for preserving KV through transfer.
 
 ## Notes
 
@@ -155,16 +189,17 @@ Routing load-score defaults are set in `MODEL_CONFIG` inside `shared_prefix_benc
 - Complete prefix blocks remain cached after their active reference count reaches
   zero. They are reported as evictable global-page-table entries and reclaimed
   by a prefix-chain-aware leaf policy: an ancestor cannot be removed while a
-  retained child depends on it, and eligible leaves use LRU order. Partial
+  retained child depends on it, and eligible leaves use LFU-first/LRU-second
+  order. Partial
   blocks are released immediately.
 - Prefill admission reserves the next possible decode-growth block for every
   active sequence. If that headroom is unavailable, the scheduler drains
   running decode work instead of preempting it to admit another long prompt.
-  Cold unreferenced cache is normally reclaimed before foreground transfer.
-  In `memory-skew`, transfer scenarios deliberately attempt foreground
-  transfer first for a real allocation shortage so the benchmark can measure
-  whether preserving a prefix chain is better than local discard. A failed
-  plan still falls back to local reclamation.
+  In `memory-skew`, transfer scenarios treat both prompt allocation and this
+  decode headroom as real admission demand. They attempt foreground transfer
+  before local cache reclamation, so a prompt that already fits cannot silently
+  discard the hot prefix merely because its future decode block is missing. A
+  failed plan still falls back to local reclamation.
   Structural failures use exponential cooldown up to 30 seconds by default,
   so an unchanged `no_plan` or `no_target_space` state does not produce a tight
   loop of failed control-plane transactions.
@@ -176,9 +211,19 @@ Routing load-score defaults are set in `MODEL_CONFIG` inside `shared_prefix_benc
 - `multi-gpu-kv-transfer` also uses round-robin dispatch, but enables foreground transfer. Use a `memory-skew` workload to create real placement pressure; all scenarios retain the same block budget for a fair comparison.
 - Rebalance requests are based on the actual block shortage, not the full
   sequence block count. Foreground plans transfer every missing ancestor needed
-  to make a selected leaf reusable at the target, retain shared ancestors at
-  the source, and release only unreferenced leaf victims. Pinned blocks are
-  never released.
+  to make a selected leaf reusable at the target. They release the deepest
+  dependency-safe suffix up to the requested shortage: a linear chain can free
+  multiple blocks, while an ancestor with an untransferred branch remains at
+  the source. Pinned blocks are never released.
+- Every scenario trial constructs a new `LLMEngine`, worker set, local block
+  managers, KV tensors, and control plane. `engine.exit()` joins or terminates
+  workers, and workers destroy their NCCL process group. Each local trial uses
+  a unique temporary FileStore rendezvous path, avoiding TCPStore port races
+  during repeated multi-rank startup; NCCL remains the data-transfer backend.
+  KV contents and page tables therefore do not carry into the next scenario.
+  OS model-file cache, GPU temperature/power state, and general machine load can
+  persist, so use repeated runs (and ideally randomized scenario order in final
+  paper scripts) to control non-KV order effects.
 - To evaluate background speculative copy itself, keep the common
   `--kv-block-budget` fixed and vary only workload pressure and background-copy
   parameters. A very small common budget is useful for failure analysis, but it

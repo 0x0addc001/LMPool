@@ -17,6 +17,10 @@ def _start_control_plane(world_size=2, max_cached_blocks=8, pairs=((0, 1),), ext
         "max_cached_blocks": max_cached_blocks,
         "nvlink_topo": {"pairs": list(pairs)},
         "log_level": "ERROR",
+        # Most control-plane tests validate two-phase transfer protocol rather
+        # than admission economics; dedicated scheduler tests cover the
+        # production benefit threshold.
+        "foreground_transfer_min_benefit_ratio": 1.0,
     }
     if extra_config:
         config.update(extra_config)
@@ -108,6 +112,7 @@ def test_route_uses_hash_chain_and_reserves_only_uncached_blocks():
         assert first["target_rank"] == 1
         assert first["route_info"]["matched_prefix_blocks"] == 3
         assert first["route_info"]["required_new_blocks"] == 1
+        assert seq.routed_prefix_hashes == hashes[:3]
         assert second["target_rank"] == 1
         assert second["route_info"]["required_new_blocks"] == 1
     finally:

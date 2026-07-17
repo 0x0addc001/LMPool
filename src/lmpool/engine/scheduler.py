@@ -58,7 +58,12 @@ class Scheduler:
 
     def _mark_rebalance_failed(self, key: tuple) -> None:
         reason = getattr(self.global_scheduler, "last_rebalance_fail_reason", "unknown")
-        structural_failure = reason in {"no_plan", "no_target_space", "stale_source"}
+        structural_failure = reason in {
+            "no_plan",
+            "no_target_space",
+            "stale_source",
+            "low_benefit",
+        }
         streak = self._rebalance_failure_streak.get(key, 0) + 1
         self._rebalance_failure_streak[key] = streak
         multiplier = 2 ** min(streak - 1, 4) if structural_failure else 1
@@ -87,6 +92,17 @@ class Scheduler:
         required = self.block_manager.num_required_new_blocks(seq)
         return len(self.block_manager.free_block_ids) >= required + self._decode_reserve_blocks(seq)
 
+    def _routed_waiting_prefix_blocks(self) -> set[int]:
+        """Protect control-plane prefix promises until waiting requests admit."""
+        protected = set()
+        for waiting_seq in self.waiting:
+            protected.update(
+                self.block_manager.resolve_cached_block_ids(
+                    getattr(waiting_seq, "routed_prefix_hashes", ())
+                )
+            )
+        return protected
+
     def _sync_local_state_to_global(self):
         if self.global_scheduler is None:
             return
@@ -101,6 +117,7 @@ class Scheduler:
                 sum(len(seq) for seq in self.waiting),
                 sum(len(seq) for seq in self.running),
                 self.block_manager.get_local_block_parent_hashes(),
+                self.block_manager.get_local_block_access_stats(),
             )
             return
         gbm = self.global_scheduler.gbm
@@ -110,6 +127,7 @@ class Scheduler:
             self.rank,
             len(self.block_manager.free_block_ids),
             self.block_manager.get_local_block_hashes(),
+            block_access_stats=self.block_manager.get_local_block_access_stats(),
         )
 
 
@@ -184,10 +202,11 @@ class Scheduler:
                     and self.global_scheduler is not None
                     and self.enable_foreground_rebalance
                 ):
-                    transfer_shortage = max(
-                        0,
-                        required_new_blocks - len(self.block_manager.free_block_ids),
-                    )
+                    # Admission reserves decode-growth headroom as well as the
+                    # prompt blocks. Preserve cache for that complete deficit;
+                    # otherwise a prompt that fits by itself skips transfer and
+                    # immediately discards the cache needed by the reuse phase.
+                    transfer_shortage = shortage
                     if (
                         transfer_shortage >= self.foreground_transfer_min_blocks
                         and not self._rebalance_on_cooldown(cooldown_key)
@@ -206,13 +225,17 @@ class Scheduler:
 
                 # Reconstructable cache remains the fallback when a
                 # chain-preserving transfer is disabled or cannot execute.
-                self.block_manager.reclaim_for_sequence(seq, reserve_blocks=reserve_blocks)
+                self.block_manager.reclaim_for_sequence(
+                    seq,
+                    reserve_blocks=reserve_blocks,
+                    protected_block_ids=self._routed_waiting_prefix_blocks(),
+                )
                 if self._can_admit_prefill(seq):
                     continue
 
-                # The request itself fits, but admitting it would consume
-                # decode headroom. Wait for running work instead of moving KV
-                # merely to increase concurrency.
+                # The request itself fits, but neither transfer nor local
+                # reclamation produced the required decode headroom. Drain
+                # running work rather than evicting live decode state.
                 if self.block_manager.can_allocate(seq):
                     break
 

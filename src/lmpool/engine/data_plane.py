@@ -106,8 +106,12 @@ def data_plane_process(
                 block_id
                 for transfer in transfers
                 if rank == transfer["src_gpu"]
-                for block_id in transfer["src_blocks"]
+                for block_id in (
+                    list(transfer["src_blocks"])
+                    + list(transfer.get("release_source_blocks", []))
+                )
             ]
+            all_source_blocks = list(dict.fromkeys(all_source_blocks))
             stale_source_blocks = [
                 block_id
                 for block_id in all_source_blocks
@@ -192,37 +196,67 @@ def data_plane_process(
             send_block_state()
             return {"success": True, "rank": rank}
 
+        source_transfers = [
+            transfer for transfer in transfers if rank == transfer["src_gpu"]
+        ]
+        if source_transfers:
+            for transfer in source_transfers:
+                model_runner.execute_swap_out(
+                    transfer["src_blocks"],
+                    transfer["dst_gpu"],
+                )
+            sent_blocks = {
+                block_id
+                for transfer in source_transfers
+                for block_id in transfer["src_blocks"]
+            }
+            release_source_blocks = list(dict.fromkeys(
+                block_id
+                for transfer in source_transfers
+                for block_id in transfer.get(
+                    "release_source_blocks",
+                    [] if transfer.get("mode", plan.get("mode", "move")) == "copy"
+                    else transfer["src_blocks"],
+                )
+            ))
+            if release_source_blocks:
+                scheduler.block_manager.release_blocks(release_source_blocks)
+            stats = {
+                "transfer_count": len(sent_blocks),
+                "swap_count": len(sent_blocks),
+                "transfer_hashes": list(dict.fromkeys(
+                    block_hash
+                    for transfer in source_transfers
+                    for block_hash in transfer.get("hashes", [])
+                    if block_hash != -1
+                )),
+                "transfer_copy_count": len(sent_blocks - set(release_source_blocks)),
+                "transfer_release_count": len(release_source_blocks),
+                "chain_transfer_count": sum(
+                    transfer.get("mode", plan.get("mode", "move")) == "chain_move"
+                    for transfer in source_transfers
+                ),
+            }
+            if plan.get("background") and all(
+                transfer.get("mode", plan.get("mode", "move")) == "copy"
+                for transfer in source_transfers
+            ):
+                stats["background_copy_success"] = 1
+            send_queue.put({
+                "type": "runtime_stats",
+                "rank": rank,
+                "data": stats,
+            })
+
         for transfer in transfers:
             src_gpu = transfer["src_gpu"]
             dst_gpu = transfer["dst_gpu"]
             src_blocks = transfer["src_blocks"]
             hashes = transfer.get("hashes", [-1] * len(src_blocks))
             parent_hashes = transfer.get("parent_hashes")
+            access_counts = transfer.get("access_counts")
             mode = transfer.get("mode", plan.get("mode", "move"))
-            release_source_blocks = transfer.get(
-                "release_source_blocks",
-                [] if mode == "copy" else src_blocks,
-            )
-
-            if rank == src_gpu:
-                model_runner.execute_swap_out(src_blocks, dst_gpu)
-                if release_source_blocks:
-                    scheduler.block_manager.release_blocks(release_source_blocks)
-                stats = {
-                    "transfer_count": len(src_blocks),
-                    "swap_count": len(src_blocks),
-                    "transfer_copy_count": len(src_blocks) - len(release_source_blocks),
-                    "transfer_release_count": len(release_source_blocks),
-                    "chain_transfer_count": 1 if mode == "chain_move" else 0,
-                }
-                if plan.get("background") and mode == "copy":
-                    stats["background_copy_success"] = 1
-                send_queue.put({
-                    "type": "runtime_stats",
-                    "rank": rank,
-                    "data": stats,
-                })
-            elif rank == dst_gpu:
+            if rank == dst_gpu:
                 prepared = prepared_rebalance_blocks.get(plan_id, {})
                 local_target_blocks = prepared.get((src_gpu, tuple(src_blocks)))
                 if local_target_blocks is None:
@@ -236,6 +270,7 @@ def data_plane_process(
                     local_target_blocks,
                     hashes,
                     parent_hashes=parent_hashes,
+                    access_counts=access_counts,
                 )
 
         if plan_id is not None:
@@ -273,6 +308,7 @@ def data_plane_process(
             sum(len(seq) for seq in scheduler.waiting),
             sum(len(seq) for seq in scheduler.running),
             scheduler.block_manager.get_local_block_parent_hashes(),
+            scheduler.block_manager.get_local_block_access_stats(),
         )
 
     send_block_state()
@@ -400,6 +436,7 @@ def data_plane_process(
 
         if local_seqs:
             run_tokens = sum(len(seq) for seq in local_seqs) if is_prefill else len(local_seqs)
+            committed_route_seq_ids = []
             if is_prefill:
                 missing_blocks = [
                     (seq.seq_id, seq.remote_gpu_id, seq.num_blocks, list(seq.block_table))
@@ -414,6 +451,8 @@ def data_plane_process(
                 prefill_stats = []
                 for seq in local_seqs:
                     is_initial_prefill = seq.prefill_attempts == 0
+                    if is_initial_prefill:
+                        committed_route_seq_ids.append(seq.seq_id)
                     seq.prefill_attempts += 1
                     prefill_stats.append({
                         "seq_id": seq.seq_id,
@@ -450,6 +489,8 @@ def data_plane_process(
             if first_tokens:
                 send_queue.put({"type": "first_token", "rank": rank, "data": first_tokens})
             send_block_state()
+            if control_plane_client is not None and committed_route_seq_ids:
+                control_plane_client.acknowledge_route_blocks(committed_route_seq_ids)
 
         finished = [
             (s.seq_id, _as_token_list(s.completion_token_ids))

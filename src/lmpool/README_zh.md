@@ -138,8 +138,9 @@ sequenceDiagram
 1. 只对完整块进行 hash
 2. 在全局页表中查找前缀命中
 3. 优先选择前缀命中分数最高的 GPU
-4. 如果没有命中，则回退到空闲块最多的 GPU
-5. 路由后进行乐观 reserve
+4. 如果没有命中，则回退到负载较低、且空闲块与依赖安全可回收 cache
+   合计能够接纳请求的 GPU
+5. 按 sequence 乐观 reserve，直到目标 worker 完成首次 prefill
 
 ### 4.3 本地调度
 
@@ -155,6 +156,7 @@ sequenceDiagram
 
 - `global_page_table`：hash 到物理块位置
 - `free_blocks_per_gpu`：每卡空闲容量
+- 依赖安全的可回收容量和待提交路由 reserve
 - `block_access_time`：用于 LRU 选择的时间戳
 - `block_hash`：每卡 block hash 快照
 

@@ -110,8 +110,12 @@ Routing policy:
 1. compute a cumulative hash chain over complete blocks only
 2. query the global page table and measure each GPU's longest contiguous prefix from block zero
 3. prefer the GPU with the best reusable-block score after queue-pressure penalty
-4. otherwise fall back to the least-congested GPU with more free blocks
+4. otherwise fall back to the least-congested GPU with enough effective
+   capacity (`free + dependency-safe reclaimable cache`)
 5. reserve only the blocks not already covered by the selected GPU's contiguous prefix
+
+Ingress reservations are tracked by sequence until first prefill commits, so
+concurrent requests cannot promise the same reclaimable blocks more than once.
 
 Foreground transfer uses reason-aware exponential backoff for structural
 failures such as `no_plan`, `no_target_space`, and `stale_source`. Repeated
@@ -132,7 +136,9 @@ Topology weights in the current routing policy are:
 
 - `global_page_table`: hash to physical block locations
 - `free_blocks_per_gpu`: per-GPU free capacity
-- `block_access_time`: per-block timestamps for LRU selection
+- dependency-safe reclaimable capacity derived from the ready-block prefix DAG
+- per-sequence optimistic block reservations for routed but uncommitted requests
+- per-block access frequency and recency for LFU-first, LRU-second selection
 - `block_hash`: per-GPU block hash snapshot
 - `block_parent_hash`: parent links used to preserve valid prefix chains during eviction
 
@@ -157,7 +163,7 @@ Each worker owns one `BlockManager` for its local KV cache blocks.
 Main responsibilities:
 
 - compute chained block hashes
-- allocate blocks and reclaim cold cached blocks with leaf-constrained LRU
+- allocate blocks and reclaim cold cached blocks with leaf-constrained LFU/LRU
 - append decode tokens
 - maintain local prefix cache state
 
@@ -165,7 +171,8 @@ Complete hashed blocks remain cached after their active reference count reaches
 zero. Partial blocks are released immediately; complete cached blocks remain
 globally discoverable and evictable until capacity pressure reclaims them.
 Eviction only removes prefix-chain leaves, so a retained descendant never loses
-an ancestor required for contiguous reuse; LRU orders the eligible leaves.
+an ancestor required for contiguous reuse. Access frequency orders eligible
+leaves first and recency breaks ties.
 
 ### 4.8 Model Runner
 
@@ -213,7 +220,12 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 | `route_prefix_hit_weight` | `float` | Positive weight for reusable prefix blocks in global routing |
 | `route_queue_pressure_weight` | `float` | Penalty weight for worker waiting/running queue pressure |
 | `route_free_block_weight` | `float` | Small tie-breaker bonus for free KV blocks |
-| `route_cache_queue_slack` | `float` | Maximum queue-pressure slack for using a cached prefix route |
+| `route_load_bypass_threshold` | `float` | Minimum token-equivalent cost advantage required to bypass a prefix owner |
+| `route_prefill_cost_weight` | `float` | Cost per missing prefix token in the completion-cost model |
+| `route_reclaim_cost_weight` | `float` | Additional cost for admitting through locally reclaimable KV capacity |
+| `foreground_transfer_cost_weight` | `float` | Per-block transfer cost expressed in equivalent prefill-block work |
+| `foreground_transfer_min_benefit_ratio` | `float` | Minimum predicted saved-prefill / transfer-cost ratio |
+| `route_cache_queue_slack` | `float` | Maximum completion-cost slack for using a cached prefix route |
 
 ### 6.2 Running
 
@@ -265,9 +277,13 @@ actual runtime block capacity, workload theoretical hit upper bound, matched
 route-block ratio, and stale-route rate.
 For `memory-skew`, deterministic warm-up, pressure, and reuse phases also
 report blocks sent, retained at the source, released at the source, chain
-transfer plans, and reuse-phase request/token hits. This distinguishes an
+transfer plans, hot-prefix transfer ratio, and reuse-phase request/token hits. This distinguishes an
 attempted foreground transfer from one that actually relieves capacity and
 preserves reusable KV.
+Workers report per-block access frequency and recency to the control plane.
+Foreground transfer ranks complete prefix chains by reuse value per missing
+target block, with recency as a tie-breaker; the target inherits the source
+frequency metadata after transfer.
 The `locality` workload uses 16 distinct long shared-prefix groups by default,
 with a deterministic shuffled request order. Override this with
 `--locality-prefix-groups`; multiple groups prevent round-robin from matching

@@ -51,6 +51,140 @@ def test_update_gpu_state_uses_only_evictable_blocks_for_eviction():
     assert gbm.select_eviction_candidates(0, 1, allow_recursive=False) == [(1, 1)]
 
 
+def test_update_gpu_state_preserves_worker_access_frequency_and_recency():
+    gbm = GlobalBlockManager(rank=0, world_size=1, num_blocks_per_gpu=4, nvlink_pairs=[])
+
+    gbm.update_gpu_state(
+        0,
+        free_blocks=2,
+        block_hashes={0: 111, 1: 222},
+        evictable_block_hashes={0: 111, 1: 222},
+        block_access_stats={
+            0: {"last_access_time": 12.5, "access_count": 9},
+            1: {"last_access_time": 7.0, "access_count": 2},
+        },
+    )
+
+    assert gbm.block_access_time[0] == {0: 12.5, 1: 7.0}
+    assert gbm.block_access_count[0] == {0: 9, 1: 2}
+    assert {
+        location.block_id: location.last_access_time
+        for locations in gbm.global_page_table.values()
+        for location in locations
+    } == {0: 12.5, 1: 7.0}
+
+
+def test_effective_capacity_counts_dependency_safe_reclamation():
+    gbm = GlobalBlockManager(rank=0, world_size=1, num_blocks_per_gpu=4, nvlink_pairs=[])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=1,
+        block_hashes={0: 11, 1: 22, 2: 33},
+        evictable_block_hashes={2: 33},
+        block_parent_hashes={0: -1, 1: 11, 2: 22},
+    )
+
+    assert gbm.get_reclaimable_blocks_count(0) == 3
+    assert gbm.get_effective_capacity(0) == 4
+    assert gbm.get_reclaimable_blocks_count(0, protected_block_ids=[2]) == 0
+
+
+def test_effective_capacity_does_not_reclaim_ancestor_of_pinned_block():
+    gbm = GlobalBlockManager(rank=0, world_size=1, num_blocks_per_gpu=3, nvlink_pairs=[])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=0,
+        block_hashes={0: 11, 1: 22, 2: 33},
+        evictable_block_hashes={},
+        pinned_block_hashes={2: 33},
+        block_parent_hashes={0: -1, 1: 11, 2: 22},
+    )
+
+    assert gbm.get_reclaimable_blocks_count(0) == 0
+    assert gbm.get_effective_capacity(0) == 0
+
+
+def test_effective_capacity_excludes_inflight_transfer_chain():
+    gbm = GlobalBlockManager(rank=0, world_size=1, num_blocks_per_gpu=3, nvlink_pairs=[])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=0,
+        block_hashes={0: 11, 1: 22, 2: 33},
+        evictable_block_hashes={2: 33},
+        block_parent_hashes={0: -1, 1: 11, 2: 22},
+    )
+    keys = {(0, 2)}
+
+    gbm.mark_transfer_blocks_inflight(keys)
+    assert gbm.get_effective_capacity(0) == 0
+
+    gbm.release_transfer_blocks_inflight(keys)
+    assert gbm.get_effective_capacity(0) == 3
+
+
+def test_pending_route_blocks_reserve_reclaimable_capacity_until_commit():
+    gbm = GlobalBlockManager(rank=0, world_size=1, num_blocks_per_gpu=3, nvlink_pairs=[])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=1,
+        block_hashes={0: 11, 1: 22},
+        evictable_block_hashes={1: 22},
+        block_parent_hashes={0: -1, 1: 11},
+    )
+    assert gbm.get_effective_capacity(0) == 3
+
+    gbm.reserve_blocks(0, 2, seq_id=17)
+
+    assert gbm.get_pending_route_blocks_count(0) == 2
+    assert gbm.get_free_blocks_count(0) == 0
+    assert gbm.get_effective_capacity(0) == 1
+
+    # A stale worker snapshot must not erase the ingress reservation.
+    gbm.update_gpu_state(
+        0,
+        free_blocks=1,
+        block_hashes={0: 11, 1: 22},
+        evictable_block_hashes={1: 22},
+        block_parent_hashes={0: -1, 1: 11},
+    )
+    assert gbm.get_effective_capacity(0) == 1
+
+    gbm.acknowledge_route_blocks(0, seq_id=17)
+    assert gbm.get_effective_capacity(0) == 3
+
+
+def test_pending_prefix_hit_protects_matched_chain_until_commit():
+    gbm = GlobalBlockManager(rank=0, world_size=1, num_blocks_per_gpu=3, nvlink_pairs=[])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=0,
+        block_hashes={0: 11, 1: 22, 2: 33},
+        evictable_block_hashes={2: 33},
+        block_parent_hashes={0: -1, 1: 11, 2: 22},
+    )
+    gbm.reserve_blocks(
+        0,
+        0,
+        seq_id=19,
+        protected_block_ids=[0, 1, 2],
+    )
+
+    assert gbm.get_reclaimable_blocks_count(0) == 0
+
+    gbm.acknowledge_route_blocks(0, seq_id=19)
+    assert gbm.get_reclaimable_blocks_count(0) == 3
+
+
+def test_select_eviction_candidates_prefers_low_frequency_over_older_hot_block():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 1]
+    gbm.block_hash[0] = {0: 111, 1: 222}
+    gbm.block_access_time[0] = {0: 1.0, 1: 10.0}
+    gbm.block_access_count[0] = {0: 8, 1: 1}
+
+    assert gbm.select_eviction_candidates(0, 1, allow_recursive=False) == [(1, 1)]
+
+
 def test_global_block_manager_reconstructs_root_to_leaf_chain():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.update_gpu_state(

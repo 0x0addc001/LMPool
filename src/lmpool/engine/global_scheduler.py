@@ -49,6 +49,13 @@ class GlobalScheduler:
         self.running_token_weight = 0.25
         self.running_sequence_weight = 32.0
         self.load_bypass_threshold = 512.0
+        # Route costs use token-equivalent units so queue work, repeated
+        # prefill, and cache reclamation can be compared directly.
+        self.block_size = 256
+        self.prefill_cost_weight = 1.0
+        self.reclaim_cost_weight = 0.5
+        self.transfer_cost_weight = 1.0
+        self.foreground_transfer_min_benefit_ratio = 1.5
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -102,6 +109,14 @@ class GlobalScheduler:
         prefix_hashes = list(prefix_hashes or ([prefix_hash] if prefix_hash is not None else []))
         candidates = self._candidate_gpus(rank)
         free_snapshot = {gpu_id: self.gbm.get_free_blocks_count(gpu_id) for gpu_id in candidates}
+        reclaimable_snapshot = {
+            gpu_id: self.gbm.get_reclaimable_blocks_count(gpu_id)
+            for gpu_id in candidates
+        }
+        effective_capacity_snapshot = {
+            gpu_id: self.gbm.get_effective_capacity(gpu_id)
+            for gpu_id in candidates
+        }
         route_info = {
             "requester_rank": rank,
             "seq_id": seq_id,
@@ -110,15 +125,24 @@ class GlobalScheduler:
             "prefix_hash": prefix_hash,
             "prefix_hashes": prefix_hashes,
             "free_snapshot": free_snapshot,
+            "reclaimable_snapshot": reclaimable_snapshot,
+            "effective_capacity_snapshot": effective_capacity_snapshot,
             "prefix_hit": False,
             "reason": None,
         }
 
         if not prefix_hashes:
             # 没有完整的块前缀，只在本地 / NVLink 伙伴之间选空闲更多的 GPU
-            target = self._select_best_candidate(rank, candidates)
+            target = self._select_best_candidate(
+                rank,
+                candidates,
+                required_blocks=num_blocks,
+                num_tokens=num_tokens,
+                num_blocks=num_blocks,
+            )
             route_info["reason"] = "most_free_no_full_blocks"
             route_info["target_rank"] = target
+            self._annotate_target_capacity(route_info, target, num_blocks)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=none free=%s -> GPU %s "
                 "(reason=most_free_no_full_blocks)",
@@ -137,9 +161,16 @@ class GlobalScheduler:
 
         if not gpu_hit_count:
             # 没有命中任何 GPU，只在本地 / NVLink 伙伴之间选空闲更多的 GPU
-            target = self._select_best_candidate(rank, candidates)
+            target = self._select_best_candidate(
+                rank,
+                candidates,
+                required_blocks=num_blocks,
+                num_tokens=num_tokens,
+                num_blocks=num_blocks,
+            )
             route_info["reason"] = "most_free_no_prefix_hit"
             route_info["target_rank"] = target
+            self._annotate_target_capacity(route_info, target, num_blocks)
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits={} free=%s -> GPU %s "
                 "(reason=most_free_no_prefix_hit)",
@@ -156,6 +187,7 @@ class GlobalScheduler:
         # 但不会无视 worker queue pressure。
         best_gpu = rank  # 默认本地
         best_score = float("-inf")
+        best_cost = float("inf")
         failed_gpus = []  # 记录空闲不足的命中 GPU
 
         for gpu_id, hit_count in gpu_hit_count.items():
@@ -165,9 +197,21 @@ class GlobalScheduler:
             score = self._route_score(rank, gpu_id, hit_count)
 
             needed = self._required_new_blocks(num_blocks, hit_count)
-            if self.gbm.get_free_blocks_count(gpu_id) >= needed:
-                if score > best_score:
+            if self.gbm.can_allocate_effective(
+                gpu_id,
+                needed,
+                hit_summary.get(gpu_id, []),
+            ):
+                cost = self._route_cost(
+                    gpu_id,
+                    num_tokens,
+                    num_blocks,
+                    hit_count,
+                    hit_summary.get(gpu_id, []),
+                )
+                if (cost, -score, gpu_id) < (best_cost, -best_score, best_gpu):
                     best_score = score
+                    best_cost = cost
                     best_gpu = gpu_id
             else:
                 # 空闲不足，暂存作为备选
@@ -175,14 +219,32 @@ class GlobalScheduler:
 
         if best_score > float("-inf"):
             load_summary = self._load_summary(candidates)
-            least_loaded_gpu = min(candidates, key=lambda gpu_id: self._load_score(gpu_id))
+            candidate_costs = {
+                gpu_id: self._route_cost(
+                    gpu_id,
+                    num_tokens,
+                    num_blocks,
+                    gpu_hit_count.get(gpu_id, 0),
+                    hit_summary.get(gpu_id, []),
+                )
+                for gpu_id in candidates
+                if self.gbm.can_allocate_effective(
+                    gpu_id,
+                    self._required_new_blocks(
+                        num_blocks,
+                        gpu_hit_count.get(gpu_id, 0),
+                    ),
+                    hit_summary.get(gpu_id, []),
+                )
+            }
+            least_loaded_gpu = min(
+                candidate_costs,
+                key=lambda gpu_id: (candidate_costs[gpu_id], gpu_id),
+            )
             if (
                 best_gpu != least_loaded_gpu
-                and self._load_score(best_gpu) > self._load_score(least_loaded_gpu) + self.load_bypass_threshold
-                and self.gbm.get_free_blocks_count(least_loaded_gpu) >= self._required_new_blocks(
-                    num_blocks,
-                    gpu_hit_count.get(least_loaded_gpu, 0),
-                )
+                and candidate_costs[least_loaded_gpu]
+                + self.load_bypass_threshold < best_cost
             ):
                 route_info["prefix_hit"] = True
                 route_info["reason"] = "prefix_hit_load_bypass"
@@ -198,6 +260,19 @@ class GlobalScheduler:
                 route_info["scores"] = self._score_summary(rank, gpu_hit_count)
                 route_info["load_score"] = load_summary
                 route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+                route_info["estimated_costs"] = self._route_cost_summary(
+                    candidates,
+                    num_tokens,
+                    num_blocks,
+                    gpu_hit_count,
+                    hit_summary,
+                )
+                self._annotate_target_capacity(
+                    route_info,
+                    least_loaded_gpu,
+                    route_info["required_new_blocks"],
+                    hit_summary.get(least_loaded_gpu, []),
+                )
                 logger.info(
                     "route seq %s: prefix=%s hits=%s load=%s -> GPU %s "
                     "(reason=prefix_hit_load_bypass, owner=%s)",
@@ -224,6 +299,19 @@ class GlobalScheduler:
             route_info["scores"] = self._score_summary(rank, gpu_hit_count)
             route_info["load_score"] = load_summary
             route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+            route_info["estimated_costs"] = self._route_cost_summary(
+                candidates,
+                num_tokens,
+                num_blocks,
+                gpu_hit_count,
+                hit_summary,
+            )
+            self._annotate_target_capacity(
+                route_info,
+                best_gpu,
+                route_info["required_new_blocks"],
+                hit_summary.get(best_gpu, []),
+            )
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s scores=%s "
                 "-> GPU %s (reason=prefix_hit, score=%.1f, target_free=%s/%s)",
@@ -245,17 +333,30 @@ class GlobalScheduler:
             allocatable_candidates = [
                 gpu_id
                 for gpu_id in candidates
-                if self.gbm.get_free_blocks_count(gpu_id) >= self._required_new_blocks(
-                    num_blocks,
-                    gpu_hit_count.get(gpu_id, 0),
+                if self.gbm.can_allocate_effective(
+                    gpu_id,
+                    self._required_new_blocks(
+                        num_blocks,
+                        gpu_hit_count.get(gpu_id, 0),
+                    ),
+                    hit_summary.get(gpu_id, []),
                 )
             ]
             if allocatable_candidates:
                 target = min(
                     allocatable_candidates,
                     key=lambda gpu_id: (
-                        self._load_score(gpu_id),
-                        -self.gbm.get_free_blocks_count(gpu_id),
+                        self._route_cost(
+                            gpu_id,
+                            num_tokens,
+                            num_blocks,
+                            gpu_hit_count.get(gpu_id, 0),
+                            hit_summary.get(gpu_id, []),
+                        ),
+                        -self.gbm.get_effective_capacity(
+                            gpu_id,
+                            hit_summary.get(gpu_id, []),
+                        ),
                         gpu_id,
                     ),
                 )
@@ -277,6 +378,12 @@ class GlobalScheduler:
                 route_info["failed_gpus"] = [(g, s) for g, s, _ in failed_gpus]
                 route_info["load_score"] = self._load_summary(candidates)
                 route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+                self._annotate_target_capacity(
+                    route_info,
+                    target,
+                    route_info["required_new_blocks"],
+                    hit_summary.get(target, []),
+                )
                 logger.info(
                     "route seq %s: prefix owners lack space; free=%s -> GPU %s "
                     "(reason=prefix_owner_full_fallback)",
@@ -286,7 +393,19 @@ class GlobalScheduler:
                 )
                 return (target, route_info) if return_info else target
 
-            failed_gpus.sort(key=lambda x: x[1], reverse=True)
+            failed_gpus.sort(
+                key=lambda item: (
+                    self._route_cost(
+                        item[0],
+                        num_tokens,
+                        num_blocks,
+                        item[2],
+                        hit_summary.get(item[0], []),
+                    ),
+                    -item[1],
+                    item[0],
+                )
+            )
             target = failed_gpus[0][0]
             route_info["prefix_hit"] = True
             route_info["reason"] = "prefix_hit_needs_rebalance"
@@ -302,6 +421,12 @@ class GlobalScheduler:
             route_info["failed_gpus"] = [(g, s) for g, s, _ in failed_gpus]
             route_info["load_score"] = self._load_summary(candidates)
             route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+            self._annotate_target_capacity(
+                route_info,
+                target,
+                route_info["required_new_blocks"],
+                hit_summary.get(target, []),
+            )
             logger.info(
                 "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s failed=%s "
                 "-> GPU %s (reason=prefix_hit_needs_rebalance)",
@@ -317,10 +442,17 @@ class GlobalScheduler:
             return (target, route_info) if return_info else target
 
         # 兜底：只在本地 / NVLink 伙伴之间选一个空闲更多的 GPU
-        target = self._select_best_candidate(rank, candidates)
+        target = self._select_best_candidate(
+            rank,
+            candidates,
+            required_blocks=num_blocks,
+            num_tokens=num_tokens,
+            num_blocks=num_blocks,
+        )
         route_info["reason"] = "fallback_most_free"
         route_info["target_rank"] = target
         route_info["required_new_blocks"] = num_blocks
+        self._annotate_target_capacity(route_info, target, num_blocks)
         logger.info(
             "route seq %s: tokens=%s blocks=%s prefix=%s hits=%s free=%s -> GPU %s "
             "(reason=fallback_most_free)",
@@ -399,8 +531,91 @@ class GlobalScheduler:
     def _route_score(self, my_rank: int, gpu_id: int, hit_count: int) -> float:
         prefix_score = hit_count * self._get_topo_weight(my_rank, gpu_id) * self.prefix_hit_weight
         queue_penalty = self._load_score(gpu_id) * self.load_weight
-        free_bonus = self.gbm.get_free_blocks_count(gpu_id) * self.free_block_weight
-        return prefix_score - queue_penalty + free_bonus
+        capacity_bonus = self.gbm.get_effective_capacity(gpu_id) * self.free_block_weight
+        return prefix_score - queue_penalty + capacity_bonus
+
+    def _route_cost_components(
+        self,
+        gpu_id: int,
+        num_tokens: int,
+        num_blocks: int,
+        hit_count: int,
+        protected_block_ids: Optional[List[int]] = None,
+    ) -> dict[str, float]:
+        """Estimate completion work in token-equivalent units."""
+        required_blocks = self._required_new_blocks(num_blocks, hit_count)
+        missing_tokens = min(
+            max(0, int(num_tokens)),
+            required_blocks * max(1, int(self.block_size)),
+        )
+        free_blocks = self.gbm.get_free_blocks_count(gpu_id)
+        reclaim_blocks = max(0, required_blocks - free_blocks)
+        components = {
+            "queue": self._load_score(gpu_id),
+            "prefill": float(missing_tokens) * self.prefill_cost_weight,
+            "reclaim": (
+                float(reclaim_blocks)
+                * float(max(1, int(self.block_size)))
+                * self.reclaim_cost_weight
+            ),
+        }
+        components["total"] = sum(components.values())
+        return components
+
+    def _route_cost(
+        self,
+        gpu_id: int,
+        num_tokens: int,
+        num_blocks: int,
+        hit_count: int,
+        protected_block_ids: Optional[List[int]] = None,
+    ) -> float:
+        return self._route_cost_components(
+            gpu_id,
+            num_tokens,
+            num_blocks,
+            hit_count,
+            protected_block_ids,
+        )["total"]
+
+    def _route_cost_summary(
+        self,
+        candidates: List[int],
+        num_tokens: int,
+        num_blocks: int,
+        gpu_hit_count: dict[int, int],
+        hit_summary: dict[int, list[int]],
+    ) -> dict[int, dict[str, float]]:
+        return {
+            gpu_id: self._route_cost_components(
+                gpu_id,
+                num_tokens,
+                num_blocks,
+                gpu_hit_count.get(gpu_id, 0),
+                hit_summary.get(gpu_id, []),
+            )
+            for gpu_id in candidates
+        }
+
+    def _annotate_target_capacity(
+        self,
+        route_info: dict,
+        target_gpu: int,
+        required_blocks: int,
+        protected_block_ids: Optional[List[int]] = None,
+    ) -> None:
+        free_blocks = self.gbm.get_free_blocks_count(target_gpu)
+        reclaimable_blocks = self.gbm.get_reclaimable_blocks_count(
+            target_gpu,
+            protected_block_ids,
+        )
+        route_info["target_free_blocks"] = free_blocks
+        route_info["target_reclaimable_blocks"] = reclaimable_blocks
+        route_info["target_effective_capacity"] = self.gbm.get_effective_capacity(
+            target_gpu,
+            protected_block_ids,
+        )
+        route_info["uses_reclaimable_capacity"] = required_blocks > free_blocks
 
     def _compute_prefix_hashes(self, seq: Sequence) -> List[int]:
         """
@@ -455,21 +670,35 @@ class GlobalScheduler:
             candidates.append(partner)
         return candidates
 
-    def _select_best_candidate(self, my_rank: int, candidates: List[int]) -> int:
-        """只在本地 / NVLink 伙伴里选低负载且空闲块更多的 GPU，同等条件优先本地"""
-        best_gpu = candidates[0]
-        best_key = self._candidate_key(my_rank, best_gpu)
-        for gpu_id in candidates:
-            key = self._candidate_key(my_rank, gpu_id)
-            if key > best_key:
-                best_key = key
-                best_gpu = gpu_id
-        return best_gpu
+    def _select_best_candidate(
+        self,
+        my_rank: int,
+        candidates: List[int],
+        required_blocks: int = 0,
+        num_tokens: int = 0,
+        num_blocks: int = 0,
+    ) -> int:
+        """Select the minimum-cost candidate with enough effective capacity."""
+        allocatable = [
+            gpu_id
+            for gpu_id in candidates
+            if self.gbm.can_allocate_effective(gpu_id, required_blocks)
+        ]
+        considered = allocatable or candidates
+        return min(
+            considered,
+            key=lambda gpu_id: (
+                self._route_cost(gpu_id, num_tokens, num_blocks, 0),
+                -self.gbm.get_effective_capacity(gpu_id),
+                0 if gpu_id == my_rank and my_rank >= 0 else 1,
+                gpu_id,
+            ),
+        )
 
     def _candidate_key(self, my_rank: int, gpu_id: int) -> tuple[float, int, int]:
         return (
             -self._load_score(gpu_id),
-            self.gbm.get_free_blocks_count(gpu_id),
+            self.gbm.get_effective_capacity(gpu_id),
             1 if gpu_id == my_rank and my_rank >= 0 else 0,
         )
 
@@ -511,7 +740,7 @@ class GlobalScheduler:
         if not self.gbm.block_hash[gpu_id]:
             self.last_rebalance_fail_reason = "no_plan"
             return None
-        if sum(self.gbm.get_free_blocks_count(target) for target in target_order) < needed_blocks:
+        if all(self.gbm.get_free_blocks_count(target) <= 0 for target in target_order):
             self.last_rebalance_fail_reason = "no_target_space"
             return None
 
@@ -523,7 +752,7 @@ class GlobalScheduler:
             excluded,
         )
         mode = "move"
-        if allow_copy and (not candidates or len(candidates) < needed_blocks):
+        if allow_copy and (not candidates or len(release_blocks) < needed_blocks):
             candidates = self._select_copy_candidates(
                 gpu_id,
                 needed_blocks,
@@ -531,8 +760,10 @@ class GlobalScheduler:
                 excluded_source_blocks=excluded,
             )
             mode = "copy"
-            release_blocks = set()
-        if not candidates or len(candidates) < needed_blocks:
+            release_blocks = []
+        valid_move = mode == "move" and candidates and len(release_blocks) >= needed_blocks
+        valid_copy = mode == "copy" and len(candidates) >= needed_blocks
+        if not (valid_move or valid_copy):
             self.last_rebalance_fail_reason = "no_plan"
             return None
 
@@ -542,31 +773,53 @@ class GlobalScheduler:
             grouped.setdefault(target_gpu, []).append(local_block)
 
         transfers = []
+        release_target = actual_candidates[0][1] if actual_candidates else None
         for target_gpu, blocks in grouped.items():
             hashes = []
             parent_hashes = []
+            access_counts = []
             for block_id in blocks:
                 block_hash = self.gbm.get_block_hash(gpu_id, block_id)
                 hashes.append(block_hash if block_hash is not None else -1)
                 parent_hashes.append(self.gbm.get_block_parent_hash(gpu_id, block_id))
+                access_counts.append(self.gbm.block_access_count[gpu_id].get(block_id, 1))
             transfers.append({
                 "src_gpu": gpu_id,
                 "dst_gpu": target_gpu,
                 "src_blocks": blocks,
                 "hashes": hashes,
                 "parent_hashes": parent_hashes,
+                "access_counts": access_counts,
                 "mode": "chain_move" if mode == "move" else mode,
-                "release_source_blocks": [
-                    block_id for block_id in blocks if block_id in release_blocks
-                ],
+                "release_source_blocks": (
+                    list(release_blocks) if target_gpu == release_target else []
+                ),
             })
 
-        return {
+        plan = {
             "gpu_id": gpu_id,
             "needed_blocks": needed_blocks,
             "mode": "chain_move" if mode == "move" else mode,
             "transfers": transfers,
         }
+        transferred_blocks = sum(len(item["src_blocks"]) for item in transfers)
+        predicted_reuses = sum(
+            sum(max(1, int(count)) for count in item["access_counts"])
+            for item in transfers
+        )
+        transfer_cost = (
+            transferred_blocks
+            * max(1, int(self.block_size))
+            * self.transfer_cost_weight
+        )
+        saved_prefill = predicted_reuses * max(1, int(self.block_size))
+        plan["estimated_transfer_cost"] = transfer_cost
+        plan["estimated_saved_prefill"] = saved_prefill
+        plan["estimated_benefit_ratio"] = saved_prefill / max(transfer_cost, 1e-9)
+        if saved_prefill < transfer_cost * self.foreground_transfer_min_benefit_ratio:
+            self.last_rebalance_fail_reason = "low_benefit"
+            return None
+        return plan
 
     def _select_chain_move_candidates(
         self,
@@ -574,29 +827,52 @@ class GlobalScheduler:
         needed_blocks: int,
         target_order: List[int],
         excluded_source_blocks: set[int],
-    ) -> tuple[List[Tuple[int, int]], set[int]]:
-        """Plan usable root-to-leaf transfers while releasing only leaf victims."""
+    ) -> tuple[List[Tuple[int, int]], List[int]]:
+        """Plan valuable complete chains and a dependency-safe release suffix."""
         target_free = {target: self.gbm.get_free_blocks_count(target) for target in target_order}
         planned_hashes = {
             target: set(self.gbm.block_hash[target].values()) for target in target_order
         }
         candidates: List[Tuple[int, int]] = []
-        release_blocks: set[int] = set()
+        selected_blocks: set[int] = set()
+        block_depth: dict[int, int] = {}
+        target_hashes = planned_hashes[target_order[0]]
+
+        def transfer_utility(block_id: int) -> tuple[float, float, int]:
+            chain = self.gbm.get_prefix_chain(gpu_id, block_id)
+            if not chain:
+                return (0.0, 0.0, block_id)
+            frequency = max(
+                self.gbm.block_access_count[gpu_id].get(chain_block, 1)
+                for chain_block in chain
+            )
+            missing = sum(
+                self.gbm.get_block_hash(gpu_id, chain_block) not in target_hashes
+                for chain_block in chain
+            )
+            utility = frequency * len(chain) / max(missing, 1)
+            recency = max(
+                self.gbm.block_access_time[gpu_id].get(chain_block, 0.0)
+                for chain_block in chain
+            )
+            return (utility, recency, -block_id)
+
         leaves = sorted(
             self.gbm.block_access_time[gpu_id],
-            key=lambda block_id: (
-                self.gbm.block_access_time[gpu_id][block_id],
-                block_id,
-            ),
+            key=transfer_utility,
+            reverse=True,
         )
         for leaf_block in leaves:
             if leaf_block in excluded_source_blocks:
                 continue
             chain = self.gbm.get_prefix_chain(gpu_id, leaf_block)
+            # Ready full-prefix ancestors are immutable. They may therefore be
+            # copied as dependencies even while referenced locally; the
+            # release planner below still forbids freeing pinned blocks. Blocks
+            # reserved by another transfer remain excluded from both reading
+            # and releasing to avoid overlapping plans.
             if not chain or any(
-                block_id in self.gbm.pinned_block_ids[gpu_id]
-                or block_id in excluded_source_blocks
-                for block_id in chain
+                block_id in excluded_source_blocks for block_id in chain
             ):
                 continue
             for target in target_order:
@@ -607,16 +883,74 @@ class GlobalScheduler:
                 if leaf_block not in missing or target_free[target] < len(missing):
                     continue
                 candidates.extend((block_id, target) for block_id in missing)
-                release_blocks.add(leaf_block)
+                selected_blocks.update(chain)
+                for depth, block_id in enumerate(chain):
+                    block_depth[block_id] = max(block_depth.get(block_id, -1), depth)
                 for block_id in missing:
                     planned_hashes[target].add(self.gbm.get_block_hash(gpu_id, block_id))
                 target_free[target] -= len(missing)
                 break
+            release_blocks = self._dependency_safe_release_order(
+                gpu_id,
+                selected_blocks,
+                block_depth,
+                excluded_source_blocks,
+            )
             if len(release_blocks) >= needed_blocks:
                 break
+        release_blocks = self._dependency_safe_release_order(
+            gpu_id,
+            selected_blocks,
+            block_depth,
+            excluded_source_blocks,
+        )
         if len(release_blocks) < needed_blocks:
-            return [], set()
-        return candidates, release_blocks
+            return [], []
+        # Release only the requested shortage. The deepest-first prefix is
+        # always safe while avoiding unnecessary loss of source locality.
+        return candidates, release_blocks[:needed_blocks]
+
+    def _dependency_safe_release_order(
+        self,
+        gpu_id: int,
+        selected_blocks: set[int],
+        block_depth: dict[int, int],
+        excluded_source_blocks: set[int],
+    ) -> List[int]:
+        """Return selected blocks releasable deepest-first without orphaning children."""
+        hash_to_block = {
+            block_hash: block_id
+            for block_id, block_hash in self.gbm.block_hash[gpu_id].items()
+            if block_hash != -1
+        }
+        children: dict[int, set[int]] = {
+            block_id: set() for block_id in self.gbm.block_hash[gpu_id]
+        }
+        for child_id, parent_hash in self.gbm.block_parent_hash[gpu_id].items():
+            parent_id = hash_to_block.get(parent_hash)
+            if parent_id is not None:
+                children.setdefault(parent_id, set()).add(child_id)
+
+        memo: dict[int, bool] = {}
+
+        def can_release(block_id: int) -> bool:
+            if block_id in memo:
+                return memo[block_id]
+            if (
+                block_id not in selected_blocks
+                or block_id in excluded_source_blocks
+                or block_id in self.gbm.pinned_block_ids[gpu_id]
+            ):
+                memo[block_id] = False
+                return False
+            memo[block_id] = all(can_release(child) for child in children.get(block_id, ()))
+            return memo[block_id]
+
+        releasable = [block_id for block_id in selected_blocks if can_release(block_id)]
+        return sorted(
+            releasable,
+            key=lambda block_id: (-block_depth.get(block_id, 0), block_id),
+        )
 
     def _select_copy_candidates(
         self,

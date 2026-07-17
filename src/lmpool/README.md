@@ -138,8 +138,9 @@ The current routing logic is:
 1. compute the hash of complete blocks only
 2. lookup the prefix in the global page table
 3. prefer the GPU with the best prefix-hit score
-4. otherwise fall back to the GPU with the most free blocks
-5. reserve blocks optimistically after routing
+4. otherwise fall back to a low-load GPU whose free plus dependency-safe
+   reclaimable cache can admit the request
+5. reserve blocks by sequence until the target commits first prefill
 
 ### 4.3 Local Scheduling
 
@@ -155,6 +156,7 @@ Each `DataPlaneProcess` keeps its own `Scheduler`, `BlockManager`, and `ModelRun
 
 - `global_page_table`: hash to physical block locations
 - `free_blocks_per_gpu`: per-GPU free capacity
+- dependency-safe reclaimable capacity and pending route reservations
 - `block_access_time`: per-block timestamps for LRU selection
 - `block_hash`: per-GPU block hash snapshot
 

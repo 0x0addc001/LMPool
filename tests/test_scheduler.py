@@ -296,6 +296,134 @@ def test_prefill_can_transfer_cache_before_local_reclaim(monkeypatch):
     assert dummy.rebalance_calls == [(0, 1)]
 
 
+def test_prefill_transfer_shortage_includes_decode_headroom(monkeypatch):
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm)
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=2,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    scheduler.preserve_cache_via_transfer = True
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    one_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=1, ignore_eos=True, max_model_length=None
+    )
+    cached = Sequence([1, 2], block_size=2, sampling_params=no_decode)
+    scheduler.block_manager.allocate(cached)
+    scheduler.block_manager.mark_kv_ready([cached])
+    scheduler.block_manager.deallocate(cached)
+    waiting = Sequence([3, 4], block_size=2, sampling_params=one_decode)
+    scheduler.add_sequence(waiting)
+
+    def transfer_one_block(gpu_id, needed_blocks):
+        dummy.rebalance_calls.append((gpu_id, needed_blocks))
+        return scheduler.block_manager.reclaim_cached_blocks(needed_blocks) == needed_blocks
+
+    dummy.rebalance = transfer_one_block
+    monkeypatch.setattr(
+        scheduler.block_manager,
+        "reclaim_for_sequence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("local reclaim ran before successful headroom transfer")
+        ),
+    )
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled == [waiting]
+    assert dummy.rebalance_calls == [(0, 1)]
+
+
+def test_prefill_reclaims_locally_only_after_headroom_transfer_fails(monkeypatch):
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm, rebalance_result=False)
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=2,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    scheduler.preserve_cache_via_transfer = True
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    one_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=1, ignore_eos=True, max_model_length=None
+    )
+    cached = Sequence([1, 2], block_size=2, sampling_params=no_decode)
+    scheduler.block_manager.allocate(cached)
+    scheduler.block_manager.mark_kv_ready([cached])
+    scheduler.block_manager.deallocate(cached)
+    waiting = Sequence([3, 4], block_size=2, sampling_params=one_decode)
+    scheduler.add_sequence(waiting)
+
+    events = []
+
+    def failed_transfer(gpu_id, needed_blocks):
+        events.append(("transfer", gpu_id, needed_blocks))
+        return False
+
+    original_reclaim = scheduler.block_manager.reclaim_for_sequence
+
+    def reclaim_after_transfer(seq, reserve_blocks=0, protected_block_ids=None):
+        events.append(("reclaim", reserve_blocks))
+        return original_reclaim(
+            seq,
+            reserve_blocks=reserve_blocks,
+            protected_block_ids=protected_block_ids,
+        )
+
+    dummy.rebalance = failed_transfer
+    monkeypatch.setattr(scheduler.block_manager, "reclaim_for_sequence", reclaim_after_transfer)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled == [waiting]
+    assert events == [("transfer", 0, 1), ("reclaim", 1)]
+
+
+def test_prefill_reclaim_preserves_prefix_promised_to_next_waiting_request():
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=3,
+        block_size=2,
+        eos=999,
+        global_scheduler=None,
+    )
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    cold = Sequence([1, 2], block_size=2, sampling_params=no_decode)
+    promised = Sequence([3, 4], block_size=2, sampling_params=no_decode)
+    for seq in (cold, promised):
+        scheduler.block_manager.allocate(seq)
+        scheduler.block_manager.mark_kv_ready([seq])
+        scheduler.block_manager.deallocate(seq)
+
+    promised_hash = scheduler.block_manager.compute_hash([3, 4], -1)
+    promised.routed_prefix_hashes = [promised_hash]
+    incoming = Sequence([5, 6, 7, 8], block_size=2, sampling_params=no_decode)
+    scheduler.add_sequence(incoming)
+    scheduler.add_sequence(promised)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled == [incoming, promised]
+    assert promised.num_cached_tokens == 2
+
+
 def test_structural_rebalance_failures_use_exponential_cooldown(monkeypatch):
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=1, nvlink_pairs=[(0, 1)])
     dummy = DummyGlobalScheduler(gbm, rebalance_result=False, fail_reason="no_target_space")

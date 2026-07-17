@@ -19,6 +19,7 @@ class Block:
         self.parent_hash = -1
         self.prefix_depth = -1
         self.last_access_time = time.monotonic()
+        self.access_count = 0
 
 
     def update(
@@ -33,6 +34,7 @@ class Block:
         self.parent_hash = parent_hash
         self.prefix_depth = prefix_depth
         self.last_access_time = time.monotonic()
+        self.access_count = max(1, self.access_count)
 
     def reset(self):
         self.hash = -1 
@@ -42,9 +44,12 @@ class Block:
         self.parent_hash = -1
         self.prefix_depth = -1
         self.last_access_time = time.monotonic()
+        self.access_count = 0
 
-    def touch(self, timestamp: float | None = None):
+    def touch(self, timestamp: float | None = None, count_access: bool = True):
         self.last_access_time = time.monotonic() if timestamp is None else timestamp
+        if count_access:
+            self.access_count += 1
 
 
 class BlockManager:
@@ -134,7 +139,11 @@ class BlockManager:
         return required
 
     def reclaim_cached_blocks(self, num_blocks: int, protected_block_ids: set[int] | None = None) -> int:
-        """Release LRU prefix leaves without orphaning retained descendants."""
+        """Release low-frequency prefix leaves without orphaning descendants.
+
+        Recency breaks ties between equally frequent candidates, which keeps
+        the policy deterministic while preserving repeatedly reused prefixes.
+        """
         protected = protected_block_ids or set()
         remaining = {
             block_id
@@ -161,7 +170,12 @@ class BlockManager:
                 break
             victim = min(
                 leaves,
-                key=lambda block: (block.last_access_time, -block.prefix_depth, block.block_id),
+                key=lambda block: (
+                    block.access_count,
+                    block.last_access_time,
+                    -block.prefix_depth,
+                    block.block_id,
+                ),
             )
             selected.append(victim)
             remaining.remove(victim.block_id)
@@ -170,14 +184,19 @@ class BlockManager:
             self._deallocate_block(block.block_id)
         return len(selected)
 
-    def reclaim_for_sequence(self, seq: Sequence, reserve_blocks: int = 0) -> int:
+    def reclaim_for_sequence(
+        self,
+        seq: Sequence,
+        reserve_blocks: int = 0,
+        protected_block_ids: set[int] | None = None,
+    ) -> int:
         """Reclaim cold cache while preserving ``seq`` and decode headroom."""
         required = self.num_required_new_blocks(seq)
         shortage = max(0, required + max(0, reserve_blocks) - len(self.free_block_ids))
         if shortage == 0:
             return 0
 
-        protected = set()
+        protected = set(protected_block_ids or ())
         h = -1
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
@@ -188,6 +207,18 @@ class BlockManager:
             if block_id is not None:
                 protected.add(block_id)
         return self.reclaim_cached_blocks(shortage, protected)
+
+    def resolve_cached_block_ids(self, block_hashes) -> set[int]:
+        """Resolve currently resident, ready cache blocks for prefix hashes."""
+        resolved = set()
+        for block_hash in block_hashes:
+            block_id = self.hash_to_block_id.get(int(block_hash))
+            if block_id is None:
+                continue
+            block = self.blocks[block_id]
+            if block.kv_ready and block.ref_count == 0:
+                resolved.add(block_id)
+        return resolved
 
 
     def allocate(self, seq: Sequence) -> None:
@@ -250,7 +281,7 @@ class BlockManager:
                     # One request access is one recency event for the whole
                     # chain. Equal timestamps let leaf/depth ordering preserve
                     # ancestors instead of evicting block zero first.
-                    block.touch(release_time)
+                    block.touch(release_time, count_access=False)
         # update sequence information
         seq.block_table = []
         seq.num_cached_tokens = 0
@@ -525,6 +556,7 @@ class BlockManager:
         block_ids: list[int],
         hashes: list[int],
         parent_hashes: list[int] | None = None,
+        access_counts: list[int] | None = None,
     ) -> None:
         """
         将已接收的 transfer-in 块登记到本地 hash 表。
@@ -536,13 +568,19 @@ class BlockManager:
             raise ValueError("block_ids and hashes must have the same length")
         if parent_hashes is not None and len(parent_hashes) != len(hashes):
             raise ValueError("parent_hashes and hashes must have the same length")
+        if access_counts is not None and len(access_counts) != len(hashes):
+            raise ValueError("access_counts and hashes must have the same length")
         parents = parent_hashes or [-1] * len(hashes)
-        for index, (block_id, h, parent_hash) in enumerate(zip(block_ids, hashes, parents)):
+        counts = access_counts or [1] * len(hashes)
+        for index, (block_id, h, parent_hash, access_count) in enumerate(
+            zip(block_ids, hashes, parents, counts)
+        ):
             block = self.blocks[block_id]
             block.hash = h
             block.kv_ready = True
             block.parent_hash = parent_hash
             block.prefix_depth = index
+            block.access_count = max(1, int(access_count))
             # transfer-in blocks already contain valid KV data but do not carry
             # original token ids. Treat token_ids=None as a trusted hash match.
             block.token_ids = None
@@ -577,6 +615,17 @@ class BlockManager:
         """Return parent hashes for ready blocks in the local prefix DAG."""
         return {
             bid: self.blocks[bid].parent_hash
+            for bid in self.used_block_ids
+            if self.blocks[bid].kv_ready
+        }
+
+    def get_local_block_access_stats(self) -> dict[int, dict[str, float | int]]:
+        """Return worker-owned recency and frequency metadata for ready blocks."""
+        return {
+            bid: {
+                "last_access_time": self.blocks[bid].last_access_time,
+                "access_count": self.blocks[bid].access_count,
+            }
             for bid in self.used_block_ids
             if self.blocks[bid].kv_ready
         }

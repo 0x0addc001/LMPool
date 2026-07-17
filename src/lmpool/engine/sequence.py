@@ -50,6 +50,10 @@ class Sequence:
         # 等待从远端 transfer in 的块索引列表（远端 GPU 上的 physical block id）。
         # 字段名保留 pending_swap_in 以兼容现有序列序列化和测试。
         self.pending_swap_in = []
+        # Prefix hashes that the control plane observed on the selected rank.
+        # While this request waits for admission, local cache reclamation must
+        # not discard the KV blocks promised by that route decision.
+        self.routed_prefix_hashes = []
 
     def __len__(self):
         return self.num_tokens
@@ -134,6 +138,7 @@ class Sequence:
             self.is_remote_prefix,
             self.remote_gpu_id,
             self.pending_swap_in,
+            self.routed_prefix_hashes,
         )
 
     def __setstate__(self, state):
@@ -158,6 +163,7 @@ class Sequence:
             self.is_remote_prefix,
             self.remote_gpu_id,
             self.pending_swap_in,
+            self.routed_prefix_hashes,
         ) = state
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens

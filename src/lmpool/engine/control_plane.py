@@ -74,10 +74,13 @@ class ControlPlaneClient:
                 self._stashed_messages.append(msg)
                 continue
             if msg.get("type") == "route_response":
+                route_info = msg.get("route_info", {})
+                matched_blocks = max(0, int(route_info.get("matched_prefix_blocks", 0)))
+                seq.routed_prefix_hashes = list(prefix_hashes[:matched_blocks])
                 if return_meta:
                     return {
                         "target_rank": msg["target_rank"],
-                        "route_info": msg.get("route_info", {}),
+                        "route_info": route_info,
                     }
                 return msg["target_rank"]
             if msg.get("type") == "error":
@@ -94,6 +97,7 @@ class ControlPlaneClient:
         waiting_tokens: int = 0,
         running_tokens: int = 0,
         block_parent_hashes: dict[int, int] | None = None,
+        block_access_stats: dict[int, dict] | None = None,
     ):
         if self.rank < 0:
             return
@@ -109,6 +113,7 @@ class ControlPlaneClient:
             "waiting_tokens": waiting_tokens,
             "running_tokens": running_tokens,
             "block_parent_hashes": block_parent_hashes,
+            "block_access_stats": block_access_stats,
         })
 
     def acknowledge_route_admission(self, seq_id: int, num_tokens: int) -> None:
@@ -118,6 +123,16 @@ class ControlPlaneClient:
             "rank": self.rank,
             "seq_id": int(seq_id),
             "num_tokens": int(num_tokens),
+        })
+
+    def acknowledge_route_blocks(self, seq_ids: list[int]) -> None:
+        """Release block reservations after routed requests commit first prefill."""
+        if self.rank < 0 or not seq_ids:
+            return
+        self.request_queue.put({
+            "type": "route_blocks_committed",
+            "rank": self.rank,
+            "seq_ids": [int(seq_id) for seq_id in seq_ids],
         })
 
     def rebalance(self, gpu_id: int, needed_blocks: int, allow_copy: bool = False) -> bool:
@@ -300,6 +315,26 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     scheduler.running_token_weight = float(config.get("route_running_token_weight", scheduler.running_token_weight))
     scheduler.running_sequence_weight = float(config.get("route_running_sequence_weight", scheduler.running_sequence_weight))
     scheduler.load_bypass_threshold = float(config.get("route_load_bypass_threshold", scheduler.load_bypass_threshold))
+    scheduler.block_size = max(1, int(config.get("block_size", scheduler.block_size)))
+    scheduler.prefill_cost_weight = max(
+        0.0,
+        float(config.get("route_prefill_cost_weight", scheduler.prefill_cost_weight)),
+    )
+    scheduler.reclaim_cost_weight = max(
+        0.0,
+        float(config.get("route_reclaim_cost_weight", scheduler.reclaim_cost_weight)),
+    )
+    scheduler.transfer_cost_weight = max(
+        0.0,
+        float(config.get("foreground_transfer_cost_weight", scheduler.transfer_cost_weight)),
+    )
+    scheduler.foreground_transfer_min_benefit_ratio = max(
+        0.0,
+        float(config.get(
+            "foreground_transfer_min_benefit_ratio",
+            scheduler.foreground_transfer_min_benefit_ratio,
+        )),
+    )
     enable_route_cache = bool(config.get("enable_route_cache", False))
     route_cache_queue_slack = float(config.get("route_cache_queue_slack", 2.0))
     enable_background_copy = bool(config.get("enable_background_copy", False))
@@ -389,11 +424,16 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         return {
             (int(transfer["src_gpu"]), int(block_id))
             for transfer in plan.get("transfers", [])
-            for block_id in transfer.get("src_blocks", [])
+            for block_id in (
+                list(transfer.get("src_blocks", []))
+                + list(transfer.get("release_source_blocks", []))
+            )
         }
 
     def _release_rebalance_inflight(plan: dict) -> None:
-        rebalance_source_blocks_inflight.difference_update(_source_block_keys(plan))
+        source_block_keys = _source_block_keys(plan)
+        rebalance_source_blocks_inflight.difference_update(source_block_keys)
+        gbm.release_transfer_blocks_inflight(source_block_keys)
         if not plan.get("background"):
             return
         for transfer in plan.get("transfers", []):
@@ -419,6 +459,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             return False
 
         rebalance_source_blocks_inflight.update(source_block_keys)
+        gbm.mark_transfer_blocks_inflight(source_block_keys)
 
         pending_rebalances[plan_id] = {
             "request_id": request_id,
@@ -558,6 +599,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 msg.get("waiting_tokens", 0),
                 msg.get("running_tokens", 0),
                 msg.get("block_parent_hashes"),
+                msg.get("block_access_stats"),
             )
             service_heartbeats()
             continue
@@ -567,6 +609,11 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 msg.get("num_tokens", 0),
                 seq_id=msg.get("seq_id"),
             )
+            service_heartbeats()
+            continue
+        if msg_type == "route_blocks_committed":
+            for seq_id in msg.get("seq_ids", []):
+                gbm.acknowledge_route_blocks(msg["rank"], seq_id)
             service_heartbeats()
             continue
         if msg_type == "rebalance_done":
@@ -643,15 +690,18 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         msg["requester_rank"],
                     )
                     candidates = scheduler._candidate_gpus(msg["requester_rank"])
-                    min_candidate_pressure = min(scheduler._load_score(gpu_id) for gpu_id in candidates)
                     owner_candidates = sorted({
                         gpu_id
                         for gpu_id, block_ids in contiguous_hits.items()
                         if (
                             gpu_id in candidates
-                            and gbm.get_free_blocks_count(gpu_id) >= scheduler._required_new_blocks(
-                                msg["num_blocks"],
-                                len(block_ids),
+                            and gbm.can_allocate_effective(
+                                gpu_id,
+                                scheduler._required_new_blocks(
+                                    msg["num_blocks"],
+                                    len(block_ids),
+                                ),
+                                block_ids,
                             )
                         )
                     })
@@ -660,15 +710,45 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         cache_owner = min(
                             owner_candidates,
                             key=lambda gpu_id: (
-                                scheduler._load_score(gpu_id),
+                                scheduler._route_cost(
+                                    gpu_id,
+                                    msg["num_tokens"],
+                                    msg["num_blocks"],
+                                    len(contiguous_hits[gpu_id]),
+                                    contiguous_hits[gpu_id],
+                                ),
                                 -gbm.get_free_blocks_count(gpu_id),
                                 gpu_id,
                             ),
                         )
-                    cached_pressure = scheduler._load_score(cache_owner) if cache_owner is not None else float("inf")
+                    candidate_costs = {
+                        gpu_id: scheduler._route_cost(
+                            gpu_id,
+                            msg["num_tokens"],
+                            msg["num_blocks"],
+                            len(contiguous_hits.get(gpu_id, [])),
+                            contiguous_hits.get(gpu_id, []),
+                        )
+                        for gpu_id in candidates
+                        if gbm.can_allocate_effective(
+                            gpu_id,
+                            scheduler._required_new_blocks(
+                                msg["num_blocks"],
+                                len(contiguous_hits.get(gpu_id, [])),
+                            ),
+                            contiguous_hits.get(gpu_id, []),
+                        )
+                    }
+                    cached_cost = (
+                        candidate_costs.get(cache_owner, float("inf"))
+                        if cache_owner is not None
+                        else float("inf")
+                    )
                     cache_owner_is_not_congested = (
                         cache_owner is not None
-                        and cached_pressure <= min_candidate_pressure + route_cache_queue_slack
+                        and candidate_costs
+                        and cached_cost
+                        <= min(candidate_costs.values()) + route_cache_queue_slack
                     )
                     if cache_owner_is_not_congested:
                         target_rank = cache_owner
@@ -691,7 +771,23 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                                 len(contiguous_hits[target_rank]),
                             ),
                             "load_score": scheduler._load_summary(candidates),
+                            "estimated_costs": scheduler._route_cost_summary(
+                                candidates,
+                                msg["num_tokens"],
+                                msg["num_blocks"],
+                                {
+                                    gpu_id: len(block_ids)
+                                    for gpu_id, block_ids in contiguous_hits.items()
+                                },
+                                contiguous_hits,
+                            ),
                         }
+                        scheduler._annotate_target_capacity(
+                            route_info,
+                            target_rank,
+                            route_info["required_new_blocks"],
+                            contiguous_hits[target_rank],
+                        )
                 if target_rank is None:
                     target_rank = scheduler.route_sequence_meta(
                         requester_rank=msg["requester_rank"],
@@ -714,6 +810,10 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 gbm.reserve_blocks(
                     target_rank,
                     int(route_info.get("required_new_blocks", msg["num_blocks"])),
+                    seq_id=msg["seq_id"],
+                    protected_block_ids=list(
+                        route_info.get("hit_summary", {}).get(target_rank, [])
+                    ),
                 )
                 gbm.reserve_route_load(
                     target_rank,

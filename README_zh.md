@@ -110,8 +110,12 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 1. 只对完整块计算累积 hash chain
 2. 在全局页表中计算每张 GPU 从第 0 块开始的最长连续命中
 3. 优先选择扣除队列压力后可复用块得分最高的 GPU
-4. 如果没有命中，则回退到负载更低且空闲块更多的 GPU
+4. 如果没有命中，则回退到负载更低且有效容量足够的 GPU；有效容量为
+   `空闲块 + 依赖安全的可回收 cache`
 5. 路由后只对连续前缀未覆盖的新块进行乐观 reserve
+
+每个 ingress reserve 会按 sequence 保留到首次 prefill 提交，防止并发请求重复承诺
+同一批可回收块。
 
 foreground transfer 对 `no_plan`、`no_target_space`、`stale_source` 等结构性
 失败使用按 rank 指数退避，避免容量状态尚未变化时重复提交相同的失败请求。
@@ -131,7 +135,9 @@ foreground transfer 对 `no_plan`、`no_target_space`、`stale_source` 等结构
 
 - `global_page_table`：hash 到物理块位置
 - `free_blocks_per_gpu`：每卡空闲容量
-- `block_access_time`：用于 LRU 选择
+- 根据 ready-block 前缀 DAG 计算的依赖安全可回收容量
+- 已路由但尚未提交 prefill 的逐 sequence 乐观块预留
+- 每个 block 的访问频率和最近访问时间：用于 LFU 优先、LRU 次序选择
 - `block_hash`：每卡 block hash 快照
 - `block_parent_hash`：用于驱逐时保持有效前缀链的父 hash 关系
 
@@ -156,13 +162,14 @@ foreground transfer 对 `no_plan`、`no_target_space`、`stale_source` 等结构
 主要职责：
 
 - 计算链式 block hash
-- 分配 block，并通过叶子约束的 LRU 回收冷缓存 block
+- 分配 block，并通过叶子约束的 LFU/LRU 回收冷缓存 block
 - 追加 decode token
 - 维护本地前缀缓存状态
 
 完整且带 hash 的 block 在活跃引用数降为 0 后仍保留为前缀缓存；partial block 会立即释放。
 缓存 block 会继续出现在全局页表中并保持可驱逐状态，直到容量压力触发回收。驱逐只选择
-前缀链叶子，避免保留的后继 block 失去连续复用所需的祖先；LRU 仅用于合法叶子之间排序。
+前缀链叶子，避免保留的后继 block 失去连续复用所需的祖先；先按访问频率排序合法叶子，
+频率相同时再按最近访问时间排序。
 
 ### 4.8 Model Runner（模型执行器）
 
@@ -210,7 +217,12 @@ foreground transfer 对 `no_plan`、`no_target_space`、`stale_source` 等结构
 | `route_prefix_hit_weight` | `float` | 全局路由中可复用前缀块的正向权重 |
 | `route_queue_pressure_weight` | `float` | worker waiting/running 队列压力的惩罚权重 |
 | `route_free_block_weight` | `float` | 空闲 KV block 的轻量 tie-breaker 权重 |
-| `route_cache_queue_slack` | `float` | 允许使用 cached prefix route 的最大队列压力余量 |
+| `route_load_bypass_threshold` | `float` | 绕过 prefix owner 所需的最小 token 等价成本优势 |
+| `route_prefill_cost_weight` | `float` | 预计完成成本模型中每个缺失 prefix token 的成本 |
+| `route_reclaim_cost_weight` | `float` | 使用本地可回收 KV 容量时计入的附加成本 |
+| `foreground_transfer_cost_weight` | `float` | 每个 transferred block 折算的等价 prefill block 成本 |
+| `foreground_transfer_min_benefit_ratio` | `float` | 预测节省 prefill 与 transfer 成本的最小比值 |
+| `route_cache_queue_slack` | `float` | cached prefix route 可接受的最大预计完成成本余量 |
 
 ### 6.2 运行
 
@@ -267,8 +279,11 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 stale-route 比例，避免将容量差异或陈旧页表误判为策略收益。
 对于 `memory-skew`，benchmark 还会按确定性的预热、施压、复用三个阶段运行，并分别报告
 发送 block 数、源端保留 block 数、源端释放 block 数、链式 transfer 计划数，以及复用阶段的
-请求命中率和 token 复用率。这样可以区分“尝试过 foreground transfer”和“确实释放容量并
+热点前缀 transfer 比例、请求命中率和 token 复用率。这样可以区分“尝试过 foreground transfer”和“确实释放容量并
 保住可复用 KV”的 transfer。
+worker 会向控制面上报每个 block 的访问频率和最近访问时间。foreground transfer 按
+“单位目标缺失 block 可带来的前缀复用价值”排序完整前缀链，并用最近访问时间打破平局；
+transfer 完成后目标 block 继承源端访问频率元数据。
 `locality` workload 默认使用 16 组不同的长共享前缀，并按固定 seed 打乱请求顺序；可通过
 `--locality-prefix-groups` 调整。多前缀组可以避免 round-robin 仅靠在每张 GPU 上复制同一个
 热点前缀，就获得与 routing 接近的稳态命中率。

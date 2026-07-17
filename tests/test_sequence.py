@@ -26,6 +26,7 @@ def test_sequence_block_view_and_round_trip_state():
     seq.is_remote_prefix = True
     seq.remote_gpu_id = 3
     seq.pending_swap_in = [9, 10]
+    seq.routed_prefix_hashes = [101, 202]
     seq.prefill_attempts = 2
     seq.preemption_count = 1
 
@@ -40,5 +41,6 @@ def test_sequence_block_view_and_round_trip_state():
     assert restored.is_remote_prefix is True
     assert restored.remote_gpu_id == 3
     assert restored.pending_swap_in == [9, 10]
+    assert restored.routed_prefix_hashes == [101, 202]
     assert restored.prefill_attempts == 2
     assert restored.preemption_count == 1

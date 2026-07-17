@@ -900,3 +900,250 @@ decision demand, decision plan, decision implementation, and decision result.
   pressure placement, while only global-pool scenarios receive NVLink topology
   for policy decisions. Results produced before this fix remain useful for
   validating transfer mechanics, but not for baseline performance ranking.
+
+## 2026-07-17: Release the Maximum Safe Prefix Suffix per Transfer
+
+- Decision demand: A fair memory-skew run showed two successful foreground
+  plans but no reuse benefit, while most plans returned `no_plan`. A complete
+  linear chain consumed several target blocks but the planner credited and
+  released only its leaf, making capacity relief much smaller than transfer
+  cost and preventing plans for multi-block shortages.
+- Decision plan: Compute source capacity relief from the complete prefix
+  dependency graph. Release as many transferred or already-target-resident
+  blocks as the current shortage requires, but retain any ancestor still needed
+  by an untransferred branch. Add a value diagnostic that identifies whether
+  transferred hashes belong to the warm-up hotspot.
+- Decision implementation: `GlobalScheduler` now builds the source child graph
+  from parent hashes, computes a deepest-first dependency-safe release order,
+  and accepts a plan based on released capacity rather than sent-block count.
+  Linear chains can release a multi-block suffix; shared ancestors are released
+  only when all source children are also safe. Target-resident ancestors may be
+  released without being sent again. Data-plane execute sends every transfer
+  before releasing the union of source blocks, reports sent-retained-released
+  counts without assuming release is a subset of send, and control-plane
+  inflight ownership covers both sent and release-only blocks. The benchmark
+  classifies transferred hashes against the common warm-up prefix and reports
+  `hot sent` and `hot ratio`. Added tests for linear suffix release,
+  target-resident ancestors, shared branches, and cumulative hash diagnostics.
+- Decision result: One chain transfer can now relieve the actual multi-block
+  shortage without breaking another prefix branch, reducing structural
+  `no_plan` failures and exposing whether capacity relief preserved the KV used
+  by the reuse phase. GPU performance impact remains to be measured with the
+  updated memory-skew run.
+
+## 2026-07-17: Make Foreground Transfer KV-Heat-Aware
+
+- Decision demand: The fair three-phase memory-skew run proved that foreground
+  transfer could send blocks and release source capacity, but `hot sent` stayed
+  at zero and reuse did not improve. The worker owned real cache accesses, while
+  the control plane replaced every evictable block timestamp with one snapshot
+  time and had no access-frequency signal, so candidate value was effectively
+  lost.
+- Decision plan: Repair the existing state path instead of adding another
+  scheduling layer. Keep per-block frequency and recency at the worker, publish
+  them with each block-state snapshot, preserve them in the global block
+  manager, and use one LFU-first policy consistently for local reclamation and
+  foreground chain selection.
+- Decision implementation: Added `access_count` to local blocks and increment
+  it only on real cache hits; release updates recency without double-counting.
+  Data-plane block-state reports now include each ready block's monotonic access
+  time and frequency. `GlobalBlockManager.update_gpu_state()` preserves those
+  values instead of assigning one synthetic timestamp, removes stale metadata,
+  and carries frequency through move/copy records. Local reclamation orders
+  dependency-safe leaves by frequency then recency. Foreground planning orders
+  complete chains by `frequency * chain_length / missing_target_blocks`, uses
+  recency as a tie-breaker, and sends source access counts so transferred blocks
+  retain their heat at the target. Added regression tests for state propagation,
+  LFU reclamation, and hot-chain selection.
+- Decision result: The planner can now distinguish repeatedly reused warm-up KV
+  from newer one-shot pressure KV. CPU regression tests validate the metadata
+  and selection path; the next foreground-only GPU run must confirm non-zero
+  hot-transfer ratio and improved reuse before background transfer is enabled.
+
+## 2026-07-17: Include Decode Headroom in Foreground Transfer Demand
+
+- Decision demand: The foreground-only memory-skew run transferred blocks but
+  never selected the warm-up hotspot. Admission rejected requests using prompt
+  blocks plus one decode-growth reserve, while foreground transfer calculated
+  demand from prompt blocks alone. When the prompt fit but its decode reserve
+  did not, transfer was skipped and local reclamation discarded reusable KV.
+- Decision plan: Use one shortage definition throughout prefill admission and
+  foreground transfer. Preserve the existing fallback: execute local cache
+  reclamation only when transfer is disabled, below threshold, on cooldown, or
+  fails to provide enough capacity.
+- Decision implementation: `Scheduler.schedule()` now passes the complete
+  admission deficit, including decode-growth headroom, to foreground transfer.
+  The subsequent local reclaim remains after the transfer attempt. Added one
+  regression test where the prompt fits but decode headroom is missing and a
+  second test that records transfer-before-reclaim ordering on plan failure.
+- Decision result: Scheduler tests confirm that the headroom-only shortage now
+  requests one block of transfer, successful transfer preserves local cache,
+  and failed transfer still admits the request through local reclamation. The
+  updated memory-skew GPU benchmark must validate higher `hot sent` and reuse.
+
+## 2026-07-17: Isolate Repeated Benchmark Rendezvous Stores
+
+- Decision demand: A six-rank, three-repetition benchmark failed during the
+  third `multi-gpu-kv-transfer` trial because rank 0 could not bind the selected
+  TCPStore port. The previous free-port helper released its probe socket before
+  workers started, leaving a race in which another local process could acquire
+  the same port.
+- Decision plan: Remove TCP port allocation from the single-node benchmark
+  lifecycle without changing NCCL data transfer. Give every scenario trial a
+  unique rendezvous resource and clean it after all workers exit.
+- Decision implementation: Added `prepare_benchmark_rendezvous()`, which copies
+  the scenario configuration and assigns a process- and UUID-specific `file://`
+  rendezvous path when no explicit init method is supplied. `run_engine_scenario()`
+  deletes that path after `engine.exit()`. Explicit rendezvous methods remain
+  unchanged. Added tests for uniqueness and explicit-method preservation, and
+  documented that FileStore handles startup while NCCL remains the transfer
+  backend.
+- Decision result: Repeated local trials no longer perform a vulnerable
+  probe-close-rebind TCP sequence, so `EADDRINUSE` cannot arise from benchmark
+  rendezvous allocation. Targeted benchmark and scheduler tests pass; the GPU
+  benchmark should be rerun from the failed command.
+
+## 2026-07-17: Route on Effective Rather Than Immediately Free Capacity
+
+- Decision demand: The corrected memory-skew run achieved perfect reuse in
+  LMPool but routed the entire reuse phase to only ranks 1, 3, and 5. Source
+  ranks 0, 2, and 4 were idle because global routing required immediately free
+  blocks, even though their one-shot pressure cache was locally reclaimable.
+  Round-robin admitted the same requests by reclaiming that cache, so the
+  control-plane approximation suppressed half of the available parallelism.
+- Decision plan: Make global admission match Local Block Manager semantics.
+  Compute effective capacity as current free blocks plus the maximum
+  dependency-safe leaf-first reclamation, protect blocks matched by the incoming
+  prefix, exclude pinned descendants, and prevent concurrent routes from
+  promising the same capacity.
+- Decision implementation: `GlobalBlockManager` now reconstructs reclaimable
+  capacity from ready block hashes, parent links, and pinned IDs. It exposes
+  effective-capacity checks and tracks optimistic block reservations by GPU and
+  sequence. `GlobalScheduler` uses those checks for no-hit selection, prefix
+  owners, load bypass, and capacity fallback, and returns free, reclaimable,
+  effective, and `uses_reclaimable_capacity` diagnostics. The control plane
+  reserves required new blocks by sequence; the target data plane releases the
+  reservation only after first prefill writes KV and publishes a fresh block
+  snapshot. Source blocks in an inflight transfer plan also block themselves
+  and their ancestors from reclaimable-capacity accounting until the plan
+  completes or aborts. Prefix blocks matched by a routed but uncommitted request
+  receive the same temporary protection, preventing a concurrent no-hit route
+  from reclaiming the first request's promised KV. The benchmark reports the
+  resulting `CP reclaim` route rate and separates warm-up, pressure, and reuse
+  mean/P90 TTFT and E2E, so pressure-tail latency cannot hide reuse-stage
+  benefit. Added tests for chain-safe reclamation, pinned and protected
+  descendants, stale snapshots, reservation overcommit, and load bypass to a
+  free-zero rank.
+- Decision result: CPU tests verify that an idle source with no immediate free
+  blocks but enough reclaimable pressure cache is now a valid load-bypass
+  target, while active prefix chains and concurrent reservations remain safe.
+  The next six-GPU memory-skew run must confirm reuse traffic returns to source
+  ranks and LMPool GPU utilization approaches the multi-GPU baseline.
+
+## 2026-07-17: Unify Routing and Foreground Transfer Economics
+
+- Decision demand: Effective-capacity routing restored traffic to all six
+  ranks, but the memory-skew benchmark still trailed multi-GPU by 2.98% in
+  throughput and 4.05% in mean E2E latency. Transfer raised reuse-phase token
+  reuse from 85.40% to 89.82%, yet 33 transferred blocks cost more than the
+  avoided prefill. The fixed load-bypass threshold treated reclaimable capacity
+  as free and did not charge cold targets for missing-prefix recomputation.
+- Decision plan: Compare every route in one token-equivalent cost domain and
+  execute foreground transfer only when frequency-predicted saved prefill
+  exceeds calibrated transfer cost by a safety margin. Keep effective capacity
+  as an admission constraint, not as evidence that a route is cheap.
+- Decision implementation: `GlobalScheduler` now computes per-candidate cost as
+  token-aware queued work plus missing-prefix tokens times
+  `route_prefill_cost_weight`, plus reclaimed blocks times block size and
+  `route_reclaim_cost_weight`. Prefix-owner selection, load bypass, full-owner
+  fallback, no-hit routing, and the route-cache fast path use this model; route
+  metadata reports queue, prefill, reclaim, and total components. Foreground
+  plans report estimated transfer cost, saved prefill, and benefit ratio, and
+  return `low_benefit` below
+  `foreground_transfer_min_benefit_ratio`. That reason uses structural-failure
+  cooldown so the scheduler does not retry an uneconomic plan every cycle. The
+  benchmark exposes all cost weights and prints a `low value` failure counter.
+- Decision result: The complete CPU suite passes with `115 passed, 1 skipped`,
+  and compile/diff validation is clean. Added regressions proving a moderately loaded owner
+  retains a long prefix, a cold transfer is rejected, and a sufficiently hot
+  transfer remains executable. The six-GPU memory-skew benchmark must now show
+  fewer foreground transfers and `low value > 0`; throughput should approach
+  multi-GPU while retaining reuse-phase benefit.
+
+## 2026-07-17: Replace the Saturating Single-Prefix Memory-Skew Trace
+
+- Decision demand: The post-cost-model run reduced transferred blocks from 33
+  to 25 and rejected five low-value plans, but LMPool still trailed multi-GPU
+  throughput by 4.17%. Routing-only and multi-GPU had exactly the same 90.63%
+  reuse request hit and 85.40% token reuse. The policy changed, but the trace
+  still could not expose its value.
+- Decision plan: Check whether the baseline can learn the trace locally before
+  changing the scheduler again. Construct a fair trace where all scenarios see
+  identical requests, placement, KV budget, and phase barriers, but where
+  preserving or routing each prefix remains useful beyond one cold request.
+- Decision implementation: Replaced memory-skew's single hot prefix with an
+  automatically sized set of up to 15 long hot prefixes. Warm-up repeats each
+  group on a deterministic source rank, pressure uses unique prefixes at half
+  the hot-prefix length, and reuse interleaves all hot groups. The automatic
+  group count is odd to avoid alignment with even-sized round-robin GPU cycles;
+  for the six-GPU, 128-request trace it chooses 15. Repeated warm-up hashes,
+  rather than the intersection of the first two requests, now define hot
+  transfer blocks. Added `--memory-skew-prefix-groups` and tests for phase
+  construction, automatic sizing, and invalid values.
+- Decision result: In the old one-prefix trace, round-robin needed only one miss
+  per partner before its remaining requests hit locally, mathematically capping
+  routing's opportunity at roughly three requests. In the new 15-prefix trace,
+  the same 64-request reuse phase visits 30 distinct `(prefix, rank)` pairs;
+  even after warm-up placement, idealized round-robin request reuse is about
+  60.94%, leaving measurable room for routing and transfer. The repository's
+  Qwen tokenizer yields eight blocks per hot prefix and four per pressure
+  prefix; each source receives about 40 hot plus 44 pressure blocks against the
+  common 64-block budget, so the trace creates real capacity pressure. The full
+  CPU suite passes with `116 passed, 1 skipped`; the GPU run must validate
+  actual values.
+
+## 2026-07-17: Preserve Routed Prefix Promises Through Local Admission
+
+- Decision demand: The 15-prefix memory-skew trace reported roughly 40% control-plane
+  route hits but only 10% reuse-phase data-plane request hits. More than 73% of
+  route hits were stale by prefill time, so routing selected valid owners but
+  local admission reclaimed their promised KV while multiple routed requests
+  waited in the worker queue.
+- Decision plan: Carry the matched prefix identity with each routed request and
+  make local reclamation honor all outstanding route promises. Keep the change
+  within existing routing and reclamation boundaries instead of adding another
+  score or cache policy.
+- Decision implementation: `ControlPlaneClient.route_sequence()` now records
+  the matched cumulative prefix hashes on `Sequence.routed_prefix_hashes`, and
+  Sequence multiprocessing serialization preserves that field. Before local
+  admission reclaims cache, `Scheduler` resolves the promised hashes of every
+  waiting request to ready local block IDs and passes them to
+  `BlockManager.reclaim_for_sequence()`. The current request's naturally
+  matched chain and all queued route promises are protected until allocation;
+  once allocated, normal block reference counts provide protection. Added
+  serialization, block-manager, scheduler, and control-plane regressions.
+- Decision result: Focused CPU tests verify that admitting one request cannot
+  evict the prefix promised to the next queued request. The next GPU run should
+  reduce `stale route` substantially and bring reuse request/token hit rates
+  closer to control-plane route coverage.
+
+## 2026-07-17: Allow Hybrid Transfer of Pinned Prefix Chains
+
+- Decision demand: The same memory-skew run executed zero transfers and all 36
+  foreground attempts failed as `no_plan`. The planner rejected an entire
+  prefix chain whenever any ancestor was pinned, although completed KV prefix
+  blocks are immutable and only the source release operation is unsafe for a
+  pinned block.
+- Decision plan: Permit pinned ancestors to be copied as destination
+  dependencies while retaining the existing rule that pinned source blocks can
+  never be released. Continue excluding blocks owned by another inflight plan.
+- Decision implementation: Relaxed chain candidate validation in
+  `GlobalScheduler._select_chain_move_candidates()` so pinned ancestors may be
+  included in transfer payloads. `_dependency_safe_release_order()` remains
+  authoritative for source reclamation and filters all pinned blocks, producing
+  a hybrid plan that copies dependencies and moves only an unpinned leaf or
+  suffix. Added a regression with a pinned root and evictable child.
+- Decision result: Unit coverage verifies that the complete two-block chain is
+  sent while only the unpinned leaf is released. The next memory-skew run should
+  replace at least some `no_plan` failures with successful foreground transfers;
+  profitability checks may still reject low-value chains.

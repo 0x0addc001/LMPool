@@ -15,6 +15,7 @@
     --repetitions 3 \
     --workload locality \
     --locality-prefix-groups 16 \
+    --memory-skew-prefix-groups 15 \
     --world-size 2 \
     --nvlink-pairs "0,1" \
     --kv-block-budget 64 \
@@ -24,6 +25,10 @@
     --background-copy-hot-threshold 3 \
     --route-load-weight 0.03 \
     --route-load-bypass-threshold 256 \
+    --route-prefill-cost-weight 1.0 \
+    --route-reclaim-cost-weight 0.5 \
+    --foreground-transfer-cost-weight 1.0 \
+    --foreground-transfer-min-benefit-ratio 1.5 \
     --route-cache-queue-slack 256 \
     --goodput-e2e-sla-ms 10000 \
     --output-json ./benchmarks/results/shared_prefix_benchmark_202607121117.json \
@@ -65,71 +70,93 @@
   打乱提交顺序，避免前缀组编号与 round-robin rank 周期重合。组数必须在 1 和
   `--num-prompts` 之间；组数越多，未启用 routing 时跨 GPU 重复缓存和 cache churn 越明显。
 
-10. `--output-json`：
+10. `--memory-skew-prefix-groups`：
+  `memory-skew` workload 中需要跨阶段保留的长热点前缀数量。默认 0 表示自动选择不超过 15
+  的最大奇数，使其适配 warmup/reuse 阶段长度。每个热点在 warmup
+  阶段固定到一个 source rank，reuse 阶段交错重放；使用多个热点可防止 round-robin 在第一次
+  miss 后自然把唯一热点复制到所有 GPU。该值不能超过 warmup 或 reuse 阶段请求数。
+
+11. `--output-json`：
   将各场景统计结果导出到指定 JSON 文件。脚本会自动创建父目录，并在成功后打印
   `saved json: ...`。
 
-11. `--model-name-or-path`：
+12. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
-12. `--nvlink-pairs`：
+13. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
   可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
   例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-13. `--world-size`：
+14. `--world-size`：
   多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
   该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
 
-14. `--kv-block-budget`：
+15. `--kv-block-budget`：
   每个 rank 请求使用的 KV block 上限。五个场景必须使用同一个值，避免把容量差异误判成
   routing / transfer 收益；worker 仍会根据实际可用显存把它收敛到可分配的共同上限。
   旧参数 `--routing-max-cached-blocks` 和 `--eviction-max-cached-blocks` 仅保留命令兼容，
   如果同时提供则数值必须完全相同。
 
-15. `--goodput-e2e-sla-ms`：
+16. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-16. `--skip-pool`：
+17. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-17. `--output-figure`：
+18. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-18. `--submit-window`：
+19. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
-19. `--disable-background-copy`：
+20. `--disable-background-copy`：
   关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
   伙伴，服务后续请求；关闭后只保留因当前请求容量不足而同步触发的 foreground transfer。
 
-20. `--background-copy-max-blocks`：
+21. `--background-copy-max-blocks`：
   每次后台 copy 最多复制多少个 prefix block。值越大越可能提高后续本地命中，但会占用更多
   NCCL / worker 时间；排查功能正确性可先用 1，验证收益时建议尝试 2。
 
-21. `--background-copy-cooldown-s`：
+22. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
-22. `--background-copy-hot-threshold`：
+23. `--background-copy-hot-threshold`：
   同一个 prefix 至少被路由命中多少次后才允许后台 copy。值越大越保守，能减少无效 copy；
   值为 1 时退化为旧的 eager speculative copy。
 
-23. `--route-load-weight`：
-  路由打分里 token-aware load 的惩罚权重。值越大越倾向负载均衡，可能降低 route hit，
-  但可以避免热点 prefix owner 吞吐成为瓶颈。
+24. `--route-load-weight`：
+  旧 prefix score 中 token-aware load 的 tie-break 权重。主路由决策现在使用统一预计完成成本；
+  该参数只在成本相同时参与稳定排序，通常保持默认值。
 
-24. `--route-load-bypass-threshold`：
-  prefix owner 比最空闲候选 GPU 高出多少 load score 后，允许绕过 owner。
-  值越小越激进，越容易牺牲 locality 换并行度。
+25. `--route-load-bypass-threshold`：
+  冷目标的预计总成本必须比 prefix owner 至少低多少 token-equivalent cost，才允许绕过
+  owner。值越小越激进，越容易牺牲 locality 换并行度。
 
-25. `--route-cache-queue-slack`：
-  route cache 命中时允许 cached owner 相比最轻载候选多出的 load score。
+26. `--route-prefill-cost-weight`：
+  缺失 prefix token 的重算成本权重。默认 1.0，使一个缺失 token 与一个 waiting token
+  使用相同成本单位；增大后路由更偏向已有 prefix 的 owner。
+
+27. `--route-reclaim-cost-weight`：
+  使用 reclaimable capacity 时，每个待回收 block 按 `block_size * weight` 计入的附加成本。
+  默认 0.5，用于反映回收元数据操作及未来 cache miss 风险。
+
+28. `--foreground-transfer-cost-weight`：
+  一个 transferred block 折算成多少个 block 的 prefill 成本，默认 1.0。可根据
+  `benchmark_kv_transfer.py` 与实测 prefill 时间校准。
+
+29. `--foreground-transfer-min-benefit-ratio`：
+  foreground transfer 预计保留的 prefix prefill 收益与 transfer 成本的最小比值。
+  默认 1.5；未达到门槛时跳过 transfer，直接使用本地回收。
+
+30. `--route-cache-queue-slack`：
+  route cache 命中时允许 cached owner 相比最低成本候选多出的 token-equivalent cost。
   值越小，缓存路由越容易被负载不均打破。
 
 说明：
@@ -155,6 +182,7 @@ import statistics
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
@@ -173,6 +201,18 @@ from lmpool.engine.global_scheduler import GlobalScheduler
 from lmpool.engine.llm_engine import LLMEngine
 from lmpool.engine.sequence import Sequence
 from lmpool.sampling_parameters import SamplingParams
+
+
+def prepare_benchmark_rendezvous(config: dict) -> tuple[dict, Path | None]:
+    """Give each local benchmark trial an independent rendezvous store."""
+    trial_config = dict(config)
+    if trial_config.get("distributed_init_method"):
+        return trial_config, None
+    rendezvous_path = Path("/tmp") / (
+        f"lmpool-rendezvous-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    trial_config["distributed_init_method"] = rendezvous_path.resolve().as_uri()
+    return trial_config, rendezvous_path
 
 
 MODEL_CONFIG = {
@@ -217,9 +257,13 @@ MODEL_CONFIG = {
     "route_running_token_weight": 0.25,
     "route_running_sequence_weight": 32.0,
     "route_load_bypass_threshold": 256.0,
+    "route_prefill_cost_weight": 1.0,
+    "route_reclaim_cost_weight": 0.5,
     "route_cache_queue_slack": 256.0,
     "enable_foreground_rebalance": True,
     "foreground_transfer_min_blocks": 2,
+    "foreground_transfer_cost_weight": 1.0,
+    "foreground_transfer_min_benefit_ratio": 1.5,
     "foreground_transfer_fail_cooldown_s": 2.0,
     "foreground_transfer_fail_cooldown_max_s": 30.0,
     # 后台 speculative copy-style transfer：每次只复制少量热点 prefix block，避免抢占前台推理时间。
@@ -283,6 +327,8 @@ class ScenarioResult:
     transfer_copy_count: int
     transfer_release_count: int
     chain_transfer_count: int
+    hot_transfer_block_count: int
+    hot_transfer_block_ratio: float
     rebalance_success: int
     rebalance_fail: int
     rebalance_fail_reasons: dict[str, int]
@@ -296,6 +342,7 @@ class ScenarioResult:
     rank_stats: dict[int, dict]
     theoretical_prefix_hit_rate: float = 0.0
     route_matched_block_ratio: float = 0.0
+    reclaimable_capacity_route_rate: float = 0.0
     stale_route_hit_rate: float = 0.0
     reuse_phase_request_hit_rate: float = 0.0
     reuse_phase_token_ratio: float = 0.0
@@ -304,6 +351,7 @@ class ScenarioResult:
     goodput_tok_s_std: float = 0.0
     mean_ttft_s_std: float = 0.0
     mean_e2e_s_std: float = 0.0
+    phase_latency_stats: dict[str, dict[str, float]] | None = None
 
 
 def build_shared_prefix(prompt_repeat: int, prefix_group: str = "shared") -> str:
@@ -330,6 +378,7 @@ def build_prompts(
     prompt_repeat: int,
     workload: str = "locality",
     locality_prefix_groups: int = 16,
+    memory_skew_prefix_groups: int = 15,
     seed: int = 0,
 ) -> list[str]:
     # locality: 多组长共享前缀，主要验证 KVCache-aware routing，避免单一前缀被每卡复制后
@@ -354,10 +403,13 @@ def build_prompts(
             for group in range(4)
         ]
     else:
-        # memory-skew uses explicit phases. Warm-up places a reusable hot chain
-        # on source ranks, pressure fills those ranks with one-shot prefixes,
-        # and reuse checks whether transfer preserved the hot chain on partners.
-        hot_prefix = build_shared_prefix(prompt_repeat, "transfer-hot")
+        # Multiple hot chains prevent round-robin from learning the only hot
+        # prefix locally after one miss. Each group is warmed on one source and
+        # revisited in an interleaved reuse phase.
+        hot_prefixes = [
+            build_shared_prefix(prompt_repeat, f"transfer-hot-{group:04d}")
+            for group in range(memory_skew_prefix_groups)
+        ]
         warmup_end = max(1, num_prompts // 4)
         pressure_end = max(warmup_end + 1, num_prompts // 2)
     prompts = []
@@ -368,11 +420,13 @@ def build_prompts(
         elif workload == "load-skew":
             shared_prefix = hot_prefix if i % 4 != 0 else cold_prefixes[(i // 4) % len(cold_prefixes)]
         elif workload == "memory-skew":
-            if i < warmup_end or i >= pressure_end:
-                shared_prefix = hot_prefix
+            if i < warmup_end:
+                shared_prefix = hot_prefixes[i % memory_skew_prefix_groups]
+            elif i >= pressure_end:
+                shared_prefix = hot_prefixes[(i - pressure_end) % memory_skew_prefix_groups]
             else:
                 shared_prefix = build_shared_prefix(
-                    max(1, prompt_repeat // 4),
+                    max(1, prompt_repeat // 2),
                     f"pressure-{i - warmup_end:04d}",
                 )
         else:
@@ -395,6 +449,17 @@ def compute_prefix_hashes(tokenizer, prompts: Iterable[str], block_size: int):
         for prompt in prompts
     ]
     return seqs
+
+
+def compute_sequence_prefix_hashes(seq: Sequence) -> list[int]:
+    """Compute cumulative hashes for every complete logical block in a sequence."""
+    block_manager = BlockManager(num_blocks=1, block_size=seq.block_size)
+    hashes = []
+    prefix_hash = -1
+    for block_index in range(seq.num_tokens // seq.block_size):
+        prefix_hash = block_manager.compute_hash(seq.block(block_index), prefix_hash)
+        hashes.append(prefix_hash)
+    return hashes
 
 
 def _percentile(values: list[float], p: float) -> float:
@@ -430,6 +495,21 @@ def resolve_memory_skew_source_ranks(config: dict) -> list[int]:
         return sorted(set(explicit))
     pairs = config.get("nvlink_topo", {}).get("pairs") or []
     return sorted({int(pair[0]) for pair in pairs}) or [0]
+
+
+def resolve_memory_skew_prefix_groups(num_prompts: int, requested: int) -> int:
+    """Resolve enough hot groups to avoid one-prefix baseline saturation."""
+    warmup_requests = max(1, num_prompts // 4)
+    reuse_requests = num_prompts - max(warmup_requests + 1, num_prompts // 2)
+    maximum = min(warmup_requests, reuse_requests)
+    if requested > 0:
+        if requested > maximum:
+            raise ValueError(
+                "--memory-skew-prefix-groups must fit in both the warmup and reuse phases"
+            )
+        return requested
+    automatic = min(15, maximum)
+    return automatic if automatic % 2 == 1 else max(1, automatic - 1)
 
 
 def _visible_physical_gpu_ids(world_size: int) -> list[int]:
@@ -724,6 +804,8 @@ def run_independent_multi_gpu_benchmark(
             transfer_copy_count=0,
             transfer_release_count=0,
             chain_transfer_count=0,
+            hot_transfer_block_count=0,
+            hot_transfer_block_ratio=0.0,
             rebalance_success=0,
             rebalance_fail=0,
             rebalance_fail_reasons={},
@@ -806,6 +888,7 @@ def run_engine_scenario(
     # prompt 先进入 launcher
     # 再由控制面路由或按 round-robin 分发
     # worker 侧执行 prefill / decode
+    config, rendezvous_path = prepare_benchmark_rendezvous(config)
     engine = LLMEngine(config)
     submit_times: dict[int, float] = {}
     ttfts: list[float] = []
@@ -818,6 +901,7 @@ def run_engine_scenario(
     route_count = 0
     route_matched_blocks = 0
     route_full_blocks = 0
+    reclaimable_capacity_routes = 0
     routed_match_by_seq: dict[int, int] = {}
     stale_route_hits = 0
     prefill_seen_seq_ids: set[int] = set()
@@ -827,6 +911,16 @@ def run_engine_scenario(
     reuse_phase_cached_tokens = 0
     reuse_phase_prompt_tokens = 0
     phase_by_seq: dict[int, str] = {}
+    phase_ttfts: dict[str, list[float]] = {
+        "warmup": [],
+        "pressure": [],
+        "reuse": [],
+    }
+    phase_e2es: dict[str, list[float]] = {
+        "warmup": [],
+        "pressure": [],
+        "reuse": [],
+    }
     initial_cached_tokens = 0
     initial_prompt_tokens = 0
     prefill_attempts = 0
@@ -835,6 +929,7 @@ def run_engine_scenario(
     transfer_copy_count = 0
     transfer_release_count = 0
     chain_transfer_count = 0
+    hot_transfer_block_count = 0
     rebalance_success = 0
     rebalance_fail = 0
     rebalance_fail_reasons: dict[str, int] = {}
@@ -870,6 +965,7 @@ def run_engine_scenario(
                 "copies": 0,
                 "released_blocks": 0,
                 "chain_transfers": 0,
+                "hot_transfer_blocks": 0,
                 "rebalance_success": 0,
                 "rebalance_fail": 0,
                 "background_copy_success": 0,
@@ -892,16 +988,34 @@ def run_engine_scenario(
             pressure_end = max(warmup_end + 1, len(prompts) // 2)
             phase_ends = [warmup_end, pressure_end, len(prompts)]
             source_ranks = resolve_memory_skew_source_ranks(config)
+            warmup_hash_chains = [
+                compute_sequence_prefix_hashes(Sequence(
+                    token_ids=tokenizer.encode(prompts[index]),
+                    block_size=config["block_size"],
+                ))
+                for index in range(warmup_end)
+            ]
+            warmup_hash_frequency: dict[int, int] = {}
+            for chain in warmup_hash_chains:
+                for block_hash in chain:
+                    warmup_hash_frequency[block_hash] = warmup_hash_frequency.get(block_hash, 0) + 1
+            hot_prefix_hashes = {
+                block_hash
+                for block_hash, frequency in warmup_hash_frequency.items()
+                if frequency >= 2
+            }
         else:
             warmup_end = pressure_end = 0
             phase_ends = [len(prompts)]
             source_ranks = [0]
+            hot_prefix_hashes = set()
         current_phase_index = 0
         current_phase_end = phase_ends[current_phase_index]
 
         def submit_prompt(prompt: str, prompt_index: int):
             nonlocal route_hits, routed_to_prefix_owner, route_count
             nonlocal route_matched_blocks, route_full_blocks
+            nonlocal reclaimable_capacity_routes
             seq = Sequence(
                 token_ids=tokenizer.encode(prompt),
                 block_size=config["block_size"],
@@ -909,11 +1023,14 @@ def run_engine_scenario(
             )
             start = time.perf_counter()
             target_rank = 0
-            if workload == "memory-skew" and prompt_index < pressure_end:
+            if workload == "memory-skew" and prompt_index < warmup_end:
                 # Deterministically create placement skew: warm-up and pressure
                 # use only the source side of each NVLink pair. Reuse returns to
                 # the scenario's normal routing/round-robin policy.
-                target_rank = source_ranks[prompt_index % len(source_ranks)]
+                prefix_group = prompt_index % config["memory_skew_prefix_groups"]
+                target_rank = source_ranks[prefix_group % len(source_ranks)]
+            elif workload == "memory-skew" and prompt_index < pressure_end:
+                target_rank = source_ranks[(prompt_index - warmup_end) % len(source_ranks)]
             elif route_mode == "control_plane" and engine.control_plane_client is not None:
                 # 控制面模式：每个请求都先做 prefix hash，再让全局调度器决定落在哪张卡
                 routed = engine.control_plane_client.route_sequence(seq, return_meta=True)
@@ -924,6 +1041,8 @@ def run_engine_scenario(
                 route_matched_blocks += matched_blocks
                 route_full_blocks += seq.num_tokens // seq.block_size
                 routed_match_by_seq[seq.seq_id] = matched_blocks
+                if route_info.get("uses_reclaimable_capacity", False):
+                    reclaimable_capacity_routes += 1
                 if route_info.get("prefix_hit"):
                     route_hits += 1
                     if target_rank in route_info.get("hit_summary", {}):
@@ -968,6 +1087,11 @@ def run_engine_scenario(
                 transfer_copy_count += int(item.get("transfer_copy_count", 0))
                 transfer_release_count += int(item.get("transfer_release_count", 0))
                 chain_transfer_count += int(item.get("chain_transfer_count", 0))
+                transferred_hashes = item.get("transfer_hashes", [])
+                hot_transferred = sum(
+                    block_hash in hot_prefix_hashes for block_hash in transferred_hashes
+                )
+                hot_transfer_block_count += hot_transferred
                 rebalance_success += int(item.get("rebalance_success", 0))
                 rebalance_fail += int(item.get("rebalance_fail", 0))
                 background_copy_success += int(item.get("background_copy_success", 0))
@@ -977,6 +1101,7 @@ def run_engine_scenario(
                 rank_data["copies"] += int(item.get("transfer_copy_count", 0))
                 rank_data["released_blocks"] += int(item.get("transfer_release_count", 0))
                 rank_data["chain_transfers"] += int(item.get("chain_transfer_count", 0))
+                rank_data["hot_transfer_blocks"] += hot_transferred
                 rank_data["rebalance_success"] += int(item.get("rebalance_success", 0))
                 rank_data["rebalance_fail"] += int(item.get("rebalance_fail", 0))
                 rank_data["background_copy_success"] += int(item.get("background_copy_success", 0))
@@ -997,7 +1122,11 @@ def run_engine_scenario(
                     )
             for seq_id, _token in first_tokens:
                 if seq_id in submit_times:
-                    ttfts.append(now - submit_times[seq_id])
+                    ttft = now - submit_times[seq_id]
+                    ttfts.append(ttft)
+                    phase = phase_by_seq.get(seq_id)
+                    if phase in phase_ttfts:
+                        phase_ttfts[phase].append(ttft)
                 # first_tokens are grouped by worker in engine.step().
                 # The rank is not attached to this tuple, so rank-level first-token
                 # counts are reported from the worker runtime stats instead.
@@ -1037,6 +1166,9 @@ def run_engine_scenario(
                 output_tokens = max(len(tokens), 1)
                 ttpts.append(latency / output_tokens)
                 e2es.append(latency)
+                phase = phase_by_seq.get(seq_id)
+                if phase in phase_e2es:
+                    phase_e2es[phase].append(latency)
                 completion_times[seq_id] = now
                 completion_token_counts[seq_id] = len(tokens)
             for rank, stats in rank_stats.items():
@@ -1061,6 +1193,8 @@ def run_engine_scenario(
     finally:
         sampler.stop()
         engine.exit()
+        if rendezvous_path is not None:
+            rendezvous_path.unlink(missing_ok=True)
 
     gpu_util_mean, gpu_util_p95, gpu_mem_util_mean, gpu_mem_util_p95 = sampler.summarize()
     for rank, gpu_stats in sampler.summarize_by_rank().items():
@@ -1104,6 +1238,8 @@ def run_engine_scenario(
         transfer_copy_count=transfer_copy_count,
         transfer_release_count=transfer_release_count,
         chain_transfer_count=chain_transfer_count,
+        hot_transfer_block_count=hot_transfer_block_count,
+        hot_transfer_block_ratio=hot_transfer_block_count / max(transfer_count, 1),
         rebalance_success=rebalance_success,
         rebalance_fail=rebalance_fail,
         rebalance_fail_reasons=rebalance_fail_reasons,
@@ -1116,6 +1252,7 @@ def run_engine_scenario(
         gpu_mem_util_p95=gpu_mem_util_p95,
         rank_stats=rank_stats,
         route_matched_block_ratio=route_matched_blocks / max(route_full_blocks, 1),
+        reclaimable_capacity_route_rate=reclaimable_capacity_routes / max(route_count, 1),
         stale_route_hit_rate=stale_route_hits / max(route_hits, 1),
         reuse_phase_request_hit_rate=(
             len(reuse_phase_hit_seq_ids) / max(len(reuse_phase_seq_ids), 1)
@@ -1123,6 +1260,17 @@ def run_engine_scenario(
         reuse_phase_token_ratio=(
             reuse_phase_cached_tokens / max(reuse_phase_prompt_tokens, 1)
         ),
+        phase_latency_stats={
+            phase: {
+                "requests": float(len(phase_e2es[phase])),
+                "mean_ttft_s": _mean(phase_ttfts[phase]),
+                "p90_ttft_s": _percentile(phase_ttfts[phase], 0.90),
+                "mean_e2e_s": _mean(phase_e2es[phase]),
+                "p90_e2e_s": _percentile(phase_e2es[phase], 0.90),
+            }
+            for phase in ("warmup", "pressure", "reuse")
+            if phase_e2es[phase]
+        },
     )
 
 
@@ -1164,6 +1312,24 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
             if all(isinstance(value, (int, float)) for value in values):
                 rank_stats[rank][key] = statistics.fmean(float(value) for value in values)
 
+    phase_names = sorted(set().union(*(
+        set((result.phase_latency_stats or {}).keys())
+        for result in trials
+    )))
+    phase_latency_stats = {}
+    for phase in phase_names:
+        metric_names = set().union(*(
+            set((result.phase_latency_stats or {}).get(phase, {}).keys())
+            for result in trials
+        ))
+        phase_latency_stats[phase] = {
+            metric: statistics.fmean(
+                float((result.phase_latency_stats or {}).get(phase, {}).get(metric, 0.0))
+                for result in trials
+            )
+            for metric in metric_names
+        }
+
     return ScenarioResult(
         name=trials[0].name,
         total_requests=round(mean_attr("total_requests")),
@@ -1194,6 +1360,8 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         transfer_copy_count=round(mean_attr("transfer_copy_count")),
         transfer_release_count=round(mean_attr("transfer_release_count")),
         chain_transfer_count=round(mean_attr("chain_transfer_count")),
+        hot_transfer_block_count=round(mean_attr("hot_transfer_block_count")),
+        hot_transfer_block_ratio=mean_attr("hot_transfer_block_ratio"),
         rebalance_success=round(mean_attr("rebalance_success")),
         rebalance_fail=round(mean_attr("rebalance_fail")),
         rebalance_fail_reasons=mean_reason_map("rebalance_fail_reasons"),
@@ -1207,6 +1375,7 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         rank_stats=rank_stats,
         theoretical_prefix_hit_rate=mean_attr("theoretical_prefix_hit_rate"),
         route_matched_block_ratio=mean_attr("route_matched_block_ratio"),
+        reclaimable_capacity_route_rate=mean_attr("reclaimable_capacity_route_rate"),
         stale_route_hit_rate=mean_attr("stale_route_hit_rate"),
         reuse_phase_request_hit_rate=mean_attr("reuse_phase_request_hit_rate"),
         reuse_phase_token_ratio=mean_attr("reuse_phase_token_ratio"),
@@ -1215,6 +1384,7 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         goodput_tok_s_std=statistics.pstdev(result.goodput_tok_s for result in trials),
         mean_ttft_s_std=statistics.pstdev(result.mean_ttft_s for result in trials),
         mean_e2e_s_std=statistics.pstdev(result.mean_e2e_s for result in trials),
+        phase_latency_stats=phase_latency_stats,
     )
 
 
@@ -1242,7 +1412,7 @@ def print_summary_table(results: list[ScenarioResult | None]):
         f"{'CP req hit':>11} {'CP owner':>11} {'DP req hit':>11} {'DP tok reuse':>12} "
         f"{'attempts':>9} {'preempt':>8} {'redund tok':>10} {'sent blk':>9} {'retained':>8} "
         f"{'fg ok':>7} {'fg fail':>8} {'bg ok':>7} {'bg fail':>8} "
-        f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'bg space':>8}"
+        f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'low value':>9} {'bg space':>8}"
     )
     for result in valid_results:
         print(
@@ -1272,14 +1442,15 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{result.rebalance_fail_reasons.get('pinned_source', 0):>8} "
             f"{result.rebalance_fail_reasons.get('no_target_space', 0):>9} "
             f"{result.rebalance_fail_reasons.get('no_plan', 0):>8} "
+            f"{result.rebalance_fail_reasons.get('low_benefit', 0):>9} "
             f"{result.background_copy_fail_reasons.get('no_target_space', 0):>8}"
         )
 
     print("\nPrefix Diagnostics")
-    print("=" * 112)
+    print("=" * 140)
     print(
         f"{'scenario':<22} {'trace upper':>12} {'CP blk match':>13} "
-        f"{'CP req hit':>11} {'CP stale':>12} {'DP req hit':>11} "
+        f"{'CP req hit':>11} {'CP reclaim':>12} {'CP stale':>12} {'DP req hit':>11} "
         f"{'DP tok reuse':>12} {'actual blocks/rank':>20}"
     )
     for result in valid_results:
@@ -1292,6 +1463,7 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{fmt_pct(result.theoretical_prefix_hit_rate):>12} "
             f"{fmt_pct(result.route_matched_block_ratio):>13} "
             f"{fmt_pct(result.route_hit_rate):>11} "
+            f"{fmt_pct(result.reclaimable_capacity_route_rate):>12} "
             f"{fmt_pct(result.stale_route_hit_rate):>12} "
             f"{fmt_pct(result.prefix_hit_rate):>11} "
             f"{fmt_pct(result.initial_cached_token_ratio):>12} "
@@ -1299,10 +1471,11 @@ def print_summary_table(results: list[ScenarioResult | None]):
         )
 
     print("\nTransfer Diagnostics")
-    print("=" * 128)
+    print("=" * 151)
     print(
         f"{'scenario':<22} {'sent blocks':>12} {'source kept':>12} "
-        f"{'source freed':>13} {'chain plans':>12} {'reuse req hit':>14} "
+        f"{'source freed':>13} {'chain plans':>12} {'hot sent':>10} {'hot ratio':>11} "
+        f"{'reuse req hit':>14} "
         f"{'reuse tok ratio':>15} {'fg ok':>8} {'fg fail':>9}"
     )
     for result in valid_results:
@@ -1312,11 +1485,35 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{result.transfer_copy_count:>12} "
             f"{result.transfer_release_count:>13} "
             f"{result.chain_transfer_count:>12} "
+            f"{result.hot_transfer_block_count:>10} "
+            f"{fmt_pct(result.hot_transfer_block_ratio):>11} "
             f"{fmt_pct(result.reuse_phase_request_hit_rate):>14} "
             f"{fmt_pct(result.reuse_phase_token_ratio):>15} "
             f"{result.rebalance_success:>8} "
             f"{result.rebalance_fail:>9}"
         )
+
+    if any(result.phase_latency_stats for result in valid_results):
+        print("\nMemory-Skew Phase Latency")
+        print("=" * 104)
+        print(
+            f"{'scenario':<22} {'phase':<10} {'requests':>10} "
+            f"{'mean TTFT(ms)':>15} {'p90 TTFT(ms)':>15} "
+            f"{'mean E2E(ms)':>15} {'p90 E2E(ms)':>15}"
+        )
+        for result in valid_results:
+            for phase in ("warmup", "pressure", "reuse"):
+                stats = (result.phase_latency_stats or {}).get(phase)
+                if not stats:
+                    continue
+                print(
+                    f"{result.name:<22} {phase:<10} "
+                    f"{int(round(stats.get('requests', 0.0))):>10} "
+                    f"{stats.get('mean_ttft_s', 0.0) * 1000:>15.2f} "
+                    f"{stats.get('p90_ttft_s', 0.0) * 1000:>15.2f} "
+                    f"{stats.get('mean_e2e_s', 0.0) * 1000:>15.2f} "
+                    f"{stats.get('p90_e2e_s', 0.0) * 1000:>15.2f}"
+                )
 
     if any(result.repetitions > 1 for result in valid_results):
         print("\nRepeated-run variability (mean +/- population stddev)")
@@ -1631,6 +1828,7 @@ def parse_args():
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--workload", choices=["locality", "load-skew", "memory-skew"], default="locality")
     parser.add_argument("--locality-prefix-groups", type=int, default=16)
+    parser.add_argument("--memory-skew-prefix-groups", type=int, default=0)
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--model-name-or-path", type=str, default=MODEL_CONFIG["model_name_or_path"])
     parser.add_argument("--nvlink-pairs", type=str, default="0,1")
@@ -1651,6 +1849,26 @@ def parse_args():
         "--route-load-bypass-threshold",
         type=float,
         default=MODEL_CONFIG["route_load_bypass_threshold"],
+    )
+    parser.add_argument(
+        "--route-prefill-cost-weight",
+        type=float,
+        default=MODEL_CONFIG["route_prefill_cost_weight"],
+    )
+    parser.add_argument(
+        "--route-reclaim-cost-weight",
+        type=float,
+        default=MODEL_CONFIG["route_reclaim_cost_weight"],
+    )
+    parser.add_argument(
+        "--foreground-transfer-cost-weight",
+        type=float,
+        default=MODEL_CONFIG["foreground_transfer_cost_weight"],
+    )
+    parser.add_argument(
+        "--foreground-transfer-min-benefit-ratio",
+        type=float,
+        default=MODEL_CONFIG["foreground_transfer_min_benefit_ratio"],
     )
     parser.add_argument("--route-cache-queue-slack", type=float, default=MODEL_CONFIG["route_cache_queue_slack"])
     return parser.parse_args()
@@ -1699,6 +1917,12 @@ def apply_background_copy_args(config: dict, args) -> None:
 def apply_route_args(config: dict, args) -> None:
     config["route_load_weight"] = args.route_load_weight
     config["route_load_bypass_threshold"] = args.route_load_bypass_threshold
+    config["route_prefill_cost_weight"] = args.route_prefill_cost_weight
+    config["route_reclaim_cost_weight"] = args.route_reclaim_cost_weight
+    config["foreground_transfer_cost_weight"] = args.foreground_transfer_cost_weight
+    config["foreground_transfer_min_benefit_ratio"] = (
+        args.foreground_transfer_min_benefit_ratio
+    )
     config["route_cache_queue_slack"] = args.route_cache_queue_slack
 
 
@@ -1722,6 +1946,13 @@ def main():
         raise SystemExit(str(exc)) from exc
     if args.workload == "locality" and not 1 <= args.locality_prefix_groups <= args.num_prompts:
         raise SystemExit("--locality-prefix-groups must be between 1 and --num-prompts")
+    try:
+        memory_skew_prefix_groups = resolve_memory_skew_prefix_groups(
+            args.num_prompts,
+            args.memory_skew_prefix_groups,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     visible_gpus = torch.cuda.device_count()
     if args.world_size > visible_gpus:
         raise SystemExit(
@@ -1737,6 +1968,7 @@ def main():
         args.prompt_repeat,
         args.workload,
         locality_prefix_groups=args.locality_prefix_groups,
+        memory_skew_prefix_groups=memory_skew_prefix_groups,
         seed=args.seed,
     )
 
@@ -1757,6 +1989,7 @@ def main():
         config["benchmark_memory_skew_source_ranks"] = (
             [0] if config["world_size"] == 1 else memory_skew_source_ranks
         )
+        config["memory_skew_prefix_groups"] = memory_skew_prefix_groups
 
     # single-gpu baseline：单卡独立执行，不启用全局池
     baseline_config = make_config(1, False, None)
@@ -1832,6 +2065,7 @@ def main():
     apply_memory_skew_placement(eviction_config)
     eviction_config["preserve_cache_via_transfer"] = args.workload == "memory-skew"
     apply_background_copy_args(eviction_config, args)
+    apply_route_args(eviction_config, args)
     kv_eviction = run_repeated_engine_scenario(
         args.repetitions,
         name="multi-gpu-kv-transfer",

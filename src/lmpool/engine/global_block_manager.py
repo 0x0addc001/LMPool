@@ -153,10 +153,12 @@ class GlobalBlockManager:
         self.free_blocks_per_gpu: List[int] = [num_blocks_per_gpu] * world_size
         # 每 GPU 的已用块访问时间：gpu_id -> {block_id: last_access_time}
         self.block_access_time: List[Dict[int, float]] = [{} for _ in range(world_size)]
+        self.block_access_count: List[Dict[int, int]] = [{} for _ in range(world_size)]
         # 每 GPU 的块 hash 记录：gpu_id -> {block_id: hash}
         self.block_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
         self.block_parent_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
         self.pinned_block_ids: List[set[int]] = [set() for _ in range(world_size)]
+        self.transfer_inflight_block_ids: List[set[int]] = [set() for _ in range(world_size)]
         # 每 GPU 的调度队列快照，由 data-plane worker 随 block_state 上报
         self.waiting_sequences_per_gpu: List[int] = [0] * world_size
         self.running_sequences_per_gpu: List[int] = [0] * world_size
@@ -168,6 +170,10 @@ class GlobalBlockManager:
         self.pending_sequences_per_gpu: List[int] = [0] * world_size
         self.pending_tokens_per_gpu: List[int] = [0] * world_size
         self.pending_route_tokens: List[Dict[int, int]] = [{} for _ in range(world_size)]
+        self.pending_route_blocks: List[Dict[int, int]] = [{} for _ in range(world_size)]
+        self.pending_route_protected_blocks: List[Dict[int, set[int]]] = [
+            {} for _ in range(world_size)
+        ]
 
     @property
     def is_master(self) -> bool:
@@ -185,6 +191,7 @@ class GlobalBlockManager:
         waiting_tokens: int = 0,
         running_tokens: int = 0,
         block_parent_hashes: Optional[Dict[int, int]] = None,
+        block_access_stats: Optional[Dict[int, dict]] = None,
     ):
         """
         Master-only state ingestion boundary.
@@ -196,7 +203,7 @@ class GlobalBlockManager:
         if not self.is_master:
             return
 
-        now = time.time()
+        now = time.monotonic()
         self.free_blocks_per_gpu[gpu_id] = free_blocks
         self.waiting_sequences_per_gpu[gpu_id] = max(0, int(waiting_sequences))
         self.running_sequences_per_gpu[gpu_id] = max(0, int(running_sequences))
@@ -217,28 +224,76 @@ class GlobalBlockManager:
         self.block_parent_hash[gpu_id] = dict(block_parent_hashes or {})
         self.pinned_block_ids[gpu_id] = set((pinned_block_hashes or {}).keys())
         evictable = block_hashes if evictable_block_hashes is None else evictable_block_hashes
-        self.block_access_time[gpu_id] = {block_id: now for block_id in evictable}
+        access_stats = block_access_stats or {}
+        self.block_access_time[gpu_id] = {
+            block_id: float(access_stats.get(block_id, {}).get("last_access_time", now))
+            for block_id in evictable
+        }
+        self.block_access_count[gpu_id] = {
+            block_id: max(1, int(access_stats.get(block_id, {}).get("access_count", 1)))
+            for block_id in block_hashes
+        }
 
         for block_id, block_hash in block_hashes.items():
             if block_hash == -1:
                 continue
             self.global_page_table.setdefault(block_hash, []).append(
-                BlockLocation(gpu_id, block_id, block_hash, now)
+                BlockLocation(
+                    gpu_id,
+                    block_id,
+                    block_hash,
+                    float(access_stats.get(block_id, {}).get("last_access_time", now)),
+                )
             )
 
-    def reserve_blocks(self, gpu_id: int, num_blocks: int):
+    def reserve_blocks(
+        self,
+        gpu_id: int,
+        num_blocks: int,
+        seq_id: Optional[int] = None,
+        protected_block_ids: Optional[List[int]] = None,
+    ):
         """
         Master-only optimistic reservation for requests routed to a worker.
 
-        The worker later reports the exact local BlockManager state through
-        update_gpu_state(), which overwrites this estimate.
+        Sequence-scoped reservations survive stale worker snapshots and are
+        removed only after first prefill commits. The legacy unscoped path
+        still deducts immediately from the free-block snapshot.
         """
         if not self.is_master:
+            return
+        if seq_id is not None:
+            self.pending_route_blocks[gpu_id].setdefault(
+                int(seq_id),
+                max(0, int(num_blocks)),
+            )
+            self.pending_route_protected_blocks[gpu_id].setdefault(
+                int(seq_id),
+                set(protected_block_ids or []),
+            )
             return
         self.free_blocks_per_gpu[gpu_id] = max(
             0,
             self.free_blocks_per_gpu[gpu_id] - num_blocks,
         )
+
+    def acknowledge_route_blocks(self, gpu_id: int, seq_id: int) -> None:
+        """Release an optimistic block reservation after first prefill commits."""
+        if not self.is_master:
+            return
+        self.pending_route_blocks[gpu_id].pop(int(seq_id), None)
+        self.pending_route_protected_blocks[gpu_id].pop(int(seq_id), None)
+
+    def get_pending_route_blocks_count(self, gpu_id: int) -> int:
+        return sum(self.pending_route_blocks[gpu_id].values())
+
+    def mark_transfer_blocks_inflight(self, block_keys: set[tuple[int, int]]) -> None:
+        for gpu_id, block_id in block_keys:
+            self.transfer_inflight_block_ids[gpu_id].add(block_id)
+
+    def release_transfer_blocks_inflight(self, block_keys: set[tuple[int, int]]) -> None:
+        for gpu_id, block_id in block_keys:
+            self.transfer_inflight_block_ids[gpu_id].discard(block_id)
 
     def reserve_route_load(
         self,
@@ -338,11 +393,81 @@ class GlobalBlockManager:
         检查指定 GPU 是否有足够空闲块。
         如果不够，返回 False，由上层调用 select_eviction_candidates + transfer。
         """
-        return self.free_blocks_per_gpu[gpu_id] >= num_blocks
+        return self.get_free_blocks_count(gpu_id) >= num_blocks
 
     def get_free_blocks_count(self, gpu_id: int) -> int:
-        """获取指定 GPU 当前空闲块数量"""
-        return self.free_blocks_per_gpu[gpu_id]
+        """Return unreserved free blocks from the latest worker snapshot."""
+        return max(
+            0,
+            self.free_blocks_per_gpu[gpu_id] - self.get_pending_route_blocks_count(gpu_id),
+        )
+
+    def get_reclaimable_blocks_count(
+        self,
+        gpu_id: int,
+        protected_block_ids: Optional[List[int]] = None,
+    ) -> int:
+        """Count blocks local reclamation can release without orphaning KV.
+
+        Workers report all ready blocks, their parent hashes, and the subset
+        still referenced by active sequences. Simulate leaf-first reclamation
+        over that snapshot so pinned or request-protected descendants keep
+        their ancestors unavailable.
+        """
+        remaining = {
+            block_id
+            for block_id, block_hash in self.block_hash[gpu_id].items()
+            if block_hash != -1
+        }
+        blocked = set(self.pinned_block_ids[gpu_id])
+        blocked.update(self.transfer_inflight_block_ids[gpu_id])
+        for pending_blocks in self.pending_route_protected_blocks[gpu_id].values():
+            blocked.update(pending_blocks)
+        blocked.update(protected_block_ids or [])
+        reclaimed = 0
+        while remaining:
+            parent_hashes = {
+                self.block_parent_hash[gpu_id].get(block_id, -1)
+                for block_id in remaining
+                if self.block_parent_hash[gpu_id].get(block_id, -1) != -1
+            }
+            leaves = {
+                block_id
+                for block_id in remaining
+                if (
+                    block_id not in blocked
+                    and self.block_hash[gpu_id][block_id] not in parent_hashes
+                )
+            }
+            if not leaves:
+                break
+            remaining.difference_update(leaves)
+            reclaimed += len(leaves)
+        return reclaimed
+
+    def get_effective_capacity(
+        self,
+        gpu_id: int,
+        protected_block_ids: Optional[List[int]] = None,
+    ) -> int:
+        """Return free plus dependency-safe locally reclaimable capacity."""
+        return max(
+            0,
+            self.free_blocks_per_gpu[gpu_id]
+            + self.get_reclaimable_blocks_count(gpu_id, protected_block_ids)
+            - self.get_pending_route_blocks_count(gpu_id),
+        )
+
+    def can_allocate_effective(
+        self,
+        gpu_id: int,
+        num_blocks: int,
+        protected_block_ids: Optional[List[int]] = None,
+    ) -> bool:
+        return self.get_effective_capacity(gpu_id, protected_block_ids) >= max(
+            0,
+            int(num_blocks),
+        )
 
     def get_queue_pressure(self, gpu_id: int) -> float:
         """
@@ -383,7 +508,7 @@ class GlobalBlockManager:
 
     def get_global_free_blocks_count(self) -> int:
         """获取集群总空闲块数量"""
-        return sum(self.free_blocks_per_gpu)
+        return sum(self.get_free_blocks_count(gpu_id) for gpu_id in range(self.world_size))
 
     # ------------------------------------------------------------------
     # 全局分配
@@ -418,10 +543,11 @@ class GlobalBlockManager:
 
     def _commit_alloc(self, gpu_id: int, block_ids: List[int], hashes: List[int]):
         """提交分配：更新空闲计数、访问时间、全局页表"""
-        now = time.time()
+        now = time.monotonic()
         for bid, h in zip(block_ids, hashes):
             self.free_blocks_per_gpu[gpu_id] -= 1
             self.block_access_time[gpu_id][bid] = now
+            self.block_access_count[gpu_id][bid] = 1
             self.block_hash[gpu_id][bid] = h
             self.global_page_table.setdefault(h, []).append(
                 BlockLocation(gpu_id, bid, h, now)
@@ -438,6 +564,7 @@ class GlobalBlockManager:
             self.free_blocks_per_gpu[gpu_id] += 1
             # 从访问时间中移除
             self.block_access_time[gpu_id].pop(bid, None)
+            self.block_access_count[gpu_id].pop(bid, None)
             # 从全局页表中移除
             h = self.block_hash[gpu_id].pop(bid, None)
             self.block_parent_hash[gpu_id].pop(bid, None)
@@ -461,7 +588,7 @@ class GlobalBlockManager:
         allow_recursive: bool = True,
     ) -> List[Tuple[int, int]]:
         """
-        从指定 GPU 选择 num_blocks 个 LRU 冷块作为 transfer 候选
+        从指定 GPU 选择 num_blocks 个 LFU/LRU 冷块作为 transfer 候选
         
         transfer 目标选择策略：
         1. 只考虑 NVLink 直连伙伴作为目标 GPU
@@ -483,7 +610,10 @@ class GlobalBlockManager:
 
         sorted_blocks = sorted(
             self.block_access_time[gpu_id].items(),
-            key=lambda kv: kv[1]  # 按 last_access_time 升序（最老的优先驱逐）
+            key=lambda kv: (
+                self.block_access_count[gpu_id].get(kv[0], 1),
+                kv[1],
+            ),
         )
         cold_blocks = [bid for bid, _ in sorted_blocks[:num_blocks]]
 
@@ -514,6 +644,7 @@ class GlobalBlockManager:
                 if victim_block is None:
                     return []
                 self.block_access_time[target].pop(victim_block, None)
+                self.block_access_count[target].pop(victim_block, None)
                 h = self.block_hash[target].pop(victim_block, None)
                 if h is not None and h in self.global_page_table:
                     self.global_page_table[h] = [
@@ -526,10 +657,16 @@ class GlobalBlockManager:
         return candidates
 
     def _select_remote_victim(self, gpu_id: int) -> Optional[int]:
-        """在指定 GPU 上选出一个 LRU 最冷的块作为二级驱逐候选"""
+        """在指定 GPU 上选出一个 LFU/LRU 最冷的二级驱逐候选。"""
         if not self.block_access_time[gpu_id]:
             return None
-        return min(self.block_access_time[gpu_id], key=self.block_access_time[gpu_id].get)
+        return min(
+            self.block_access_time[gpu_id],
+            key=lambda block_id: (
+                self.block_access_count[gpu_id].get(block_id, 1),
+                self.block_access_time[gpu_id][block_id],
+            ),
+        )
 
     # ------------------------------------------------------------------
     # 块迁移记录
@@ -554,11 +691,12 @@ class GlobalBlockManager:
         if new_block_id is None:
             new_block_id = block_id
 
-        now = time.time()
+        now = time.monotonic()
 
         # 从源 GPU 移除
         self.free_blocks_per_gpu[src_gpu] += 1
         self.block_access_time[src_gpu].pop(block_id, None)
+        access_count = self.block_access_count[src_gpu].pop(block_id, 1)
         h = self.block_hash[src_gpu].pop(block_id, None)
         parent_hash = self.block_parent_hash[src_gpu].pop(block_id, -1)
         self.pinned_block_ids[src_gpu].discard(block_id)
@@ -574,6 +712,7 @@ class GlobalBlockManager:
         # 在目标 GPU 上注册
         self.free_blocks_per_gpu[dst_gpu] -= 1
         self.block_access_time[dst_gpu][new_block_id] = now
+        self.block_access_count[dst_gpu][new_block_id] = access_count
         if h is not None:
             self.block_hash[dst_gpu][new_block_id] = h
             self.block_parent_hash[dst_gpu][new_block_id] = parent_hash
@@ -594,11 +733,12 @@ class GlobalBlockManager:
         与 record_block_transfer 不同，copy 不释放源 GPU 的块，只在目标 GPU
         注册一个新的副本位置。
         """
-        now = time.time()
+        now = time.monotonic()
         h = self.block_hash[src_gpu].get(block_id)
         parent_hash = self.block_parent_hash[src_gpu].get(block_id, -1)
         self.free_blocks_per_gpu[dst_gpu] -= 1
         self.block_access_time[dst_gpu][new_block_id] = now
+        self.block_access_count[dst_gpu][new_block_id] = self.block_access_count[src_gpu].get(block_id, 1)
         if h is not None:
             self.block_hash[dst_gpu][new_block_id] = h
             self.block_parent_hash[dst_gpu][new_block_id] = parent_hash

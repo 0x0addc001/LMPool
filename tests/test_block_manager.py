@@ -192,6 +192,30 @@ def test_reclaim_cached_blocks_preserves_shared_ancestor_until_branches_are_gone
     assert ancestor not in bm.used_block_ids
 
 
+def test_reclaim_cached_blocks_prefers_low_frequency_over_older_hot_block():
+    bm = BlockManager(num_blocks=2, block_size=2)
+    hot = Sequence([1, 2], block_size=2)
+    cold = Sequence([3, 4], block_size=2)
+
+    bm.allocate(hot)
+    bm.mark_kv_ready([hot])
+    hot_id = hot.block_table[0]
+    bm.deallocate(hot)
+    bm.allocate(cold)
+    bm.mark_kv_ready([cold])
+    cold_id = cold.block_table[0]
+    bm.deallocate(cold)
+
+    bm.blocks[hot_id].access_count = 8
+    bm.blocks[hot_id].last_access_time = 1.0
+    bm.blocks[cold_id].access_count = 1
+    bm.blocks[cold_id].last_access_time = 10.0
+
+    assert bm.reclaim_cached_blocks(1) == 1
+    assert hot_id in bm.used_block_ids
+    assert cold_id not in bm.used_block_ids
+
+
 def test_reclaim_for_sequence_evicts_lru_cache_but_keeps_required_prefix():
     bm = BlockManager(num_blocks=2, block_size=2)
     old = Sequence([1, 2], block_size=2)
@@ -211,6 +235,26 @@ def test_reclaim_for_sequence_evicts_lru_cache_but_keeps_required_prefix():
     assert old_id in bm.free_block_ids
     assert keep_id not in bm.free_block_ids
     assert bm.can_allocate(incoming) is True
+
+
+def test_reclaim_for_sequence_keeps_other_routed_waiting_prefixes():
+    bm = BlockManager(num_blocks=3, block_size=2)
+    first = Sequence([1, 2], block_size=2)
+    promised = Sequence([3, 4], block_size=2)
+    for seq in (first, promised):
+        bm.allocate(seq)
+        bm.mark_kv_ready([seq])
+        bm.deallocate(seq)
+
+    first_id = bm.hash_to_block_id[bm.compute_hash([1, 2], -1)]
+    promised_hash = bm.compute_hash([3, 4], -1)
+    promised_id = bm.hash_to_block_id[promised_hash]
+    incoming = Sequence([5, 6, 7, 8], block_size=2)
+
+    protected = bm.resolve_cached_block_ids([promised_hash])
+    assert bm.reclaim_for_sequence(incoming, protected_block_ids=protected) == 1
+    assert first_id in bm.free_block_ids
+    assert promised_id not in bm.free_block_ids
 
 
 def test_transfer_in_block_can_be_reused_as_trusted_prefix_hit():
