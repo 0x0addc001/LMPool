@@ -35,7 +35,7 @@ def test_route_sequence_meta_does_not_overweight_duplicate_prefix_replicas():
 
 def test_route_sequence_meta_falls_back_when_prefix_owner_has_no_space():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
-    gbm.free_blocks_per_gpu = [4, 1]
+    gbm.free_blocks_per_gpu = [4, 0]
     gbm.global_page_table = {
         456: [
             BlockLocation(1, 0, 456, 1.0),
@@ -60,7 +60,7 @@ def test_route_sequence_meta_falls_back_when_prefix_owner_has_no_space():
 
 def test_route_sequence_meta_requests_rebalance_only_when_all_candidates_are_full():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
-    gbm.free_blocks_per_gpu = [1, 1]
+    gbm.free_blocks_per_gpu = [0, 0]
     gbm.global_page_table = {456: [BlockLocation(1, 0, 456, 1.0)]}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
 
@@ -75,6 +75,54 @@ def test_route_sequence_meta_requests_rebalance_only_when_all_candidates_are_ful
 
     assert target == 1
     assert info["reason"] == "prefix_hit_needs_rebalance"
+
+
+def test_route_sequence_meta_uses_longest_contiguous_prefix_when_deepest_hash_misses():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [8, 2]
+    gbm.global_page_table = {
+        11: [BlockLocation(1, 0, 11, 1.0)],
+        22: [BlockLocation(1, 1, 22, 1.0)],
+    }
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=0,
+        seq_id=12,
+        num_tokens=8,
+        num_blocks=4,
+        prefix_hash=33,
+        prefix_hashes=[11, 22, 33],
+        return_info=True,
+    )
+
+    assert target == 1
+    assert info["matched_prefix_blocks"] == 2
+    assert info["required_new_blocks"] == 2
+    assert info["hit_summary"] == {1: [0, 1]}
+
+
+def test_route_sequence_meta_rejects_noncontiguous_deep_hash():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [8, 2]
+    gbm.global_page_table = {
+        22: [BlockLocation(1, 1, 22, 1.0)],
+    }
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=0,
+        seq_id=13,
+        num_tokens=6,
+        num_blocks=3,
+        prefix_hash=22,
+        prefix_hashes=[11, 22],
+        return_info=True,
+    )
+
+    assert target == 0
+    assert info["prefix_hit"] is False
+    assert info["reason"] == "most_free_no_prefix_hit"
 
 
 def test_route_sequence_meta_falls_back_to_free_gpu_on_prefix_miss():
@@ -228,9 +276,65 @@ def test_plan_rebalance_groups_transfers():
     assert plan is not None
     assert plan["gpu_id"] == 0
     assert plan["needed_blocks"] == 1
-    assert plan["mode"] == "move"
+    assert plan["mode"] == "chain_move"
     assert plan["transfers"][0]["src_gpu"] == 0
-    assert plan["transfers"][0]["mode"] == "move"
+    assert plan["transfers"][0]["mode"] == "chain_move"
+
+
+def test_plan_rebalance_transfers_complete_chain_and_releases_only_leaf():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_hash[0] = {0: 11, 1: 22}
+    gbm.block_parent_hash[0] = {0: -1, 1: 11}
+    gbm.block_access_time[0] = {1: 5.0}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    transfer = plan["transfers"][0]
+    assert transfer["mode"] == "chain_move"
+    assert transfer["src_blocks"] == [0, 1]
+    assert transfer["hashes"] == [11, 22]
+    assert transfer["parent_hashes"] == [-1, 11]
+    assert transfer["release_source_blocks"] == [1]
+
+
+def test_plan_rebalance_reuses_ancestors_already_present_on_target():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 1]
+    gbm.block_hash[0] = {0: 11, 1: 22}
+    gbm.block_parent_hash[0] = {0: -1, 1: 11}
+    gbm.block_access_time[0] = {1: 5.0}
+    gbm.block_hash[1] = {0: 11}
+    gbm.global_page_table = {
+        11: [BlockLocation(0, 0, 11, 1.0), BlockLocation(1, 0, 11, 1.0)],
+        22: [BlockLocation(0, 1, 22, 1.0)],
+    }
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    transfer = plan["transfers"][0]
+    assert transfer["src_blocks"] == [1]
+    assert transfer["release_source_blocks"] == [1]
+
+
+def test_plan_rebalance_shares_one_planned_ancestor_across_two_branches():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 3]
+    gbm.block_hash[0] = {0: 11, 1: 22, 2: 33}
+    gbm.block_parent_hash[0] = {0: -1, 1: 11, 2: 11}
+    gbm.block_access_time[0] = {1: 5.0, 2: 6.0}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=2)
+
+    assert plan is not None
+    transfer = plan["transfers"][0]
+    assert transfer["src_blocks"] == [0, 1, 2]
+    assert transfer["release_source_blocks"] == [1, 2]
 
 
 def test_plan_rebalance_excludes_source_blocks_reserved_by_pending_plans():

@@ -1,7 +1,7 @@
 """
 全局块管理器 (Global Block Manager)
 
-负责跨 GPU 的 KV cache 块状态同步、全局 LRU 冷块选择和 transfer 目标决策
+负责跨 GPU 的 KV cache 块状态同步、全局冷块选择和 transfer 目标决策
 设计要点：
 1. 全局页表：hash -> 该 hash 的块分布在哪些 GPU 上（一对多）
 2. NVLink 拓扑感知的 transfer 目标选择：只考虑 NVLink 直连伙伴
@@ -155,6 +155,8 @@ class GlobalBlockManager:
         self.block_access_time: List[Dict[int, float]] = [{} for _ in range(world_size)]
         # 每 GPU 的块 hash 记录：gpu_id -> {block_id: hash}
         self.block_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
+        self.block_parent_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
+        self.pinned_block_ids: List[set[int]] = [set() for _ in range(world_size)]
         # 每 GPU 的调度队列快照，由 data-plane worker 随 block_state 上报
         self.waiting_sequences_per_gpu: List[int] = [0] * world_size
         self.running_sequences_per_gpu: List[int] = [0] * world_size
@@ -182,6 +184,7 @@ class GlobalBlockManager:
         running_sequences: int = 0,
         waiting_tokens: int = 0,
         running_tokens: int = 0,
+        block_parent_hashes: Optional[Dict[int, int]] = None,
     ):
         """
         Master-only state ingestion boundary.
@@ -211,6 +214,8 @@ class GlobalBlockManager:
                     del self.global_page_table[old_hash]
 
         self.block_hash[gpu_id] = dict(block_hashes)
+        self.block_parent_hash[gpu_id] = dict(block_parent_hashes or {})
+        self.pinned_block_ids[gpu_id] = set((pinned_block_hashes or {}).keys())
         evictable = block_hashes if evictable_block_hashes is None else evictable_block_hashes
         self.block_access_time[gpu_id] = {block_id: now for block_id in evictable}
 
@@ -435,6 +440,8 @@ class GlobalBlockManager:
             self.block_access_time[gpu_id].pop(bid, None)
             # 从全局页表中移除
             h = self.block_hash[gpu_id].pop(bid, None)
+            self.block_parent_hash[gpu_id].pop(bid, None)
+            self.pinned_block_ids[gpu_id].discard(bid)
             if h is not None and h in self.global_page_table:
                 self.global_page_table[h] = [
                     loc for loc in self.global_page_table[h]
@@ -553,6 +560,8 @@ class GlobalBlockManager:
         self.free_blocks_per_gpu[src_gpu] += 1
         self.block_access_time[src_gpu].pop(block_id, None)
         h = self.block_hash[src_gpu].pop(block_id, None)
+        parent_hash = self.block_parent_hash[src_gpu].pop(block_id, -1)
+        self.pinned_block_ids[src_gpu].discard(block_id)
 
         if h is not None and h in self.global_page_table:
             self.global_page_table[h] = [
@@ -567,6 +576,7 @@ class GlobalBlockManager:
         self.block_access_time[dst_gpu][new_block_id] = now
         if h is not None:
             self.block_hash[dst_gpu][new_block_id] = h
+            self.block_parent_hash[dst_gpu][new_block_id] = parent_hash
             self.global_page_table.setdefault(h, []).append(
                 BlockLocation(dst_gpu, new_block_id, h, now)
             )
@@ -586,10 +596,12 @@ class GlobalBlockManager:
         """
         now = time.time()
         h = self.block_hash[src_gpu].get(block_id)
+        parent_hash = self.block_parent_hash[src_gpu].get(block_id, -1)
         self.free_blocks_per_gpu[dst_gpu] -= 1
         self.block_access_time[dst_gpu][new_block_id] = now
         if h is not None:
             self.block_hash[dst_gpu][new_block_id] = h
+            self.block_parent_hash[dst_gpu][new_block_id] = parent_hash
             self.global_page_table.setdefault(h, []).append(
                 BlockLocation(dst_gpu, new_block_id, h, now)
             )
@@ -597,6 +609,36 @@ class GlobalBlockManager:
     def get_block_hash(self, gpu_id: int, block_id: int) -> Optional[int]:
         """获取指定块的内容 hash"""
         return self.block_hash[gpu_id].get(block_id)
+
+    def get_block_parent_hash(self, gpu_id: int, block_id: int) -> int:
+        """Return the cumulative hash of the previous prefix block."""
+        return self.block_parent_hash[gpu_id].get(block_id, -1)
+
+    def get_prefix_chain(self, gpu_id: int, leaf_block_id: int) -> List[int]:
+        """Return a root-to-leaf physical block chain located on one GPU."""
+        if leaf_block_id not in self.block_hash[gpu_id]:
+            return []
+        hash_to_block = {
+            block_hash: block_id
+            for block_id, block_hash in self.block_hash[gpu_id].items()
+            if block_hash != -1
+        }
+        chain = []
+        current = leaf_block_id
+        visited = set()
+        while current not in visited and current in self.block_hash[gpu_id]:
+            visited.add(current)
+            chain.append(current)
+            parent_hash = self.block_parent_hash[gpu_id].get(current, -1)
+            if parent_hash == -1:
+                return list(reversed(chain))
+            current = hash_to_block.get(parent_hash, -1)
+            if current == -1:
+                return []
+        return []
+
+    def gpu_has_hash(self, gpu_id: int, block_hash: int) -> bool:
+        return any(loc.gpu_id == gpu_id for loc in self.global_page_table.get(block_hash, []))
 
     def get_block_location(self, hash_val: int) -> List[BlockLocation]:
         """通过 hash 查找块的所有位置"""

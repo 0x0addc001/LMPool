@@ -10,9 +10,10 @@ from lmpool.engine.sequence import Sequence, SequenceStatus
 
 
 class DummyGlobalScheduler:
-    def __init__(self, gbm, rebalance_result=True):
+    def __init__(self, gbm, rebalance_result=True, fail_reason="no_plan"):
         self.gbm = gbm
         self.rebalance_result = rebalance_result
+        self.last_rebalance_fail_reason = fail_reason
         self.rebalance_calls = []
 
     def rebalance(self, gpu_id, needed_blocks):
@@ -75,6 +76,7 @@ def test_decode_rebalance_prevents_preemption(monkeypatch):
     )
     seq = Sequence([1, 2], block_size=2)
     scheduler.block_manager.allocate(seq)
+    seq.append_token(3)
     seq.status = SequenceStatus.RUNNING
     scheduler.running.append(seq)
     scheduler.block_manager.free_block_ids.clear()
@@ -84,6 +86,34 @@ def test_decode_rebalance_prevents_preemption(monkeypatch):
     assert scheduled == []
     assert dummy.rebalance_calls == [(0, 1)]
     assert list(scheduler.running) == [seq]
+
+
+def test_decode_batch_handles_two_sequences_crossing_boundary_with_one_free_block():
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=3,
+        block_size=2,
+        eos=999,
+        global_scheduler=None,
+    )
+    first = Sequence([1, 2], block_size=2)
+    second = Sequence([3, 4], block_size=2)
+    scheduler.block_manager.allocate(first)
+    scheduler.block_manager.allocate(second)
+    first.append_token(5)
+    second.append_token(6)
+    first.status = SequenceStatus.RUNNING
+    second.status = SequenceStatus.RUNNING
+    scheduler.running.extend([first, second])
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is False
+    assert scheduled == [first]
+    assert len(first.block_table) == 2
+    assert second in scheduler.waiting
+    assert scheduler.preemption_count == 1
 
 
 def test_prefill_rebalance_failure_preserves_running_decode():
@@ -219,9 +249,82 @@ def test_prefill_can_disable_foreground_rebalance():
 
     scheduled, is_prefill = scheduler.schedule()
 
-    assert scheduled == []
+    assert scheduled == [running_seq]
     assert is_prefill is False
     assert dummy.rebalance_calls == []
+
+
+def test_prefill_can_transfer_cache_before_local_reclaim(monkeypatch):
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm)
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=2,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    scheduler.preserve_cache_via_transfer = True
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    cached = Sequence([1, 2], block_size=2, sampling_params=no_decode)
+    scheduler.block_manager.allocate(cached)
+    scheduler.block_manager.mark_kv_ready([cached])
+    scheduler.block_manager.deallocate(cached)
+    waiting = Sequence([3, 4, 5, 6], block_size=2, sampling_params=no_decode)
+    scheduler.add_sequence(waiting)
+
+    def transfer_one_block(gpu_id, needed_blocks):
+        dummy.rebalance_calls.append((gpu_id, needed_blocks))
+        return scheduler.block_manager.reclaim_cached_blocks(needed_blocks) == needed_blocks
+
+    dummy.rebalance = transfer_one_block
+    monkeypatch.setattr(
+        scheduler.block_manager,
+        "reclaim_for_sequence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("local reclaim ran before successful transfer")
+        ),
+    )
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled == [waiting]
+    assert dummy.rebalance_calls == [(0, 1)]
+
+
+def test_structural_rebalance_failures_use_exponential_cooldown(monkeypatch):
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=1, nvlink_pairs=[(0, 1)])
+    dummy = DummyGlobalScheduler(gbm, rebalance_result=False, fail_reason="no_target_space")
+    scheduler = Scheduler(
+        max_num_sequences=1,
+        max_num_batched_tokens=4,
+        max_cached_blocks=1,
+        block_size=2,
+        eos=999,
+        global_scheduler=dummy,
+    )
+    scheduler._rebalance_cooldown_s = 2.0
+    scheduler._rebalance_cooldown_max_s = 30.0
+    now = [100.0]
+    monkeypatch.setattr("lmpool.engine.scheduler.time.monotonic", lambda: now[0])
+
+    key = ("capacity", 0)
+    scheduler._mark_rebalance_failed(key)
+    assert scheduler._rebalance_cooldown_until[key] == 102.0
+    now[0] = 102.0
+    scheduler._mark_rebalance_failed(key)
+    assert scheduler._rebalance_cooldown_until[key] == 106.0
+    now[0] = 106.0
+    scheduler._mark_rebalance_failed(key)
+    assert scheduler._rebalance_cooldown_until[key] == 114.0
+
+    scheduler._mark_rebalance_succeeded(key)
+    assert key not in scheduler._rebalance_failure_streak
+    assert key not in scheduler._rebalance_cooldown_until
 
 
 def test_postprocess_finishes_and_requeues_non_finished():

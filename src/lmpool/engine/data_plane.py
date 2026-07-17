@@ -67,6 +67,7 @@ def data_plane_process(
         global_scheduler=control_plane_client,
     )
     scheduler.enable_foreground_rebalance = bool(config.get("enable_foreground_rebalance", True))
+    scheduler.preserve_cache_via_transfer = bool(config.get("preserve_cache_via_transfer", False))
     scheduler.foreground_transfer_min_blocks = max(
         1,
         int(config.get("foreground_transfer_min_blocks", getattr(scheduler, "foreground_transfer_min_blocks", 1))),
@@ -74,6 +75,13 @@ def data_plane_process(
     scheduler._rebalance_cooldown_s = max(
         0.0,
         float(config.get("foreground_transfer_fail_cooldown_s", getattr(scheduler, "_rebalance_cooldown_s", 0.25))),
+    )
+    scheduler._rebalance_cooldown_max_s = max(
+        scheduler._rebalance_cooldown_s,
+        float(config.get(
+            "foreground_transfer_fail_cooldown_max_s",
+            getattr(scheduler, "_rebalance_cooldown_max_s", 30.0),
+        )),
     )
     prepared_rebalance_blocks: dict[str, dict[tuple[int, tuple[int, ...]], list[int]]] = {}
 
@@ -116,8 +124,11 @@ def data_plane_process(
             source_blocks = [
                 block_id
                 for transfer in transfers
-                if rank == transfer["src_gpu"] and transfer.get("mode", "move") != "copy"
-                for block_id in transfer["src_blocks"]
+                if rank == transfer["src_gpu"]
+                for block_id in transfer.get(
+                    "release_source_blocks",
+                    [] if transfer.get("mode", "move") == "copy" else transfer["src_blocks"],
+                )
             ]
             pinned_blocks = [
                 block_id
@@ -186,16 +197,23 @@ def data_plane_process(
             dst_gpu = transfer["dst_gpu"]
             src_blocks = transfer["src_blocks"]
             hashes = transfer.get("hashes", [-1] * len(src_blocks))
+            parent_hashes = transfer.get("parent_hashes")
             mode = transfer.get("mode", plan.get("mode", "move"))
+            release_source_blocks = transfer.get(
+                "release_source_blocks",
+                [] if mode == "copy" else src_blocks,
+            )
 
             if rank == src_gpu:
                 model_runner.execute_swap_out(src_blocks, dst_gpu)
-                if mode != "copy":
-                    scheduler.block_manager.release_blocks(src_blocks)
+                if release_source_blocks:
+                    scheduler.block_manager.release_blocks(release_source_blocks)
                 stats = {
                     "transfer_count": len(src_blocks),
                     "swap_count": len(src_blocks),
-                    "transfer_copy_count": len(src_blocks) if mode == "copy" else 0,
+                    "transfer_copy_count": len(src_blocks) - len(release_source_blocks),
+                    "transfer_release_count": len(release_source_blocks),
+                    "chain_transfer_count": 1 if mode == "chain_move" else 0,
                 }
                 if plan.get("background") and mode == "copy":
                     stats["background_copy_success"] = 1
@@ -214,7 +232,11 @@ def data_plane_process(
                     src_blocks,
                     local_target_blocks=local_target_blocks,
                 )
-                scheduler.block_manager.register_swap_in_blocks(local_target_blocks, hashes)
+                scheduler.block_manager.register_swap_in_blocks(
+                    local_target_blocks,
+                    hashes,
+                    parent_hashes=parent_hashes,
+                )
 
         if plan_id is not None:
             prepared_rebalance_blocks.pop(plan_id, None)
@@ -250,9 +272,15 @@ def data_plane_process(
             len(scheduler.running),
             sum(len(seq) for seq in scheduler.waiting),
             sum(len(seq) for seq in scheduler.running),
+            scheduler.block_manager.get_local_block_parent_hashes(),
         )
 
     send_block_state()
+    send_queue.put({
+        "type": "runtime_stats",
+        "rank": rank,
+        "data": {"max_cached_blocks": int(config["max_cached_blocks"])},
+    })
     idle_sent = False
     poll_timeout = float(config.get("worker_queue_poll_timeout", 0.01))
     heartbeat_interval = float(config.get("heartbeat_interval", 1.0))

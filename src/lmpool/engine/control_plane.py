@@ -49,6 +49,7 @@ class ControlPlaneClient:
         self.rebalance_success_count = 0
         self.rebalance_fail_count = 0
         self.rebalance_fail_reasons = defaultdict(int)
+        self.last_rebalance_fail_reason = ""
 
     def route_sequence(self, seq: Sequence, return_meta: bool = False) -> int | dict:
         request_id = uuid.uuid4().hex
@@ -92,6 +93,7 @@ class ControlPlaneClient:
         running_sequences: int = 0,
         waiting_tokens: int = 0,
         running_tokens: int = 0,
+        block_parent_hashes: dict[int, int] | None = None,
     ):
         if self.rank < 0:
             return
@@ -106,6 +108,7 @@ class ControlPlaneClient:
             "running_sequences": running_sequences,
             "waiting_tokens": waiting_tokens,
             "running_tokens": running_tokens,
+            "block_parent_hashes": block_parent_hashes,
         })
 
     def acknowledge_route_admission(self, seq_id: int, num_tokens: int) -> None:
@@ -138,9 +141,11 @@ class ControlPlaneClient:
                 success = bool(msg.get("success", False))
                 if success:
                     self.rebalance_success_count += 1
+                    self.last_rebalance_fail_reason = ""
                 else:
+                    self.last_rebalance_fail_reason = msg.get("reason", "unknown")
                     self.rebalance_fail_count += 1
-                    self.rebalance_fail_reasons[msg.get("reason", "unknown")] += 1
+                    self.rebalance_fail_reasons[self.last_rebalance_fail_reason] += 1
                 return success
             if msg.get("type") == "error":
                 logger.error(
@@ -151,6 +156,7 @@ class ControlPlaneClient:
                     msg.get("error", "unknown error"),
                 )
                 self.rebalance_fail_count += 1
+                self.last_rebalance_fail_reason = "error"
                 self.rebalance_fail_reasons["error"] += 1
                 return False
 
@@ -436,7 +442,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     def _maybe_schedule_background_copy(route_info: dict) -> None:
         if not enable_background_copy or not route_info.get("prefix_hit"):
             return
-        prefix_hash = route_info.get("prefix_hash")
+        prefix_hash = route_info.get("matched_prefix_hash", route_info.get("prefix_hash"))
         prefix_hashes = route_info.get("prefix_hashes") or ([prefix_hash] if prefix_hash is not None else [])
         hit_summary = route_info.get("hit_summary") or {}
         if prefix_hash is None or not hit_summary:
@@ -463,6 +469,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
 
         src_blocks = []
         hashes = []
+        parent_hashes = []
         for block_hash in prefix_hashes:
             if len(src_blocks) >= background_copy_max_blocks:
                 break
@@ -477,6 +484,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             block_id = locations[0].block_id
             src_blocks.append(block_id)
             hashes.append(block_hash)
+            parent_hashes.append(gbm.get_block_parent_hash(src_gpu, block_id))
 
         if not src_blocks or gbm.get_free_blocks_count(dst_gpu) < len(src_blocks):
             return
@@ -491,6 +499,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 "dst_gpu": dst_gpu,
                 "src_blocks": src_blocks,
                 "hashes": hashes,
+                "parent_hashes": parent_hashes,
                 "mode": "copy",
             }],
         }
@@ -548,6 +557,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 msg.get("running_sequences", 0),
                 msg.get("waiting_tokens", 0),
                 msg.get("running_tokens", 0),
+                msg.get("block_parent_hashes"),
             )
             service_heartbeats()
             continue
@@ -617,23 +627,32 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             try:
                 prefix_hash = msg["prefix_hash"]
                 prefix_hashes = msg.get("prefix_hashes") or ([prefix_hash] if prefix_hash is not None else [])
-                cached_target = route_cache.get(prefix_hash) if prefix_hash is not None else None
+                cached_prefix_hash = next(
+                    (block_hash for block_hash in reversed(prefix_hashes) if block_hash in route_cache),
+                    None,
+                )
+                cached_target = route_cache.get(cached_prefix_hash) if cached_prefix_hash is not None else None
                 target_rank = None
                 route_info = {}
                 if (
                     enable_route_cache
                     and cached_target is not None
-                    and gbm.get_free_blocks_count(cached_target) >= msg["num_blocks"]
                 ):
-                    cached_locations = gbm.lookup_prefix(prefix_hash, requester_rank=msg["requester_rank"])
+                    contiguous_hits = scheduler._lookup_contiguous_prefix(
+                        prefix_hashes,
+                        msg["requester_rank"],
+                    )
                     candidates = scheduler._candidate_gpus(msg["requester_rank"])
                     min_candidate_pressure = min(scheduler._load_score(gpu_id) for gpu_id in candidates)
                     owner_candidates = sorted({
-                        loc.gpu_id
-                        for loc in cached_locations
+                        gpu_id
+                        for gpu_id, block_ids in contiguous_hits.items()
                         if (
-                            loc.gpu_id in candidates
-                            and gbm.get_free_blocks_count(loc.gpu_id) >= msg["num_blocks"]
+                            gpu_id in candidates
+                            and gbm.get_free_blocks_count(gpu_id) >= scheduler._required_new_blocks(
+                                msg["num_blocks"],
+                                len(block_ids),
+                            )
                         )
                     })
                     cache_owner = None
@@ -658,12 +677,19 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                             "seq_id": msg["seq_id"],
                             "num_tokens": msg["num_tokens"],
                             "num_blocks": msg["num_blocks"],
-                            "prefix_hash": prefix_hash,
+                            "prefix_hash": cached_prefix_hash,
                             "prefix_hashes": prefix_hashes,
                             "prefix_hit": True,
                             "reason": "route_cache",
                             "target_rank": target_rank,
-                            "hit_summary": scheduler._hit_summary(cached_locations),
+                            "hit_summary": contiguous_hits,
+                            "matched_prefix_blocks": len(contiguous_hits[target_rank]),
+                            "matched_prefix_hash": prefix_hashes[len(contiguous_hits[target_rank]) - 1],
+                            "prefix_owner_rank": target_rank,
+                            "required_new_blocks": scheduler._required_new_blocks(
+                                msg["num_blocks"],
+                                len(contiguous_hits[target_rank]),
+                            ),
                             "load_score": scheduler._load_summary(candidates),
                         }
                 if target_rank is None:
@@ -674,6 +700,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         num_blocks=msg["num_blocks"],
                         prefix_hash=prefix_hash,
                         return_info=True,
+                        prefix_hashes=prefix_hashes,
                     )
                     if isinstance(target_rank, tuple):
                         target_rank, route_info = target_rank
@@ -681,9 +708,13 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         route_info = {}
                     if route_info:
                         route_info["prefix_hashes"] = prefix_hashes
-                    if prefix_hash is not None and route_info.get("prefix_hit"):
-                        route_cache[prefix_hash] = target_rank
-                gbm.reserve_blocks(target_rank, msg["num_blocks"])
+                    matched_prefix_blocks = int(route_info.get("matched_prefix_blocks", 0))
+                    if matched_prefix_blocks > 0 and target_rank in route_info.get("hit_summary", {}):
+                        route_cache[prefix_hashes[matched_prefix_blocks - 1]] = target_rank
+                gbm.reserve_blocks(
+                    target_rank,
+                    int(route_info.get("required_new_blocks", msg["num_blocks"])),
+                )
                 gbm.reserve_route_load(
                     target_rank,
                     msg["num_tokens"],

@@ -76,6 +76,44 @@ def test_route_falls_back_when_nvlink_prefix_owner_has_no_capacity():
         _stop_control_plane(request_queue, thread)
 
 
+def test_route_uses_hash_chain_and_reserves_only_uncached_blocks():
+    config, request_queue, response_queues, thread = _start_control_plane()
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        client = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        client.block_manager = bm
+        seq = Sequence(token_ids=[1, 2, 3, 4, 5, 6, 7], block_size=2)
+        hashes = client._compute_prefix_hashes(seq)
+
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 8,
+            "block_hashes": {},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 2,
+            "block_hashes": {0: hashes[0], 1: hashes[1], 2: hashes[2]},
+        })
+        time.sleep(0.2)
+
+        first = client.route_sequence(seq, return_meta=True)
+        second = client.route_sequence(
+            Sequence(token_ids=[1, 2, 3, 4, 5, 6, 8], block_size=2),
+            return_meta=True,
+        )
+
+        assert first["target_rank"] == 1
+        assert first["route_info"]["matched_prefix_blocks"] == 3
+        assert first["route_info"]["required_new_blocks"] == 1
+        assert second["target_rank"] == 1
+        assert second["route_info"]["required_new_blocks"] == 1
+    finally:
+        _stop_control_plane(request_queue, thread)
+
+
 def test_route_cache_reuses_valid_prefix_owner():
     config, request_queue, response_queues, thread = _start_control_plane(
         extra_config={"enable_route_cache": True, "route_cache_queue_slack": 100000.0}

@@ -59,6 +59,30 @@ def test_allocate_deallocate_and_global_commit(monkeypatch):
     assert seq.num_cached_tokens == 0
 
 
+def test_can_append_checks_capacity_after_token_crosses_block_boundary():
+    bm = BlockManager(num_blocks=1, block_size=2)
+    seq = Sequence([1, 2], block_size=2)
+    bm.allocate(seq)
+
+    seq.append_token(3)
+
+    assert bm.can_append(seq) is False
+    with pytest.raises(RuntimeError, match="new KV block is required"):
+        bm.append(seq)
+
+
+def test_append_allocates_new_block_after_boundary_token_is_added():
+    bm = BlockManager(num_blocks=2, block_size=2)
+    seq = Sequence([1, 2], block_size=2)
+    bm.allocate(seq)
+
+    seq.append_token(3)
+
+    assert bm.can_append(seq) is True
+    bm.append(seq)
+    assert seq.block_table == [0, 1]
+
+
 def test_remote_prefix_and_swap_helpers(monkeypatch):
     gbm = DummyGBM()
     bm = BlockManager(num_blocks=6, block_size=2, gbm=gbm)
@@ -125,6 +149,47 @@ def test_shared_prefix_ref_count_keeps_block_out_of_free_list():
     bm.allocate(seq3)
     assert seq3.block_table == [shared_block_id]
     assert seq3.num_cached_tokens == 2
+
+
+def test_reclaim_cached_blocks_evicts_deepest_prefix_leaf_first():
+    bm = BlockManager(num_blocks=4, block_size=2)
+    seq = Sequence([1, 2, 3, 4, 5, 6], block_size=2)
+    bm.allocate(seq)
+    bm.mark_kv_ready([seq])
+    block_ids = list(seq.block_table)
+    bm.deallocate(seq)
+
+    assert bm.reclaim_cached_blocks(1) == 1
+    assert block_ids[0] in bm.used_block_ids
+    assert block_ids[1] in bm.used_block_ids
+    assert block_ids[2] not in bm.used_block_ids
+
+    assert bm.reclaim_cached_blocks(1) == 1
+    assert block_ids[0] in bm.used_block_ids
+    assert block_ids[1] not in bm.used_block_ids
+
+
+def test_reclaim_cached_blocks_preserves_shared_ancestor_until_branches_are_gone():
+    bm = BlockManager(num_blocks=5, block_size=2)
+    left = Sequence([1, 2, 3, 4], block_size=2)
+    right = Sequence([1, 2, 5, 6], block_size=2)
+    bm.allocate(left)
+    bm.mark_kv_ready([left])
+    ancestor = left.block_table[0]
+    left_leaf = left.block_table[1]
+    bm.deallocate(left)
+    bm.allocate(right)
+    bm.mark_kv_ready([right])
+    right_leaf = right.block_table[1]
+    bm.deallocate(right)
+
+    assert bm.reclaim_cached_blocks(2) == 2
+    assert ancestor in bm.used_block_ids
+    assert left_leaf not in bm.used_block_ids
+    assert right_leaf not in bm.used_block_ids
+
+    assert bm.reclaim_cached_blocks(1) == 1
+    assert ancestor not in bm.used_block_ids
 
 
 def test_reclaim_for_sequence_evicts_lru_cache_but_keeps_required_prefix():

@@ -751,3 +751,152 @@ decision demand, decision plan, decision implementation, and decision result.
   resolver, with tests for both repository IDs and hash-named local snapshots.
 - Decision result: `HF_HUB_OFFLINE=1` runs can use a cached snapshot path
   directly without renaming it or contacting Hugging Face.
+
+## 2026-07-17: Route by Longest Contiguous Prefix and Incremental Capacity
+
+- Decision demand: The locality benchmark showed that routing improved mean
+  performance, but route/local hit rates remained low and LMPool still issued
+  many low-value foreground transfers. Routing queried only the terminal full
+  block hash and treated the entire prompt as new allocation even after a
+  prefix hit.
+- Decision plan: Make reusable KV length and incremental allocation demand the
+  shared basis for routing, capacity checks, reservations, and metrics. Suppress
+  repeated structural transfer failures without adding a workload-specific
+  policy.
+- Decision implementation: `ControlPlaneClient` already sends the cumulative
+  full-block hash chain; `GlobalScheduler` now looks up every hash and retains
+  each GPU's longest chain contiguous from block zero. Route scoring uses that
+  block count, while admission checks and optimistic global reservations use
+  `num_blocks - matched_prefix_blocks`. Route-cache validation follows the same
+  chain semantics. The synthetic single-GPU hit measurement now marks KV ready
+  and releases request references before the next lookup. Foreground transfer
+  exposes its last failure reason to `Scheduler`, which applies bounded
+  exponential cooldown for `no_plan`, `no_target_space`, and `stale_source`,
+  resetting immediately after success.
+- Decision result: Shared prefixes remain discoverable when request suffixes
+  differ, cached blocks are no longer double-counted as required capacity, and
+  locality traffic no longer creates sustained retries against unchanged
+  transfer state. Unit and control-plane tests cover partial-chain hits,
+  non-contiguous rejection, incremental reservation, ready-KV metrics, and
+  structural-failure backoff.
+
+## 2026-07-17: Preserve Prefix Chains and Equalize KV Capacity
+
+- Decision demand: The locality comparison mixed two independent effects.
+  Ordinary block-level LRU could evict an early ancestor before newer suffix
+  blocks, leaving globally visible hashes that could not form a reusable prefix
+  from block zero. Routing and transfer scenarios also accepted different KV
+  block limits, so policy effects were not isolated under equal memory.
+- Decision plan: Make prefix-chain validity a hard eviction constraint, retain
+  recency only as the ordering policy among valid victims, and expose one
+  canonical per-rank block budget for every benchmark scenario. Add diagnostics
+  that separate workload potential, routing-time matches, worker reuse, stale
+  routing decisions, and actual runtime capacity.
+- Decision implementation: Added `parent_hash` and `prefix_depth` to local
+  blocks and propagated parent metadata through worker block-state snapshots,
+  the authoritative global page table, move/copy plans, and transfer-in block
+  registration. Local reclamation and globally reported eviction candidates
+  now contain only unreferenced KV-ready leaves; repeated eviction peels a chain
+  from the deepest eligible leaf, with LRU ordering across independent leaves.
+  All blocks touched by one completed request receive the same recency timestamp
+  so per-block loop timing cannot make block zero look older than its suffix.
+  Added `--kv-block-budget`, applied it to all five scenarios, rejected
+  conflicting legacy routing/transfer budgets, and reported worker-resolved
+  `max_cached_blocks` per rank. The benchmark now reports an unbounded workload
+  theoretical prefix-hit upper bound, route matched-block ratio, and stale-route
+  rate separately from initial worker local hits and cached-token ratio. Added
+  chain and shared-ancestor regression tests plus a small-budget metric test.
+- Decision result: Capacity comparisons now hold requested KV memory constant,
+  and eviction cannot preserve unusable suffix hashes while discarding their
+  required ancestors. The ranking layer remains leaf-LRU, providing a correct
+  baseline for later leaf-LFU or TinyLFU admission-policy ablations without
+  changing prefix-chain safety.
+
+## 2026-07-17: Disambiguate Control-Plane and Data-Plane Prefix Metrics
+
+- Decision demand: Benchmark labels `route`, `owner`, `local`, and
+  `cached tokens` mixed decision-time and execution-time observations and did
+  not state whether their denominator was requests, blocks, or tokens.
+- Decision plan: Preserve JSON field compatibility while making every console,
+  figure, and documentation label identify its plane and unit of aggregation.
+- Decision implementation: Renamed visible metrics to `CP req hit`, `CP owner`,
+  `CP blk match`, `CP stale`, `DP req hit`, and `DP tok reuse`; renamed the
+  figure panel to `Prefix Reuse Metrics`; documented each existing JSON field,
+  denominator, and the load-bypass case where CP owner selection can be lower
+  than the control-plane request-hit rate.
+- Decision result: A result now distinguishes routing knowledge from worker
+  cache reality and binary request hits from the amount of prefill work
+  actually avoided, without invalidating existing JSON consumers.
+
+## 2026-07-17: Enforce Decode Page-Boundary Capacity Checks
+
+- Decision demand: The first `load-skew` trial crashed in
+  `BlockManager.append()` with an empty free-block deque during decode.
+  `Scheduler.postprocess()` had already appended the sampled token, but
+  `can_append()` checked the pre-append boundary condition and therefore
+  approved a sequence that actually needed a new KV page.
+- Decision plan: Align the capacity predicate with the Sequence lifecycle and
+  make the low-level append primitive fail explicitly if a caller bypasses the
+  predicate. Cover both one-sequence and same-batch multi-sequence boundaries.
+- Decision implementation: Changed `can_append()` to require a free block when
+  `num_tokens % block_size == 1`, matching `append()` and the fact that the new
+  token is already present. Added a descriptive runtime error before accessing
+  an empty deque. Added BlockManager tests for successful and blocked boundary
+  growth and a Scheduler test where two sequences cross a boundary with only
+  one free block; the second sequence now follows controlled preemption rather
+  than crashing. Updated an old scheduler test that encoded the previous
+  off-by-one behavior.
+- Decision result: Decode page growth and its capacity check now use the same
+  state transition. KV exhaustion is handled by the scheduler's normal
+  reclaim/transfer/preemption policy and cannot surface as `IndexError`.
+
+## 2026-07-17: Make Foreground Transfer Preserve a Usable Prefix Chain
+
+- Decision demand: Existing locality and load-skew runs did not demonstrate
+  transfer value. Foreground requests were attempted but had zero successful
+  data movement, background transfer was explicitly disabled, and moving only
+  a leaf could not create a prefix reusable from block zero at the target.
+- Decision plan: Keep foreground and background semantics separate. Make a
+  foreground capacity plan transfer the complete missing root-to-leaf fragment,
+  release only cold leaf victims, and benchmark it with deterministic cache
+  warm-up, source-side pressure, and reuse phases under an equal KV budget.
+- Decision implementation: `GlobalBlockManager` now tracks pinned physical IDs
+  and reconstructs root-to-leaf chains. `GlobalScheduler.plan_rebalance()`
+  selects leaf victims by LRU, includes missing ancestors once per target,
+  supports branches sharing one planned ancestor, and records exactly which
+  leaves may be released. Data-plane prepare validates only release candidates
+  for pinning; execute sends the complete fragment, retains copied ancestors,
+  and releases selected leaves. For `memory-skew` only, `Scheduler` attempts
+  this chain-preserving transfer before local cache reclamation and falls back
+  to reclamation on failure. The benchmark now uses three phase barriers and
+  reports sent, retained, released, and chain-plan counts plus reuse-phase
+  request and token hit ratios. Added chain, shared-ancestor, phase-construction,
+  and transfer-before-reclaim regression tests.
+- Decision result: Foreground success now means an executable transfer both
+  freed source capacity and installed a structurally reusable target prefix.
+  Background transfer remains independently controlled and is absent when
+  `--disable-background-copy` is set. The full CPU test suite passes; the next
+  GPU experiment can directly validate capacity relief and reuse benefit with
+  the new diagnostics instead of inferring them from aggregate throughput.
+
+## 2026-07-17: Equalize Memory-Skew Placement Across Baselines
+
+- Decision demand: The first three-phase memory-skew result assigned warm-up
+  and pressure traffic to ranks 0, 2, and 4 for topology-aware scenarios, but
+  assigned all of that traffic to rank 0 for `multi-gpu`, because the baseline
+  intentionally had no `nvlink_topo` configuration. Its throughput, latency,
+  and aggregate prefix metrics therefore described a different workload.
+- Decision plan: Separate benchmark traffic placement from the topology exposed
+  to an engine policy. Use the same source ranks for every multi-GPU scenario
+  without enabling topology-aware routing or transfer in a baseline.
+- Decision implementation: The benchmark now derives source ranks once from
+  the command-line NVLink pairs and writes them to a benchmark-only placement
+  field on all configurations. The three-phase runner resolves that explicit
+  field before consulting engine topology. `single-gpu` remains fixed to rank
+  0. Per-rank output now separates warm-up, pressure, and reuse submissions.
+  Added a regression test for a six-rank topology-blind baseline using source
+  ranks 0, 2, and 4.
+- Decision result: All multi-GPU scenarios now execute the same warm-up and
+  pressure placement, while only global-pool scenarios receive NVLink topology
+  for policy decisions. Results produced before this fix remain useful for
+  validating transfer mechanics, but not for baseline performance ranking.

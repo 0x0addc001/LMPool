@@ -16,12 +16,22 @@ class Block:
         self.ref_count = 0
         self.token_ids = []
         self.kv_ready = False
+        self.parent_hash = -1
+        self.prefix_depth = -1
         self.last_access_time = time.monotonic()
 
 
-    def update(self, h: int, token_ids: list[int]):
+    def update(
+        self,
+        h: int,
+        token_ids: list[int],
+        parent_hash: int = -1,
+        prefix_depth: int = 0,
+    ):
         self.hash = h 
         self.token_ids = token_ids
+        self.parent_hash = parent_hash
+        self.prefix_depth = prefix_depth
         self.last_access_time = time.monotonic()
 
     def reset(self):
@@ -29,10 +39,12 @@ class Block:
         self.ref_count = 0
         self.token_ids = []
         self.kv_ready = False
+        self.parent_hash = -1
+        self.prefix_depth = -1
         self.last_access_time = time.monotonic()
 
-    def touch(self):
-        self.last_access_time = time.monotonic()
+    def touch(self, timestamp: float | None = None):
+        self.last_access_time = time.monotonic() if timestamp is None else timestamp
 
 
 class BlockManager:
@@ -122,26 +134,41 @@ class BlockManager:
         return required
 
     def reclaim_cached_blocks(self, num_blocks: int, protected_block_ids: set[int] | None = None) -> int:
-        """Release up to ``num_blocks`` least-recently-used unreferenced cache blocks."""
+        """Release LRU prefix leaves without orphaning retained descendants."""
         protected = protected_block_ids or set()
-        candidates = sorted(
-            (
+        remaining = {
+            block_id
+            for block_id in self.used_block_ids
+            if self.blocks[block_id].hash != -1 and self.blocks[block_id].kv_ready
+        }
+        selected: list[Block] = []
+        for _ in range(max(0, int(num_blocks))):
+            parent_hashes = {
+                self.blocks[block_id].parent_hash
+                for block_id in remaining
+                if self.blocks[block_id].parent_hash != -1
+            }
+            leaves = [
                 self.blocks[block_id]
-                for block_id in self.used_block_ids
+                for block_id in remaining
                 if (
                     block_id not in protected
                     and self.blocks[block_id].ref_count == 0
-                    and self.blocks[block_id].hash != -1
-                    and self.blocks[block_id].kv_ready
+                    and self.blocks[block_id].hash not in parent_hashes
                 )
-            ),
-            key=lambda block: (block.last_access_time, block.block_id),
-        )
-        reclaimed = 0
-        for block in candidates[:max(0, int(num_blocks))]:
+            ]
+            if not leaves:
+                break
+            victim = min(
+                leaves,
+                key=lambda block: (block.last_access_time, -block.prefix_depth, block.block_id),
+            )
+            selected.append(victim)
+            remaining.remove(victim.block_id)
+
+        for block in selected:
             self._deallocate_block(block.block_id)
-            reclaimed += 1
-        return reclaimed
+        return len(selected)
 
     def reclaim_for_sequence(self, seq: Sequence, reserve_blocks: int = 0) -> int:
         """Reclaim cold cache while preserving ``seq`` and decode headroom."""
@@ -171,6 +198,7 @@ class BlockManager:
 
             token_ids = seq.block(i)
             # only compute hash for full blocks, always -1 for partial blocks
+            parent_hash = h
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
             
@@ -199,11 +227,17 @@ class BlockManager:
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
                 block.ref_count = 1
-                block.update(h=h, token_ids=token_ids)
+                block.update(
+                    h=h,
+                    token_ids=token_ids,
+                    parent_hash=parent_hash,
+                    prefix_depth=i,
+                )
             seq.block_table.append(block.block_id)
 
     def deallocate(self, seq: Sequence) -> None:
         # update block information
+        release_time = time.monotonic()
         for block_id in seq.block_table:
             block = self.blocks[block_id]
             block.ref_count -= 1
@@ -213,7 +247,10 @@ class BlockManager:
                 else:
                     # A complete KV block remains addressable as an evictable
                     # prefix-cache entry until capacity pressure reclaims it.
-                    block.touch()
+                    # One request access is one recency event for the whole
+                    # chain. Equal timestamps let leaf/depth ordering preserve
+                    # ancestors instead of evicting block zero first.
+                    block.touch(release_time)
         # update sequence information
         seq.block_table = []
         seq.num_cached_tokens = 0
@@ -221,7 +258,10 @@ class BlockManager:
     # this is to check whether we can append tokens to this sequence
     # when that token would require allocating a new block.
     def can_append(self, seq: Sequence) -> bool:
-        if seq.num_tokens % self.block_size == 0:
+        # Scheduler.postprocess() has already appended the sampled token before
+        # the next decode schedule. A remainder of one therefore means that
+        # this token starts a new logical block which is not in block_table yet.
+        if seq.num_tokens % self.block_size == 1:
             return len(self.free_block_ids) > 0
         return True
 
@@ -244,12 +284,23 @@ class BlockManager:
                 prefix_hash_value=-1 if len(block_tables) == 1 else self.blocks[block_tables[-2]].hash
             )
             block = self.blocks[last_block_for_seq_id]
-            block.update(h=h, token_ids=seq.block(seq.num_blocks - 1))
+            parent_hash = -1 if len(block_tables) == 1 else self.blocks[block_tables[-2]].hash
+            block.update(
+                h=h,
+                token_ids=seq.block(seq.num_blocks - 1),
+                parent_hash=parent_hash,
+                prefix_depth=len(block_tables) - 1,
+            )
 
         # if one new block is needed
         elif seq.num_tokens % self.block_size == 1:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
+            if not self.free_block_ids:
+                raise RuntimeError(
+                    f"Cannot append seq {seq.seq_id}: a new KV block is required "
+                    "but no free block is available"
+                )
             block = self._allocate_block(self.free_block_ids[0])
             block.ref_count = 1
             block_tables.append(block.block_id)
@@ -469,7 +520,12 @@ class BlockManager:
                 raise RuntimeError(f"Cannot release reserved block {block_id}: ref_count={block.ref_count}")
             self._deallocate_block(block_id)
 
-    def register_swap_in_blocks(self, block_ids: list[int], hashes: list[int]) -> None:
+    def register_swap_in_blocks(
+        self,
+        block_ids: list[int],
+        hashes: list[int],
+        parent_hashes: list[int] | None = None,
+    ) -> None:
         """
         将已接收的 transfer-in 块登记到本地 hash 表。
 
@@ -478,10 +534,15 @@ class BlockManager:
         """
         if len(block_ids) != len(hashes):
             raise ValueError("block_ids and hashes must have the same length")
-        for block_id, h in zip(block_ids, hashes):
+        if parent_hashes is not None and len(parent_hashes) != len(hashes):
+            raise ValueError("parent_hashes and hashes must have the same length")
+        parents = parent_hashes or [-1] * len(hashes)
+        for index, (block_id, h, parent_hash) in enumerate(zip(block_ids, hashes, parents)):
             block = self.blocks[block_id]
             block.hash = h
             block.kv_ready = True
+            block.parent_hash = parent_hash
+            block.prefix_depth = index
             # transfer-in blocks already contain valid KV data but do not carry
             # original token ids. Treat token_ids=None as a trusted hash match.
             block.token_ids = None
@@ -512,6 +573,14 @@ class BlockManager:
             if self.blocks[bid].kv_ready
         }
 
+    def get_local_block_parent_hashes(self) -> dict[int, int]:
+        """Return parent hashes for ready blocks in the local prefix DAG."""
+        return {
+            bid: self.blocks[bid].parent_hash
+            for bid in self.used_block_ids
+            if self.blocks[bid].kv_ready
+        }
+
     def get_evictable_block_hashes(self) -> dict[int, int]:
         """
         获取本地可 move-evict 的块。
@@ -519,10 +588,19 @@ class BlockManager:
         ref_count > 0 的块仍被序列引用，只能作为复制式 migration 的来源，
         不能作为释放源端空间的 eviction victim。
         """
+        ready_parent_hashes = {
+            self.blocks[bid].parent_hash
+            for bid in self.used_block_ids
+            if self.blocks[bid].kv_ready and self.blocks[bid].parent_hash != -1
+        }
         return {
             bid: self.blocks[bid].hash
             for bid in self.used_block_ids
-            if self.blocks[bid].ref_count == 0 and self.blocks[bid].kv_ready
+            if (
+                self.blocks[bid].ref_count == 0
+                and self.blocks[bid].kv_ready
+                and self.blocks[bid].hash not in ready_parent_hashes
+            )
         }
 
     def get_pinned_block_hashes(self) -> dict[int, int]:

@@ -57,7 +57,7 @@ Each worker owns a local `Scheduler`, `BlockManager`, and `ModelRunner`. The con
 ## 3. Runtime Model
 
 1. `LLMEngine` receives prompts and builds `Sequence` objects.
-2. `ControlPlaneClient` computes the complete-block prefix hash.
+2. `ControlPlaneClient` computes the cumulative hash chain for every complete prefix block.
 3. The control plane asks `GlobalScheduler` to choose a target rank.
 4. `LLMEngine` forwards the `Sequence` to the chosen worker.
 5. The worker runs prefill / decode locally through `Scheduler` and `ModelRunner`.
@@ -107,11 +107,15 @@ Each data-plane process binds one GPU. It schedules prefill / decode locally, al
 
 Routing policy:
 
-1. compute the hash of complete blocks only
-2. query the global page table for prefix hits
-3. prefer the GPU with the best prefix-hit score after queue-pressure penalty
+1. compute a cumulative hash chain over complete blocks only
+2. query the global page table and measure each GPU's longest contiguous prefix from block zero
+3. prefer the GPU with the best reusable-block score after queue-pressure penalty
 4. otherwise fall back to the least-congested GPU with more free blocks
-5. reserve blocks optimistically after routing
+5. reserve only the blocks not already covered by the selected GPU's contiguous prefix
+
+Foreground transfer uses reason-aware exponential backoff for structural
+failures such as `no_plan`, `no_target_space`, and `stale_source`. Repeated
+requests are suppressed until capacity state has had time to change.
 
 Topology weights in the current routing policy are:
 
@@ -130,6 +134,7 @@ Topology weights in the current routing policy are:
 - `free_blocks_per_gpu`: per-GPU free capacity
 - `block_access_time`: per-block timestamps for LRU selection
 - `block_hash`: per-GPU block hash snapshot
+- `block_parent_hash`: parent links used to preserve valid prefix chains during eviction
 
 The authoritative state lives in the control plane process. Workers report local snapshots back through block-state messages.
 
@@ -152,13 +157,15 @@ Each worker owns one `BlockManager` for its local KV cache blocks.
 Main responsibilities:
 
 - compute chained block hashes
-- allocate blocks and reclaim cold cached blocks with local LRU
+- allocate blocks and reclaim cold cached blocks with leaf-constrained LRU
 - append decode tokens
 - maintain local prefix cache state
 
 Complete hashed blocks remain cached after their active reference count reaches
 zero. Partial blocks are released immediately; complete cached blocks remain
 globally discoverable and evictable until capacity pressure reclaims them.
+Eviction only removes prefix-chain leaves, so a retained descendant never loses
+an ancestor required for contiguous reuse; LRU orders the eligible leaves.
 
 ### 4.8 Model Runner
 
@@ -246,12 +253,21 @@ Reported metrics:
 - mean / p95 end-to-end latency
 - GPU utilization mean / p95
 - GPU memory utilization mean / p95
-- prefix hit rate
-- route hit / prefix-owner hit
+- data-plane request-hit rate and token-reuse ratio
+- control-plane request-hit / owner-selection / matched-block ratios
 - transfer / copy count and rebalance success / failure counts
 
 The current `multi-gpu` baseline uses online round-robin dispatch. Control-plane scenarios should use a bounded `--submit-window` such as `4` or `8` when measuring prefix reuse, because routing can only hit prefixes that previous requests have already prefetched and reported to the global page table.
 The benchmark records TTFT from explicit first-token events emitted by data-plane workers. Local prefix hit is measured only on each request's initial prefill, excluding retry hits after preemption. Cached-token ratio, prefill attempts, preemptions, and redundant prefill tokens are reported separately. Route hit and prefix-owner hit are reported separately for control-plane scenarios.
+All five scenarios use the same requested per-rank KV capacity through
+`--kv-block-budget`. The prefix diagnostics table also reports each rank's
+actual runtime block capacity, workload theoretical hit upper bound, matched
+route-block ratio, and stale-route rate.
+For `memory-skew`, deterministic warm-up, pressure, and reuse phases also
+report blocks sent, retained at the source, released at the source, chain
+transfer plans, and reuse-phase request/token hits. This distinguishes an
+attempted foreground transfer from one that actually relieves capacity and
+preserves reusable KV.
 The `locality` workload uses 16 distinct long shared-prefix groups by default,
 with a deterministic shuffled request order. Override this with
 `--locality-prefix-groups`; multiple groups prevent round-robin from matching

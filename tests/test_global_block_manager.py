@@ -51,6 +51,19 @@ def test_update_gpu_state_uses_only_evictable_blocks_for_eviction():
     assert gbm.select_eviction_candidates(0, 1, allow_recursive=False) == [(1, 1)]
 
 
+def test_global_block_manager_reconstructs_root_to_leaf_chain():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.update_gpu_state(
+        0,
+        free_blocks=1,
+        block_hashes={0: 11, 1: 22, 2: 33},
+        evictable_block_hashes={2: 33},
+        block_parent_hashes={0: -1, 1: 11, 2: 22},
+    )
+
+    assert gbm.get_prefix_chain(0, 2) == [0, 1, 2]
+
+
 def test_update_gpu_state_tracks_queue_pressure_snapshot():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.update_gpu_state(

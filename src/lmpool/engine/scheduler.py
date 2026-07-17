@@ -35,8 +35,11 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.eos = eos
         self._rebalance_cooldown_until: dict[tuple, float] = {}
+        self._rebalance_failure_streak: dict[tuple, int] = {}
         self._rebalance_cooldown_s = 0.25
+        self._rebalance_cooldown_max_s = 30.0
         self.enable_foreground_rebalance = True
+        self.preserve_cache_via_transfer = False
         self.foreground_transfer_min_blocks = 1
         self.preemption_count = 0
 
@@ -54,7 +57,17 @@ class Scheduler:
         return time.monotonic() < self._rebalance_cooldown_until.get(key, 0.0)
 
     def _mark_rebalance_failed(self, key: tuple) -> None:
-        self._rebalance_cooldown_until[key] = time.monotonic() + self._rebalance_cooldown_s
+        reason = getattr(self.global_scheduler, "last_rebalance_fail_reason", "unknown")
+        structural_failure = reason in {"no_plan", "no_target_space", "stale_source"}
+        streak = self._rebalance_failure_streak.get(key, 0) + 1
+        self._rebalance_failure_streak[key] = streak
+        multiplier = 2 ** min(streak - 1, 4) if structural_failure else 1
+        cooldown = min(self._rebalance_cooldown_s * multiplier, self._rebalance_cooldown_max_s)
+        self._rebalance_cooldown_until[key] = time.monotonic() + cooldown
+
+    def _mark_rebalance_succeeded(self, key: tuple) -> None:
+        self._rebalance_failure_streak.pop(key, None)
+        self._rebalance_cooldown_until.pop(key, None)
 
     def is_finished(self):
         return len(self.waiting) == 0 and len(self.running) == 0
@@ -87,6 +100,7 @@ class Scheduler:
                 len(self.running),
                 sum(len(seq) for seq in self.waiting),
                 sum(len(seq) for seq in self.running),
+                self.block_manager.get_local_block_parent_hashes(),
             )
             return
         gbm = self.global_scheduler.gbm
@@ -163,8 +177,35 @@ class Scheduler:
                     0,
                     required_new_blocks + reserve_blocks - len(self.block_manager.free_block_ids),
                 )
-                # Dropping a cold reconstructable cache entry is cheaper than
-                # transferring it or preempting live decode work.
+                cooldown_key = ("capacity", self.rank)
+                rebalance_attempted = False
+                if (
+                    self.preserve_cache_via_transfer
+                    and self.global_scheduler is not None
+                    and self.enable_foreground_rebalance
+                ):
+                    transfer_shortage = max(
+                        0,
+                        required_new_blocks - len(self.block_manager.free_block_ids),
+                    )
+                    if (
+                        transfer_shortage >= self.foreground_transfer_min_blocks
+                        and not self._rebalance_on_cooldown(cooldown_key)
+                    ):
+                        rebalance_attempted = True
+                        rebalance_success = self.global_scheduler.rebalance(
+                            self.rank,
+                            transfer_shortage,
+                        )
+                        if rebalance_success:
+                            self._mark_rebalance_succeeded(cooldown_key)
+                            if self._can_admit_prefill(seq):
+                                continue
+                        else:
+                            self._mark_rebalance_failed(cooldown_key)
+
+                # Reconstructable cache remains the fallback when a
+                # chain-preserving transfer is disabled or cannot execute.
                 self.block_manager.reclaim_for_sequence(seq, reserve_blocks=reserve_blocks)
                 if self._can_admit_prefill(seq):
                     continue
@@ -178,17 +219,19 @@ class Scheduler:
                 # Local cache reclamation was insufficient. The full LMPool
                 # path may preserve cache value by moving evictable blocks.
                 shortage = max(0, required_new_blocks - len(self.block_manager.free_block_ids))
-                cooldown_key = ("capacity", self.rank)
                 if (
                     self.global_scheduler is not None
                     and self.enable_foreground_rebalance
                     and shortage >= self.foreground_transfer_min_blocks
+                    and not rebalance_attempted
                 ):
                     rebalance_success = False
                     if shortage > 0 and not self._rebalance_on_cooldown(cooldown_key):
                         rebalance_success = self.global_scheduler.rebalance(self.rank, shortage)
                         if not rebalance_success:
                             self._mark_rebalance_failed(cooldown_key)
+                        else:
+                            self._mark_rebalance_succeeded(cooldown_key)
                     if rebalance_success and self._can_admit_prefill(seq):
                         continue
                 # Do not evict live decode work merely to admit new prefill.
@@ -235,6 +278,8 @@ class Scheduler:
                         rebalance_success = self.global_scheduler.rebalance(self.rank, 1)
                         if not rebalance_success:
                             self._mark_rebalance_failed(cooldown_key)
+                        else:
+                            self._mark_rebalance_succeeded(cooldown_key)
 
                 if rebalance_success:
                     # rebalance 成功，把序列放回队首，下轮重试

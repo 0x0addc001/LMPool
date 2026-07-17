@@ -57,7 +57,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 ## 3. 运行逻辑
 
 1. `LLMEngine` 接收 prompt，并构造 `Sequence`。
-2. `ControlPlaneClient` 计算完整块前缀 hash。
+2. `ControlPlaneClient` 计算所有完整前缀块的累积 hash chain。
 3. 控制进程调用 `GlobalScheduler` 选择目标 rank。
 4. `LLMEngine` 将 `Sequence` 转发给目标 worker。
 5. worker 通过 `Scheduler` 和 `ModelRunner` 执行 prefill / decode。
@@ -107,11 +107,14 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 
 路由策略：
 
-1. 只对完整块做 hash
-2. 在全局页表中查找前缀命中
-3. 优先选择扣除队列压力后的前缀命中分数最高的 GPU
+1. 只对完整块计算累积 hash chain
+2. 在全局页表中计算每张 GPU 从第 0 块开始的最长连续命中
+3. 优先选择扣除队列压力后可复用块得分最高的 GPU
 4. 如果没有命中，则回退到负载更低且空闲块更多的 GPU
-5. 路由后进行乐观 reserve
+5. 路由后只对连续前缀未覆盖的新块进行乐观 reserve
+
+foreground transfer 对 `no_plan`、`no_target_space`、`stale_source` 等结构性
+失败使用按 rank 指数退避，避免容量状态尚未变化时重复提交相同的失败请求。
 
 当前路由权重如下：
 
@@ -130,6 +133,7 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 - `free_blocks_per_gpu`：每卡空闲容量
 - `block_access_time`：用于 LRU 选择
 - `block_hash`：每卡 block hash 快照
+- `block_parent_hash`：用于驱逐时保持有效前缀链的父 hash 关系
 
 当前权威状态保存在控制进程中，worker 通过状态消息回传本地快照。
 
@@ -152,12 +156,13 @@ LMPool 将集群内多张 GPU 的 HBM 抽象为一个逻辑统一的全局 KV Ca
 主要职责：
 
 - 计算链式 block hash
-- 分配 block，并通过本地 LRU 回收冷缓存 block
+- 分配 block，并通过叶子约束的 LRU 回收冷缓存 block
 - 追加 decode token
 - 维护本地前缀缓存状态
 
 完整且带 hash 的 block 在活跃引用数降为 0 后仍保留为前缀缓存；partial block 会立即释放。
-缓存 block 会继续出现在全局页表中并保持可驱逐状态，直到容量压力触发回收。
+缓存 block 会继续出现在全局页表中并保持可驱逐状态，直到容量压力触发回收。驱逐只选择
+前缀链叶子，避免保留的后继 block 失去连续复用所需的祖先；LRU 仅用于合法叶子之间排序。
 
 ### 4.8 Model Runner（模型执行器）
 
@@ -245,8 +250,8 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 - mean / p95 端到端延迟
 - GPU 利用率 mean / p95
 - GPU 显存利用率 mean / p95
-- 前缀命中率
-- route hit / prefix-owner hit
+- 数据面请求命中率与 token 复用比例
+- 控制面请求命中、owner 选择和匹配 block 比例
 - transfer / copy count 和 rebalance success / failure count
 
 当前 `multi-gpu` 基线采用在线 round-robin 分发。控制面场景如果要观察 prefix reuse，建议使用
@@ -257,6 +262,13 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 比例、prefill attempt、preemption 和重复处理的 prefill token，因此 round-robin 与 routing 的
 真实 locality 收益可以直接比较。
 控制面 route hit 和 prefix-owner hit 会单独报告。
+五个场景通过 `--kv-block-budget` 使用相同的每 rank KV 容量请求值；prefix diagnostics
+还会报告每个 rank 实际运行时 block 容量、workload 理论命中上界、路由匹配 block 比例和
+stale-route 比例，避免将容量差异或陈旧页表误判为策略收益。
+对于 `memory-skew`，benchmark 还会按确定性的预热、施压、复用三个阶段运行，并分别报告
+发送 block 数、源端保留 block 数、源端释放 block 数、链式 transfer 计划数，以及复用阶段的
+请求命中率和 token 复用率。这样可以区分“尝试过 foreground transfer”和“确实释放容量并
+保住可复用 KV”的 transfer。
 `locality` workload 默认使用 16 组不同的长共享前缀，并按固定 seed 打乱请求顺序；可通过
 `--locality-prefix-groups` 调整。多前缀组可以避免 round-robin 仅靠在每张 GPU 上复制同一个
 热点前缀，就获得与 routing 接近的稳态命中率。
