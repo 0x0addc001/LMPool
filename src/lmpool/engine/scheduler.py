@@ -225,11 +225,21 @@ class Scheduler:
 
                 # Reconstructable cache remains the fallback when a
                 # chain-preserving transfer is disabled or cannot execute.
+                routed_protected_blocks = self._routed_waiting_prefix_blocks()
                 self.block_manager.reclaim_for_sequence(
                     seq,
                     reserve_blocks=reserve_blocks,
-                    protected_block_ids=self._routed_waiting_prefix_blocks(),
+                    protected_block_ids=routed_protected_blocks,
                 )
+                # Route promises are admission priorities, not hard pins. If
+                # protecting every queued request leaves no reclaimable block,
+                # preserve the FIFO head only and sacrifice later promises so
+                # the worker cannot enter an admission livelock.
+                if not self._can_admit_prefill(seq) and routed_protected_blocks:
+                    self.block_manager.reclaim_for_sequence(
+                        seq,
+                        reserve_blocks=reserve_blocks,
+                    )
                 if self._can_admit_prefill(seq):
                     continue
 
@@ -282,7 +292,17 @@ class Scheduler:
 
             # 检查是否可以追加一个 token
             if not self.block_manager.can_append(seq):
-                if self.block_manager.reclaim_cached_blocks(1) > 0:
+                routed_protected_blocks = self._routed_waiting_prefix_blocks()
+                reclaimed = self.block_manager.reclaim_cached_blocks(
+                    1,
+                    protected_block_ids=routed_protected_blocks,
+                )
+                if reclaimed == 0 and routed_protected_blocks:
+                    # As in prefill admission, queued route promises are
+                    # best-effort under true overcommit. Decode growth must not
+                    # deadlock behind tail requests.
+                    reclaimed = self.block_manager.reclaim_cached_blocks(1)
+                if reclaimed > 0:
                     self.block_manager.append(seq)
                     scheduled_sequences.append(seq)
                     current_scheduled_tokens += 1

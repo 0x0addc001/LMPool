@@ -4,6 +4,7 @@ import random
 import sys
 import time
 from multiprocessing import Queue
+from multiprocessing.connection import wait as wait_for_connections
 from queue import Empty
 
 import torch
@@ -14,6 +15,25 @@ from lmpool.engine.model_runner import ModelRunner
 from lmpool.engine.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_for_worker_events(
+    recv_queue: Queue,
+    control_queue,
+    timeout: float,
+) -> tuple[bool, bool] | None:
+    """Wait for ingress or control work without polling one queue first.
+
+    ``multiprocessing.Queue`` exposes its receive connection through ``_reader``.
+    Keep a fallback for queue-compatible test doubles and alternate queue
+    implementations that do not expose a connection.
+    """
+    recv_reader = getattr(recv_queue, "_reader", None)
+    control_reader = getattr(control_queue, "_reader", None)
+    if recv_reader is None or control_reader is None:
+        return None
+    ready = set(wait_for_connections([recv_reader, control_reader], timeout))
+    return recv_reader in ready, control_reader in ready
 
 
 def _as_token_list(tokens):
@@ -49,6 +69,18 @@ def data_plane_process(
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
 
     model_runner = ModelRunner(config, rank, gbm=None)
+    prewarm_observations = []
+    if config.get("enable_kv_transfer_prewarm", True):
+        from lmpool.engine.kv_transfer import prewarm_p2p_pairs
+
+        prewarm_observations = prewarm_p2p_pairs(
+            config.get("nvlink_topo", {}).get("pairs") or [],
+            num_layers=int(config.get("num_layers", 1)),
+            block_size=int(config.get("block_size", 256)),
+            num_kv_heads=int(config.get("num_kv_heads", 1)),
+            head_dim=int(config.get("head_dim", config.get("hidden_size", 1) // config.get("num_heads", 1))),
+            num_blocks=max(1, int(config.get("kv_transfer_prewarm_blocks", 2))),
+        )
     control_plane_client = None
     if config.get("enable_global_pool", False) and config.get("use_control_plane_process", True):
         control_plane_client = ControlPlaneClient(
@@ -58,6 +90,8 @@ def data_plane_process(
             heartbeat_interval=float(config.get("heartbeat_interval", 1.0)),
             heartbeat_timeout=float(config.get("heartbeat_timeout", 3.0)),
         )
+        for observation in prewarm_observations:
+            control_plane_client.report_transfer_observation(**observation)
     scheduler = Scheduler(
         max_num_sequences=config.get("max_num_sequences", 16),
         max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
@@ -199,12 +233,26 @@ def data_plane_process(
         source_transfers = [
             transfer for transfer in transfers if rank == transfer["src_gpu"]
         ]
+        execution_stats = {}
         if source_transfers:
+            transfer_started = time.perf_counter()
+            transfer_observations = []
             for transfer in source_transfers:
+                operation_started = time.perf_counter()
                 model_runner.execute_swap_out(
                     transfer["src_blocks"],
                     transfer["dst_gpu"],
                 )
+                operation_time_s = time.perf_counter() - operation_started
+                transfer_observations.append({
+                    "src_gpu": int(transfer["src_gpu"]),
+                    "dst_gpu": int(transfer["dst_gpu"]),
+                    "transfer_bytes": model_runner.kv_transfer_bytes(
+                        len(transfer["src_blocks"])
+                    ),
+                    "transfer_time_s": operation_time_s,
+                })
+            transfer_time_s = time.perf_counter() - transfer_started
             sent_blocks = {
                 block_id
                 for transfer in source_transfers
@@ -236,6 +284,23 @@ def data_plane_process(
                     transfer.get("mode", plan.get("mode", "move")) == "chain_move"
                     for transfer in source_transfers
                 ),
+                "transfer_bytes": sum(
+                    model_runner.kv_transfer_bytes(len(transfer["src_blocks"]))
+                    for transfer in source_transfers
+                ),
+                "transfer_time_s": transfer_time_s,
+                "transfer_source_time_s": transfer_time_s,
+                "estimated_transfer_cost_ms": float(
+                    plan.get("estimated_transfer_cost_ms", 0.0)
+                ),
+                "estimated_saved_prefill_ms": float(
+                    plan.get("estimated_saved_prefill_ms", 0.0)
+                ),
+            }
+            execution_stats = {
+                "transfer_bytes": stats["transfer_bytes"],
+                "transfer_time_s": stats["transfer_time_s"],
+                "transfer_observations": transfer_observations,
             }
             if plan.get("background") and all(
                 transfer.get("mode", plan.get("mode", "move")) == "copy"
@@ -261,6 +326,7 @@ def data_plane_process(
                 local_target_blocks = prepared.get((src_gpu, tuple(src_blocks)))
                 if local_target_blocks is None:
                     local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
+                target_started = time.perf_counter()
                 model_runner.execute_swap_in(
                     src_gpu,
                     src_blocks,
@@ -272,11 +338,18 @@ def data_plane_process(
                     parent_hashes=parent_hashes,
                     access_counts=access_counts,
                 )
+                send_queue.put({
+                    "type": "runtime_stats",
+                    "rank": rank,
+                    "data": {
+                        "transfer_target_time_s": time.perf_counter() - target_started,
+                    },
+                })
 
         if plan_id is not None:
             prepared_rebalance_blocks.pop(plan_id, None)
         send_block_state()
-        return {"success": True, "rank": rank}
+        return {"success": True, "rank": rank, **execution_stats}
 
     if control_plane_client is not None:
         control_plane_client.set_rebalance_executor(execute_rebalance_plan)
@@ -298,6 +371,12 @@ def data_plane_process(
     def send_block_state():
         if control_plane_client is None:
             return
+        decode_weight = max(0.0, float(config.get("route_decode_token_weight", 8.0)))
+
+        def estimated_work_tokens(seq):
+            remaining_decode = max(0, int(seq.max_tokens) - int(seq.num_completion_tokens))
+            return int(len(seq) + decode_weight * remaining_decode)
+
         control_plane_client.report_block_state(
             len(scheduler.block_manager.free_block_ids),
             scheduler.block_manager.get_local_block_hashes(),
@@ -305,8 +384,8 @@ def data_plane_process(
             scheduler.block_manager.get_pinned_block_hashes(),
             len(scheduler.waiting),
             len(scheduler.running),
-            sum(len(seq) for seq in scheduler.waiting),
-            sum(len(seq) for seq in scheduler.running),
+            sum(estimated_work_tokens(seq) for seq in scheduler.waiting),
+            sum(estimated_work_tokens(seq) for seq in scheduler.running),
             scheduler.block_manager.get_local_block_parent_hashes(),
             scheduler.block_manager.get_local_block_access_stats(),
         )
@@ -347,19 +426,29 @@ def data_plane_process(
             if control_plane_client is not None:
                 control_plane_client.pump_async_messages()
                 maybe_send_worker_heartbeat()
-            timeout = 0.05 if scheduler.is_finished() else poll_timeout
-            msg = recv_queue.get(timeout=timeout)
-            if not handle_message(msg):
-                return
-            if msg.get("type") == "sequence":
-                received_sequences.append(msg["seq"])
-
-            while True:
-                msg = recv_queue.get_nowait()
+            events = _wait_for_worker_events(
+                recv_queue,
+                global_response_queue if control_plane_client is not None else None,
+                poll_timeout,
+            )
+            ingress_ready = True
+            if events is not None:
+                ingress_ready, control_ready = events
+                if control_ready:
+                    control_plane_client.pump_async_messages()
+            if ingress_ready:
+                msg = recv_queue.get(timeout=poll_timeout if events is None else 0)
                 if not handle_message(msg):
                     return
                 if msg.get("type") == "sequence":
                     received_sequences.append(msg["seq"])
+
+                while True:
+                    msg = recv_queue.get_nowait()
+                    if not handle_message(msg):
+                        return
+                    if msg.get("type") == "sequence":
+                        received_sequences.append(msg["seq"])
         except Exception as e:
             if isinstance(e, Empty):
                 pass
@@ -436,6 +525,17 @@ def data_plane_process(
 
         if local_seqs:
             run_tokens = sum(len(seq) for seq in local_seqs) if is_prefill else len(local_seqs)
+            prefill_cached_tokens = (
+                sum(min(len(seq), int(seq.num_cached_tokens)) for seq in local_seqs)
+                if is_prefill
+                else 0
+            )
+            prefill_uncached_tokens = (
+                max(0, run_tokens - prefill_cached_tokens) if is_prefill else 0
+            )
+            first_token_count = sum(
+                1 for seq in local_seqs if seq.num_completion_tokens == 0
+            )
             committed_route_seq_ids = []
             if is_prefill:
                 missing_blocks = [
@@ -467,20 +567,30 @@ def data_plane_process(
                     send_queue.put({"type": "prefill_stats", "rank": rank, "data": prefill_stats})
             run_started = time.perf_counter()
             outputs = model_runner.run(local_seqs, is_prefill)
-            run_elapsed = time.perf_counter() - run_started
             scheduler.block_manager.mark_kv_ready(local_seqs)
+            scheduler.postprocess(local_seqs, outputs)
+            # postprocess consumes sampled CUDA values, so this wall time also
+            # includes completion synchronization rather than only enqueue time.
+            run_elapsed = time.perf_counter() - run_started
             send_queue.put({
                 "type": "runtime_stats",
                 "rank": rank,
                 "data": {
                     "prefill_tokens": run_tokens if is_prefill else 0,
+                    "prefill_prompt_tokens": run_tokens if is_prefill else 0,
+                    "prefill_cached_tokens": prefill_cached_tokens,
+                    "prefill_uncached_tokens": prefill_uncached_tokens,
                     "decode_tokens": 0 if is_prefill else run_tokens,
                     "prefill_time_s": run_elapsed if is_prefill else 0.0,
                     "decode_time_s": 0.0 if is_prefill else run_elapsed,
-                    "first_tokens": sum(1 for seq in local_seqs if seq.num_completion_tokens == 0),
+                    "first_tokens": first_token_count,
                 },
             })
-            scheduler.postprocess(local_seqs, outputs)
+            if is_prefill and control_plane_client is not None:
+                control_plane_client.report_prefill_observation(
+                    prefill_uncached_tokens,
+                    run_elapsed,
+                )
             first_tokens = [
                 (seq.seq_id, _as_token_list([seq.completion_token_ids[-1]])[0])
                 for seq in local_seqs

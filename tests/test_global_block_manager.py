@@ -23,6 +23,23 @@ def test_lookup_prefix_prefers_nvlink_partner():
     assert [loc.gpu_id for loc in hits] == [1, 0]
 
 
+def test_lookup_prefix_hides_inflight_transfer_locations():
+    gbm = GlobalBlockManager(
+        rank=0,
+        world_size=2,
+        num_blocks_per_gpu=4,
+        nvlink_pairs=[(0, 1)],
+    )
+    gbm.global_page_table = {
+        99: [BlockLocation(0, 2, 99, 1.0), BlockLocation(1, 3, 99, 2.0)]
+    }
+    gbm.mark_transfer_blocks_inflight({(0, 2)})
+
+    hits = gbm.lookup_prefix(99, requester_rank=0)
+
+    assert [(loc.gpu_id, loc.block_id) for loc in hits] == [(1, 3)]
+
+
 def test_update_allocate_and_free_global_state():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.update_gpu_state(0, 3, {0: 111, 1: 222})
@@ -72,6 +89,34 @@ def test_update_gpu_state_preserves_worker_access_frequency_and_recency():
         for locations in gbm.global_page_table.values()
         for location in locations
     } == {0: 12.5, 1: 7.0}
+
+
+def test_hot_prefix_chains_return_only_maximal_ordered_hot_leaf():
+    gbm = GlobalBlockManager(
+        rank=0,
+        world_size=2,
+        num_blocks_per_gpu=8,
+        nvlink_pairs=[(0, 1)],
+    )
+    gbm.update_gpu_state(
+        0,
+        free_blocks=4,
+        block_hashes={0: 11, 1: 22, 2: 33, 3: 44},
+        block_parent_hashes={0: -1, 1: 11, 2: 22, 3: 22},
+        block_access_stats={
+            0: {"last_access_time": 1.0, "access_count": 3},
+            1: {"last_access_time": 2.0, "access_count": 3},
+            2: {"last_access_time": 3.0, "access_count": 3},
+            3: {"last_access_time": 4.0, "access_count": 1},
+        },
+    )
+
+    chains = gbm.get_hot_prefix_chains(0, min_access_count=2, max_blocks=8)
+
+    assert len(chains) == 1
+    assert chains[0]["hashes"] == [11, 22, 33]
+    assert chains[0]["block_ids"] == [0, 1, 2]
+    assert chains[0]["access_counts"] == [3, 3, 3]
 
 
 def test_effective_capacity_counts_dependency_safe_reclamation():

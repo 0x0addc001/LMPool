@@ -11,6 +11,23 @@ class DummyBlockManager:
         return prefix_hash_value + sum(token_ids)
 
 
+def test_prefill_observation_updates_destination_specific_transfer_benefit():
+    gbm = GlobalBlockManager(
+        rank=0,
+        world_size=2,
+        num_blocks_per_gpu=8,
+        nvlink_pairs=[(0, 1)],
+    )
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.prefill_token_time_ms = 0.02
+    scheduler.prefill_observation_discount = 0.5
+
+    scheduler.observe_prefill(gpu_id=1, uncached_tokens=100, elapsed_s=0.02)
+
+    assert scheduler.estimate_prefill_token_time_ms(0) == 0.02
+    assert scheduler.estimate_prefill_token_time_ms(1) == 0.1
+
+
 def test_route_sequence_meta_does_not_overweight_duplicate_prefix_replicas():
     gbm = GlobalBlockManager(rank=0, world_size=3, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [2, 3, 1]
@@ -261,6 +278,58 @@ def test_route_cost_keeps_long_prefix_on_moderately_loaded_owner():
     assert info["estimated_costs"][0]["prefill"] == 512
 
 
+def test_route_spills_prefix_request_to_idle_nvlink_partner_on_sequence_skew():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [8, 8]
+    gbm.running_sequences_per_gpu = [3, 0]
+    gbm.global_page_table = {
+        11: [BlockLocation(0, 0, 11, 1.0)],
+        22: [BlockLocation(0, 1, 22, 1.0)],
+    }
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=-1,
+        seq_id=20,
+        num_tokens=512,
+        num_blocks=2,
+        prefix_hash=22,
+        prefix_hashes=[11, 22],
+        return_info=True,
+    )
+
+    assert target == 1
+    assert info["reason"] == "prefix_hit_pair_spill"
+    assert info["prefix_owner_rank"] == 0
+    assert info["matched_prefix_blocks"] == 0
+
+
+def test_route_keeps_current_request_on_owner_when_hot_replica_copy_is_cheaper():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [8, 8]
+    gbm.running_sequences_per_gpu = [3, 0]
+    gbm.global_page_table = {
+        11: [BlockLocation(0, 0, 11, 1.0)],
+        22: [BlockLocation(0, 1, 22, 1.0)],
+    }
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.enable_routing_guided_copy = True
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=-1,
+        seq_id=21,
+        num_tokens=512,
+        num_blocks=2,
+        prefix_hash=22,
+        prefix_hashes=[11, 22],
+        return_info=True,
+    )
+
+    assert target == 0
+    assert info["reason"] == "prefix_hit_replica_copy"
+    assert info["replica_copy_saved_ms"] >= info["replica_copy_cost_ms"]
+
+
 def test_route_bypasses_owner_to_idle_gpu_with_reclaimable_capacity():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
     gbm.update_gpu_state(
@@ -334,7 +403,7 @@ def test_plan_rebalance_groups_transfers():
     gbm.block_access_time[0] = {0: 5.0, 1: 10.0}
     gbm.block_hash[0] = {0: 11, 1: 22}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1, allow_copy=True)
     assert plan is not None
@@ -352,7 +421,7 @@ def test_plan_rebalance_transfers_complete_chain_and_releases_only_leaf():
     gbm.block_parent_hash[0] = {0: -1, 1: 11}
     gbm.block_access_time[0] = {1: 5.0}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
 
@@ -373,7 +442,7 @@ def test_plan_rebalance_copies_pinned_ancestor_but_releases_unpinned_leaf():
     gbm.block_access_time[0] = {1: 5.0}
     gbm.pinned_block_ids[0] = {0}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
 
@@ -390,7 +459,7 @@ def test_plan_rebalance_releases_linear_chain_suffix_up_to_shortage():
     gbm.block_parent_hash[0] = {0: -1, 1: 11, 2: 22}
     gbm.block_access_time[0] = {2: 5.0}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=2)
 
@@ -408,7 +477,7 @@ def test_plan_rebalance_can_release_target_resident_ancestor_without_resending_i
     gbm.block_access_time[0] = {1: 5.0}
     gbm.block_hash[1] = {0: 11}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=2)
 
@@ -430,7 +499,7 @@ def test_plan_rebalance_reuses_ancestors_already_present_on_target():
         22: [BlockLocation(0, 1, 22, 1.0)],
     }
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
 
@@ -447,7 +516,7 @@ def test_plan_rebalance_shares_one_planned_ancestor_across_two_branches():
     gbm.block_parent_hash[0] = {0: -1, 1: 11, 2: 11}
     gbm.block_access_time[0] = {1: 5.0, 2: 6.0}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=2)
 
@@ -465,7 +534,7 @@ def test_plan_rebalance_prioritizes_high_frequency_chain_over_newer_cold_block()
     gbm.block_access_time[0] = {0: 1.0, 1: 10.0}
     gbm.block_access_count[0] = {0: 8, 1: 1}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
 
@@ -481,7 +550,7 @@ def test_plan_rebalance_excludes_source_blocks_reserved_by_pending_plans():
     gbm.block_access_time[0] = {0: 5.0, 1: 10.0}
     gbm.block_hash[0] = {0: 11, 1: 22}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(
         gpu_id=0,
@@ -499,7 +568,7 @@ def test_plan_rebalance_uses_copy_for_pinned_blocks_when_move_is_impossible():
     gbm.block_access_time[0] = {}
     gbm.block_hash[0] = {0: 11, 1: 22}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
-    scheduler.foreground_transfer_min_benefit_ratio = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1, allow_copy=True)
 
@@ -539,12 +608,85 @@ def test_plan_rebalance_accepts_hot_transfer_and_reports_cost():
     gbm.block_access_time[0] = {0: 1.0}
     gbm.block_access_count[0] = {0: 3}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 100.0
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.prefill_token_time_ms = 1.0
+    scheduler.future_reuse_discount = 1.0
 
     plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
 
     assert plan is not None
-    assert plan["estimated_benefit_ratio"] == 3.0
-    assert plan["estimated_saved_prefill"] > plan["estimated_transfer_cost"]
+    assert plan["estimated_future_reuses"] == 2.0
+    assert plan["estimated_saved_prefill_ms"] > plan["estimated_transfer_cost_ms"]
+
+
+def test_transfer_cost_smooths_end_to_end_placement_observation_per_pair():
+    gbm = GlobalBlockManager(rank=0, world_size=4, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1), (2, 3)])
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 10.0
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    transfer_bytes = 1024 ** 3
+
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 0, 1) == 100.0
+
+    scheduler.observe_placement(transfer_bytes, 0.5, 0, 1)
+
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 0, 1) == 200.0
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 2, 3) == 100.0
+
+
+def test_plan_rebalance_does_not_sum_accesses_across_chain_blocks():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_hash[0] = {0: 11, 1: 22}
+    gbm.block_parent_hash[0] = {0: -1, 1: 11}
+    gbm.block_access_time[0] = {0: 1.0, 1: 2.0}
+    gbm.block_access_count[0] = {0: 20, 1: 2}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 100.0
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.prefill_token_time_ms = 1.0
+    scheduler.future_reuse_discount = 1.0
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    assert plan["estimated_future_reuses"] == 1.0
+
+
+def test_observed_transfer_overhead_raises_future_cost_estimate():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 25.0
+    scheduler.transfer_fixed_latency_ms = 3.5
+    scheduler.transfer_interference_multiplier = 1.5
+    transfer_bytes = 224 * 1024 * 1024
+    static_cost = scheduler._estimate_transfer_cost_ms(transfer_bytes)
+
+    scheduler.observe_transfer(transfer_bytes, elapsed_s=0.2)
+
+    assert scheduler.observed_transfer_extra_ms is not None
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes) > static_cost
+
+
+def test_observed_transfer_cost_is_isolated_by_nvlink_pair():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 25.0
+    transfer_bytes = 64 * 1024 * 1024
+    cold_pair_cost = scheduler._estimate_transfer_cost_ms(transfer_bytes, 2, 3)
+
+    scheduler.observe_transfer(
+        transfer_bytes,
+        elapsed_s=0.2,
+        src_gpu=0,
+        dst_gpu=1,
+    )
+
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 0, 1) > cold_pair_cost
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 2, 3) == cold_pair_cost
+    assert (0, 1) in scheduler.observed_transfer_extra_ms_by_pair
 
 
 def test_plan_rebalance_does_not_use_recursive_target_victims():

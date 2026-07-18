@@ -39,7 +39,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from lmpool.engine.kv_transfer import swap_in
+from lmpool.engine.kv_transfer import prewarm_p2p_pairs, swap_in
 
 
 def _find_free_port() -> int:
@@ -92,6 +92,14 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
     if rank == 0:
         _fill_source_blocks(kv_cache, src_blocks)
 
+    prewarm_p2p_pairs(
+        [(0, 1)],
+        num_layers=args.num_layers,
+        block_size=args.block_size,
+        num_kv_heads=args.num_kv_heads,
+        head_dim=args.head_dim,
+        num_blocks=args.num_transfer_blocks,
+    )
     dist.barrier()
     total_iters = args.warmup + args.iterations
     measured_ms: list[float] = []
@@ -110,6 +118,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
                 block_size=args.block_size,
                 num_kv_heads=args.num_kv_heads,
                 head_dim=args.head_dim,
+                negotiate_blocks=False,
             )
         else:
             swap_in(
@@ -122,6 +131,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
                 num_kv_heads=args.num_kv_heads,
                 head_dim=args.head_dim,
                 local_target_blocks=dst_blocks,
+                negotiate_blocks=False,
             )
         torch.cuda.synchronize()
         elapsed_ms = (time.perf_counter() - start) * 1000.0

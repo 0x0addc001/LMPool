@@ -16,11 +16,13 @@
     --workload locality \
     --locality-prefix-groups 16 \
     --memory-skew-prefix-groups 15 \
+    --handoff-prefix-groups 32 \
     --world-size 2 \
     --nvlink-pairs "0,1" \
     --kv-block-budget 64 \
+    --gpu-memory-utilization 0.20 \
     --submit-window 5 \
-    --background-copy-max-blocks 1 \
+    --background-copy-max-blocks 8 \
     --background-copy-cooldown-s 2.0 \
     --background-copy-hot-threshold 3 \
     --route-load-weight 0.03 \
@@ -29,6 +31,11 @@
     --route-reclaim-cost-weight 0.5 \
     --foreground-transfer-cost-weight 1.0 \
     --foreground-transfer-min-benefit-ratio 1.5 \
+    --foreground-transfer-bandwidth-gib-s 3.5 \
+    --foreground-transfer-fixed-latency-ms 2.0 \
+    --foreground-transfer-interference-multiplier 1.5 \
+    --foreground-prefill-token-time-ms 0.02 \
+    --foreground-future-reuse-discount 0.5 \
     --route-cache-queue-slack 256 \
     --goodput-e2e-sla-ms 10000 \
     --output-json ./benchmarks/results/shared_prefix_benchmark_202607121117.json \
@@ -64,6 +71,10 @@
   `load-skew` 用一个热点前缀加少量冷前缀制造请求负载倾斜；
   `memory-skew` 依次执行热点前缀预热、源端一次性前缀施压、热点前缀复用三个阶段，
   用于验证 foreground transfer 是否既释放源端容量，又在 NVLink 伙伴保留可复用前缀。
+  `session-handoff` 把等长的 warmup/reuse 两阶段固定到 NVLink pair 两侧，专门验证
+  proactive copy 能否避免 partner 的首次重算，并通过 placement lease 服务后续请求。
+  对 topology-blind baseline 和 transfer-only，复用阶段会确定性地跨到对应 NVLink partner：
+  baseline 必须在 partner 重算，只有已经完成 transfer 的前缀才能直接命中。
 
 9. `--locality-prefix-groups`：
   `locality` workload 中不同长共享前缀的组数，默认 16。每组请求数保持均衡，并按 `--seed`
@@ -76,86 +87,139 @@
   阶段固定到一个 source rank，reuse 阶段交错重放；使用多个热点可防止 round-robin 在第一次
   miss 后自然把唯一热点复制到所有 GPU。该值不能超过 warmup 或 reuse 阶段请求数。
 
-11. `--output-json`：
+11. `--handoff-prefix-groups`：
+  `session-handoff` 两个阶段共享的会话前缀组数。默认 0 自动取每阶段请求数与 32 的较小值；
+  最大不能超过 `--num-prompts / 2`。值越接近每阶段请求数，partner 在 baseline 中自行预热的
+  机会越少，越能直接测量 transfer 避免的首次 prefill。
+
+12. `--output-json`：
   将各场景统计结果导出到指定 JSON 文件。脚本会自动创建父目录，并在成功后打印
   `saved json: ...`。
 
-12. `--model-name-or-path`：
+13. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
-13. `--nvlink-pairs`：
+14. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
   可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
   例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-14. `--world-size`：
+15. `--world-size`：
   多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
   该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
 
-15. `--kv-block-budget`：
-  每个 rank 请求使用的 KV block 上限。五个场景必须使用同一个值，避免把容量差异误判成
-  routing / transfer 收益；worker 仍会根据实际可用显存把它收敛到可分配的共同上限。
+16. `--kv-block-budget`：
+  每个 rank 请求使用的 KV block 数。五个场景必须使用同一个值，避免把容量差异误判成
+  routing / transfer 收益。显式设置后采用严格语义：worker 实际容量不足时会在提交请求前报错，
+  不再静默缩小预算。
   旧参数 `--routing-max-cached-blocks` 和 `--eviction-max-cached-blocks` 仅保留命令兼容，
   如果同时提供则数值必须完全相同。
 
-16. `--goodput-e2e-sla-ms`：
+17. `--gpu-memory-utilization`：
+  ModelRunner 推导可用 KV cache 容量时可使用的空闲显存比例，范围 `(0, 1]`，benchmark
+  默认 0.20。最终分配仍受 `--kv-block-budget` 限制；提高该值只是让显式 block budget
+  能够实现，不会越过该上限。
+
+18. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-17. `--skip-pool`：
+19. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-18. `--output-figure`：
+20. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-19. `--submit-window`：
+21. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
-20. `--disable-background-copy`：
+22. `--disable-background-copy`：
   关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
   伙伴，服务后续请求；关闭后只保留因当前请求容量不足而同步触发的 foreground transfer。
 
-21. `--background-copy-max-blocks`：
-  每次后台 copy 最多复制多少个 prefix block。值越大越可能提高后续本地命中，但会占用更多
-  NCCL / worker 时间；排查功能正确性可先用 1，验证收益时建议尝试 2。
+23. `--background-copy-max-blocks`：
+  每条后台候选前缀链最多贡献多少个 prefix block。相同方向、相同 NVLink pair 的多条候选
+  会在内部合并成一个有界 plan，以摊薄 prepare/execute 和 payload 启动开销。
 
-22. `--background-copy-cooldown-s`：
+24. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
-23. `--background-copy-hot-threshold`：
-  同一个 prefix 至少被路由命中多少次后才允许后台 copy。值越大越保守，能减少无效 copy；
-  值为 1 时退化为旧的 eager speculative copy。
+25. `--background-copy-hot-threshold`：
+  最大热点前缀链中每个 block 至少需要达到的 worker 上报访问次数。值越大越保守，能减少
+  无效 copy；该统计来自真实数据面访问，不再使用路由请求次数代替。
 
-24. `--route-load-weight`：
+26. `--background-copy-min-load-skew`：
+  route-originated 候选发现要求 prefix owner 与 NVLink partner 至少相差多少队列压力，默认 2；
+  phase 边界的 ingress forecast 使用已观测的数据放置偏斜，不受该瞬时负载差限制。
+
+27. `--background-copy-expected-reuses`：
+  预测未来复用次数的保守上限，默认 4。实际预测来自 ingress 尚未提交请求的逐前缀计数；
+  没有 forecast 时才使用折扣后的 worker 历史访问次数，不再固定假设一定有 4 次复用。
+
+28. `--route-decode-token-weight`：
+  一个预计 decode token 在路由负载快照中的权重，默认 8，用于避免长输出请求集中到单一 owner。
+
+29. `--route-owner-spill-sequence-skew`：
+  prefix owner 比 NVLink partner 多出的序列压力达到该值时允许 pair 内 spill，默认 2。
+
+30. `--route-owner-spill-max-extra-cost`：
+  pair spill 相比留在 owner 最多允许增加的 token-equivalent 重算成本，默认 2048。
+
+31. `--route-load-weight`：
   旧 prefix score 中 token-aware load 的 tie-break 权重。主路由决策现在使用统一预计完成成本；
   该参数只在成本相同时参与稳定排序，通常保持默认值。
 
-25. `--route-load-bypass-threshold`：
+32. `--route-load-bypass-threshold`：
   冷目标的预计总成本必须比 prefix owner 至少低多少 token-equivalent cost，才允许绕过
   owner。值越小越激进，越容易牺牲 locality 换并行度。
 
-26. `--route-prefill-cost-weight`：
+33. `--route-prefill-cost-weight`：
   缺失 prefix token 的重算成本权重。默认 1.0，使一个缺失 token 与一个 waiting token
   使用相同成本单位；增大后路由更偏向已有 prefix 的 owner。
 
-27. `--route-reclaim-cost-weight`：
+34. `--route-reclaim-cost-weight`：
   使用 reclaimable capacity 时，每个待回收 block 按 `block_size * weight` 计入的附加成本。
   默认 0.5，用于反映回收元数据操作及未来 cache miss 风险。
 
-28. `--foreground-transfer-cost-weight`：
-  一个 transferred block 折算成多少个 block 的 prefill 成本，默认 1.0。可根据
-  `benchmark_kv_transfer.py` 与实测 prefill 时间校准。
+35. `--foreground-transfer-cost-weight`：
+  对时间模型算出的 transfer 成本施加的整体倍率，默认 1.0。大于 1 会更保守；通常保持
+  1.0，优先校准下面的带宽、固定延迟和干扰系数。
 
-29. `--foreground-transfer-min-benefit-ratio`：
-  foreground transfer 预计保留的 prefix prefill 收益与 transfer 成本的最小比值。
+36. `--foreground-transfer-min-benefit-ratio`：
+  foreground transfer 预计节省的 prefill 毫秒数与预计 transfer 毫秒数的最小比值。
   默认 1.5；未达到门槛时跳过 transfer，直接使用本地回收。
 
-30. `--route-cache-queue-slack`：
+37. `--foreground-transfer-bandwidth-gib-s`：
+  成本模型采用的有效 KV transfer 带宽，单位 GiB/s。应使用
+  `benchmarks/benchmark_kv_transfer.py` 在当前 GPU/NVLink 拓扑上的实测值，而不是 NVLink
+  链路标称带宽；默认 3.5。
+
+38. `--foreground-transfer-fixed-latency-ms`：
+  每个 transfer plan 的固定协议、协调和启动延迟，单位毫秒，默认 2.0。
+
+39. `--foreground-transfer-interference-multiplier`：
+  对纯链路传输时间施加的前台推理干扰倍率，默认 1.5，且不能小于 1。它用于反映打包、
+  解包以及源/目标 GPU 被通信占用的代价。
+
+40. `--foreground-prefill-token-time-ms`：
+  重算一个未缓存 prompt token 的预计耗时，单位毫秒，默认 0.02。该值应由目标模型的
+  prefill 统计校准。
+
+41. `--foreground-future-reuse-discount`：
+  将历史叶前缀访问次数折算成未来复用次数的折扣，范围 `[0, 1]`，默认 0.5。成本模型不会
+  再把前缀链上每个 block 的访问次数相加，从而避免将一条请求重复计算多次。
+
+42. `--kv-transfer-prewarm-blocks`：
+  serving 开始前，每个 NVLink pair 使用真实 KV 形状预热的 block 数，默认 2。预热会循环
+  使用与线上一致的单个 all-layer 连续 payload，并把测得的 pair-specific 成本送入控制面，
+  但不计入 throughput 或 latency。
+
+43. `--route-cache-queue-slack`：
   route cache 命中时允许 cached owner 相比最低成本候选多出的 token-equivalent cost。
   值越小，缓存路由越容易被负载不均打破。
 
@@ -167,9 +231,9 @@
 4. 表里的 prefix hit 是 worker 在 prefill 时实际观察到的本地 prefix cache 命中率，
    round-robin 基线也会统计，因此可横向对比。它不是控制面路由命中率。
 5. `multi-gpu-lmpool` 需要至少 2 张可见 CUDA GPU。
-6. 如果要专门验证后台 speculative copy-style transfer，所有场景仍应使用相同的
-   `--kv-block-budget`；通过 `memory-skew` workload 和 background-copy 参数制造迁移需求，
-   不要通过缩小某一个场景的容量制造不公平结果。
+6. 如果要专门验证后台 copy-style transfer，所有场景仍应使用相同的
+   `--kv-block-budget`；优先使用 `session-handoff` 明确制造跨 pair 复用，使用
+   `memory-skew` 验证容量压力。不要通过缩小某一个场景的容量制造不公平结果。
 """
 
 import argparse
@@ -239,7 +303,10 @@ MODEL_CONFIG = {
     "ffn_bias": False,
     "max_num_batch_tokens": 4096,
     "max_model_length": 2048,
-    "gpu_memory_utilization": 0.05,
+    # This fraction is used only to derive KV capacity; max_cached_blocks still
+    # caps the actual allocation. Five percent yielded only 14 Qwen3 blocks on
+    # the evaluation GPUs, silently invalidating explicit 64-block experiments.
+    "gpu_memory_utilization": 0.20,
     "eos": 151645,
     "log_level": "ERROR",
     "log_timing": False,
@@ -257,6 +324,9 @@ MODEL_CONFIG = {
     "route_running_token_weight": 0.25,
     "route_running_sequence_weight": 32.0,
     "route_load_bypass_threshold": 256.0,
+    "route_decode_token_weight": 8.0,
+    "route_owner_spill_sequence_skew": 2.0,
+    "route_owner_spill_max_extra_cost": 2048.0,
     "route_prefill_cost_weight": 1.0,
     "route_reclaim_cost_weight": 0.5,
     "route_cache_queue_slack": 256.0,
@@ -264,13 +334,33 @@ MODEL_CONFIG = {
     "foreground_transfer_min_blocks": 2,
     "foreground_transfer_cost_weight": 1.0,
     "foreground_transfer_min_benefit_ratio": 1.5,
+    # Time-domain transfer cost model. Calibrate bandwidth with
+    # benchmark_kv_transfer.py; the other terms account for protocol setup and
+    # interference with foreground model execution.
+    "foreground_transfer_bandwidth_gib_s": 3.5,
+    "foreground_transfer_fixed_latency_ms": 2.0,
+    "foreground_transfer_interference_multiplier": 1.5,
+    "foreground_prefill_token_time_ms": 0.02,
+    "foreground_future_reuse_discount": 0.5,
+    "foreground_transfer_ewma_alpha": 0.25,
+    "enable_kv_transfer_prewarm": True,
+    "kv_transfer_prewarm_blocks": 2,
     "foreground_transfer_fail_cooldown_s": 2.0,
     "foreground_transfer_fail_cooldown_max_s": 30.0,
-    # 后台 speculative copy-style transfer：每次只复制少量热点 prefix block，避免抢占前台推理时间。
+    # 后台 proactive copy-style transfer：worker access snapshot 发现热点，
+    # ingress 未提交需求估计剩余复用，并按 NVLink pair 在低负载时串行放置。
     "enable_background_copy": True,
-    "background_copy_max_blocks": 1,
+    "background_copy_max_blocks": 8,
+    # Coalesce independent prefix candidates on one directed NVLink pair into
+    # one prepare/execute transaction and one contiguous KV payload.
+    "background_copy_batch_max_candidates": 16,
+    "background_copy_batch_max_blocks": 128,
     "background_copy_cooldown_s": 2.0,
     "background_copy_hot_threshold": 3,
+    "background_copy_min_load_skew": 2.0,
+    "background_copy_expected_reuses": 4.0,
+    "background_copy_idle_pressure_threshold": 2.0,
+    "background_copy_flush_timeout_s": 600.0,
 }
 
 
@@ -324,6 +414,13 @@ class ScenarioResult:
     preemption_count: int
     redundant_prefill_tokens: int
     transfer_count: int
+    transfer_bytes: int
+    transfer_time_s: float
+    transfer_source_time_s: float
+    transfer_target_time_s: float
+    transfer_bandwidth_gib_s: float
+    estimated_transfer_cost_ms: float
+    estimated_saved_prefill_ms: float
     transfer_copy_count: int
     transfer_release_count: int
     chain_transfer_count: int
@@ -352,6 +449,15 @@ class ScenarioResult:
     mean_ttft_s_std: float = 0.0
     mean_e2e_s_std: float = 0.0
     phase_latency_stats: dict[str, dict[str, float]] | None = None
+    pair_spill_count: int = 0
+    replica_copy_route_count: int = 0
+    placement_lease_route_count: int = 0
+    background_placement_stats: dict[str, int] | None = None
+    background_placement_pair_stats: dict[str, dict[str, int]] | None = None
+    prefill_prompt_tokens: int = 0
+    prefill_cached_tokens: int = 0
+    prefill_uncached_tokens: int = 0
+    placement_wait_s: float = 0.0
 
 
 def build_shared_prefix(prompt_repeat: int, prefix_group: str = "shared") -> str:
@@ -379,6 +485,7 @@ def build_prompts(
     workload: str = "locality",
     locality_prefix_groups: int = 16,
     memory_skew_prefix_groups: int = 15,
+    handoff_prefix_groups: int = 32,
     seed: int = 0,
 ) -> list[str]:
     # locality: 多组长共享前缀，主要验证 KVCache-aware routing，避免单一前缀被每卡复制后
@@ -386,6 +493,8 @@ def build_prompts(
     # load-skew: 多数请求共享热点前缀，少数请求落到冷前缀，观察 routing 是否能兼顾 locality 和 load。
     # memory-skew: 依次执行热点预热、一次性前缀施压、热点复用三个阶段，验证 transfer
     # 是否能在释放源端容量的同时，把完整可复用前缀链保留到 NVLink 伙伴。
+    # session-handoff: 前半段在 source 建立多条会话前缀，后半段在 NVLink partner 继续
+    # 同一批会话。它避免 partner 在测量阶段前自行预热，是 transfer 的主验证 workload。
     if workload == "locality":
         locality_prefixes = [
             build_shared_prefix(prompt_repeat, f"locality-{group:04d}")
@@ -402,7 +511,7 @@ def build_prompts(
             build_shared_prefix(max(1, prompt_repeat // 2), f"cold-{group:04d}")
             for group in range(4)
         ]
-    else:
+    elif workload == "memory-skew":
         # Multiple hot chains prevent round-robin from learning the only hot
         # prefix locally after one miss. Each group is warmed on one source and
         # revisited in an interleaved reuse phase.
@@ -412,6 +521,14 @@ def build_prompts(
         ]
         warmup_end = max(1, num_prompts // 4)
         pressure_end = max(warmup_end + 1, num_prompts // 2)
+    elif workload == "session-handoff":
+        hot_prefixes = [
+            build_shared_prefix(prompt_repeat, f"handoff-{group:04d}")
+            for group in range(handoff_prefix_groups)
+        ]
+        warmup_end = num_prompts // 2
+    else:
+        raise ValueError(f"unknown workload: {workload}")
     prompts = []
     for i in range(num_prompts):
         suffix = SUFFIXES[i % len(SUFFIXES)]
@@ -429,6 +546,9 @@ def build_prompts(
                     max(1, prompt_repeat // 2),
                     f"pressure-{i - warmup_end:04d}",
                 )
+        elif workload == "session-handoff":
+            phase_index = i if i < warmup_end else i - warmup_end
+            shared_prefix = hot_prefixes[phase_index % handoff_prefix_groups]
         else:
             raise ValueError(f"unknown workload: {workload}")
         prompt = f"{shared_prefix} Now answer the following request: {suffix}"
@@ -497,6 +617,17 @@ def resolve_memory_skew_source_ranks(config: dict) -> list[int]:
     return sorted({int(pair[0]) for pair in pairs}) or [0]
 
 
+def resolve_memory_skew_target_by_source(config: dict) -> dict[int, int]:
+    return {
+        int(source): int(target)
+        for source, target in config.get("benchmark_memory_skew_target_by_source", {}).items()
+        if (
+            0 <= int(source) < config["world_size"]
+            and 0 <= int(target) < config["world_size"]
+        )
+    }
+
+
 def resolve_memory_skew_prefix_groups(num_prompts: int, requested: int) -> int:
     """Resolve enough hot groups to avoid one-prefix baseline saturation."""
     warmup_requests = max(1, num_prompts // 4)
@@ -510,6 +641,18 @@ def resolve_memory_skew_prefix_groups(num_prompts: int, requested: int) -> int:
         return requested
     automatic = min(15, maximum)
     return automatic if automatic % 2 == 1 else max(1, automatic - 1)
+
+
+def resolve_handoff_prefix_groups(num_prompts: int, requested: int) -> int:
+    """Resolve session groups shared exactly across warmup and handoff phases."""
+    if num_prompts < 2 or num_prompts % 2:
+        raise ValueError("session-handoff requires an even --num-prompts >= 2")
+    requests_per_phase = num_prompts // 2
+    if requested > requests_per_phase:
+        raise ValueError(
+            "--handoff-prefix-groups cannot exceed half of --num-prompts"
+        )
+    return requested if requested > 0 else min(32, requests_per_phase)
 
 
 def _visible_physical_gpu_ids(world_size: int) -> list[int]:
@@ -801,6 +944,13 @@ def run_independent_multi_gpu_benchmark(
             preemption_count=0,
             redundant_prefill_tokens=0,
             transfer_count=0,
+            transfer_bytes=0,
+            transfer_time_s=0.0,
+            transfer_source_time_s=0.0,
+            transfer_target_time_s=0.0,
+            transfer_bandwidth_gib_s=0.0,
+            estimated_transfer_cost_ms=0.0,
+            estimated_saved_prefill_ms=0.0,
             transfer_copy_count=0,
             transfer_release_count=0,
             chain_transfer_count=0,
@@ -899,6 +1049,9 @@ def run_engine_scenario(
     route_hits = 0
     routed_to_prefix_owner = 0
     route_count = 0
+    pair_spill_count = 0
+    replica_copy_route_count = 0
+    placement_lease_route_count = 0
     route_matched_blocks = 0
     route_full_blocks = 0
     reclaimable_capacity_routes = 0
@@ -921,11 +1074,24 @@ def run_engine_scenario(
         "pressure": [],
         "reuse": [],
     }
+    phase_output_tokens: dict[str, int] = {
+        "warmup": 0,
+        "pressure": 0,
+        "reuse": 0,
+    }
+    phase_started_at: dict[str, float] = {}
+    phase_finished_at: dict[str, float] = {}
     initial_cached_tokens = 0
     initial_prompt_tokens = 0
     prefill_attempts = 0
     preemption_count = 0
     transfer_count = 0
+    transfer_bytes = 0
+    transfer_time_s = 0.0
+    transfer_source_time_s = 0.0
+    transfer_target_time_s = 0.0
+    estimated_transfer_cost_ms = 0.0
+    estimated_saved_prefill_ms = 0.0
     transfer_copy_count = 0
     transfer_release_count = 0
     chain_transfer_count = 0
@@ -936,9 +1102,14 @@ def run_engine_scenario(
     background_copy_success = 0
     background_copy_fail = 0
     background_copy_fail_reasons: dict[str, int] = {}
+    background_placement_stats: dict[str, int] = {}
+    background_placement_pair_stats: dict[str, dict[str, int]] = {}
+    placement_wait_s = 0.0
     rank_stats: dict[int, dict] = {}
-    start_wall = time.perf_counter()
+    start_wall = 0.0
+    last_progress_report = 0.0
     sampler = GpuMetricSampler(interval_s=0.5, world_size=config["world_size"])
+    sampler_started = False
 
     def get_rank_stats(rank: int) -> dict:
         return rank_stats.setdefault(
@@ -958,10 +1129,17 @@ def run_engine_scenario(
                 "initial_prompt_tokens": 0,
                 "preemption_count": 0,
                 "prefill_tokens": 0,
+                "prefill_prompt_tokens": 0,
+                "prefill_cached_tokens": 0,
+                "prefill_uncached_tokens": 0,
                 "decode_tokens": 0,
                 "prefill_time_s": 0.0,
                 "decode_time_s": 0.0,
                 "transfers": 0,
+                "transfer_bytes": 0,
+                "transfer_time_s": 0.0,
+                "transfer_source_time_s": 0.0,
+                "transfer_target_time_s": 0.0,
                 "copies": 0,
                 "released_blocks": 0,
                 "chain_transfers": 0,
@@ -975,7 +1153,30 @@ def run_engine_scenario(
         )
 
     try:
-        sampler.start()
+        worker_capacities: dict[int, int] = {}
+        capacity_deadline = time.monotonic() + 600.0
+        while len(worker_capacities) < config["world_size"]:
+            if time.monotonic() >= capacity_deadline:
+                raise RuntimeError(
+                    f"timed out waiting for KV capacities: received "
+                    f"{len(worker_capacities)}/{config['world_size']} workers"
+                )
+            _finished, _first_tokens, _prefill_stats, startup_stats = engine.step()
+            for item in startup_stats:
+                if "max_cached_blocks" in item and "rank" in item:
+                    worker_capacities[int(item["rank"])] = int(item["max_cached_blocks"])
+        for rank, capacity in worker_capacities.items():
+            get_rank_stats(rank)["max_cached_blocks"] = capacity
+
+        requested_budget = int(config.get("max_cached_blocks", 0))
+        actual_budget = min(worker_capacities.values())
+        if config.get("require_exact_kv_block_budget") and actual_budget < requested_budget:
+            raise RuntimeError(
+                f"requested --kv-block-budget {requested_budget}, but workers can allocate "
+                f"only {actual_budget} blocks with --gpu-memory-utilization "
+                f"{config.get('gpu_memory_utilization')}. Increase GPU memory utilization "
+                f"or lower the KV block budget."
+            )
 
         next_prompt_idx = 0
         finished_count = 0
@@ -983,11 +1184,19 @@ def run_engine_scenario(
         completion_token_counts: dict[int, int] = {}
         inflight: set[int] = set()
         effective_submit_window = len(prompts) if submit_window <= 0 else max(1, submit_window)
-        if workload == "memory-skew":
-            warmup_end = max(1, len(prompts) // 4)
-            pressure_end = max(warmup_end + 1, len(prompts) // 2)
-            phase_ends = [warmup_end, pressure_end, len(prompts)]
+        transfer_workload = workload in {"memory-skew", "session-handoff"}
+        if transfer_workload:
+            if workload == "memory-skew":
+                warmup_end = max(1, len(prompts) // 4)
+                pressure_end = max(warmup_end + 1, len(prompts) // 2)
+                phase_ends = [warmup_end, pressure_end, len(prompts)]
+            else:
+                warmup_end = len(prompts) // 2
+                pressure_end = warmup_end
+                phase_ends = [warmup_end, len(prompts)]
             source_ranks = resolve_memory_skew_source_ranks(config)
+            target_by_source = resolve_memory_skew_target_by_source(config)
+            transfer_prefix_groups = int(config["benchmark_transfer_prefix_groups"])
             warmup_hash_chains = [
                 compute_sequence_prefix_hashes(Sequence(
                     token_ids=tokenizer.encode(prompts[index]),
@@ -1002,18 +1211,38 @@ def run_engine_scenario(
             hot_prefix_hashes = {
                 block_hash
                 for block_hash, frequency in warmup_hash_frequency.items()
-                if frequency >= 2
+                if frequency >= (1 if workload == "session-handoff" else 2)
             }
+            future_prefix_demands: dict[int, int] = {}
+            for index in range(pressure_end, len(prompts)):
+                seq = Sequence(
+                    token_ids=tokenizer.encode(prompts[index]),
+                    block_size=config["block_size"],
+                )
+                for block_hash in compute_sequence_prefix_hashes(seq):
+                    future_prefix_demands[block_hash] = (
+                        future_prefix_demands.get(block_hash, 0) + 1
+                    )
         else:
             warmup_end = pressure_end = 0
             phase_ends = [len(prompts)]
             source_ranks = [0]
+            target_by_source = {}
             hot_prefix_hashes = set()
+            future_prefix_demands = {}
+        # Serving metrics start only after model load, CUDA/NCCL warmup, KV
+        # allocation, and benchmark metadata preparation have completed.
+        sampler.start()
+        sampler_started = True
+        start_wall = time.perf_counter()
+        last_progress_report = start_wall
         current_phase_index = 0
         current_phase_end = phase_ends[current_phase_index]
 
         def submit_prompt(prompt: str, prompt_index: int):
             nonlocal route_hits, routed_to_prefix_owner, route_count
+            nonlocal pair_spill_count, replica_copy_route_count
+            nonlocal placement_lease_route_count
             nonlocal route_matched_blocks, route_full_blocks
             nonlocal reclaimable_capacity_routes
             seq = Sequence(
@@ -1023,20 +1252,37 @@ def run_engine_scenario(
             )
             start = time.perf_counter()
             target_rank = 0
-            if workload == "memory-skew" and prompt_index < warmup_end:
+            if transfer_workload and prompt_index < warmup_end:
                 # Deterministically create placement skew: warm-up and pressure
                 # use only the source side of each NVLink pair. Reuse returns to
                 # the scenario's normal routing/round-robin policy.
-                prefix_group = prompt_index % config["memory_skew_prefix_groups"]
+                prefix_group = prompt_index % transfer_prefix_groups
                 target_rank = source_ranks[prefix_group % len(source_ranks)]
             elif workload == "memory-skew" and prompt_index < pressure_end:
                 target_rank = source_ranks[(prompt_index - warmup_end) % len(source_ranks)]
+            elif transfer_workload and route_mode == "round_robin":
+                # The reuse phase deliberately crosses each NVLink pair for
+                # both the multi-GPU baseline and transfer-only scenario. The
+                # baseline must recompute on the partner; a successful transfer
+                # can serve the first partner-side reuse immediately.
+                prefix_group = (prompt_index - pressure_end) % transfer_prefix_groups
+                source_rank = source_ranks[prefix_group % len(source_ranks)]
+                target_rank = target_by_source.get(source_rank, source_rank)
             elif route_mode == "control_plane" and engine.control_plane_client is not None:
                 # 控制面模式：每个请求都先做 prefix hash，再让全局调度器决定落在哪张卡
                 routed = engine.control_plane_client.route_sequence(seq, return_meta=True)
                 target_rank = routed["target_rank"]
                 route_info = routed.get("route_info", {})
                 route_count += 1
+                pair_spill_count += int(
+                    route_info.get("reason") == "prefix_hit_pair_spill"
+                )
+                replica_copy_route_count += int(
+                    route_info.get("reason") == "prefix_hit_replica_copy"
+                )
+                placement_lease_route_count += int(
+                    route_info.get("reason") == "placement_lease"
+                )
                 matched_blocks = int(route_info.get("matched_prefix_blocks", 0))
                 route_matched_blocks += matched_blocks
                 route_full_blocks += seq.num_tokens // seq.block_size
@@ -1056,7 +1302,7 @@ def run_engine_scenario(
             seq.remote_gpu_id = -1
             engine.send_queues[target_rank].put({"type": "sequence", "seq": seq})
             submit_times[seq.seq_id] = start
-            if workload == "memory-skew":
+            if transfer_workload:
                 if prompt_index < warmup_end:
                     phase_name = "warmup"
                 elif prompt_index < pressure_end:
@@ -1064,6 +1310,7 @@ def run_engine_scenario(
                 else:
                     phase_name = "reuse"
                 phase_by_seq[seq.seq_id] = phase_name
+                phase_started_at.setdefault(phase_name, start)
                 get_rank_stats(target_rank)[f"{phase_name}_submitted"] += 1
             get_rank_stats(target_rank)["submitted"] += 1
             inflight.add(seq.seq_id)
@@ -1084,6 +1331,12 @@ def run_engine_scenario(
                         int(item["max_cached_blocks"]),
                     )
                 transfer_count += int(item.get("transfer_count", item.get("swap_count", 0)))
+                transfer_bytes += int(item.get("transfer_bytes", 0))
+                transfer_time_s += float(item.get("transfer_time_s", 0.0))
+                transfer_source_time_s += float(item.get("transfer_source_time_s", 0.0))
+                transfer_target_time_s += float(item.get("transfer_target_time_s", 0.0))
+                estimated_transfer_cost_ms += float(item.get("estimated_transfer_cost_ms", 0.0))
+                estimated_saved_prefill_ms += float(item.get("estimated_saved_prefill_ms", 0.0))
                 transfer_copy_count += int(item.get("transfer_copy_count", 0))
                 transfer_release_count += int(item.get("transfer_release_count", 0))
                 chain_transfer_count += int(item.get("chain_transfer_count", 0))
@@ -1098,6 +1351,10 @@ def run_engine_scenario(
                 background_copy_fail += int(item.get("background_copy_fail", 0))
                 preemption_count += int(item.get("preemption_count", 0))
                 rank_data["transfers"] += int(item.get("transfer_count", item.get("swap_count", 0)))
+                rank_data["transfer_bytes"] += int(item.get("transfer_bytes", 0))
+                rank_data["transfer_time_s"] += float(item.get("transfer_time_s", 0.0))
+                rank_data["transfer_source_time_s"] += float(item.get("transfer_source_time_s", 0.0))
+                rank_data["transfer_target_time_s"] += float(item.get("transfer_target_time_s", 0.0))
                 rank_data["copies"] += int(item.get("transfer_copy_count", 0))
                 rank_data["released_blocks"] += int(item.get("transfer_release_count", 0))
                 rank_data["chain_transfers"] += int(item.get("chain_transfer_count", 0))
@@ -1108,6 +1365,15 @@ def run_engine_scenario(
                 rank_data["background_copy_fail"] += int(item.get("background_copy_fail", 0))
                 rank_data["preemption_count"] += int(item.get("preemption_count", 0))
                 rank_data["prefill_tokens"] += int(item.get("prefill_tokens", 0))
+                rank_data["prefill_prompt_tokens"] += int(
+                    item.get("prefill_prompt_tokens", item.get("prefill_tokens", 0))
+                )
+                rank_data["prefill_cached_tokens"] += int(
+                    item.get("prefill_cached_tokens", 0)
+                )
+                rank_data["prefill_uncached_tokens"] += int(
+                    item.get("prefill_uncached_tokens", item.get("prefill_tokens", 0))
+                )
                 rank_data["decode_tokens"] += int(item.get("decode_tokens", 0))
                 rank_data["prefill_time_s"] += float(item.get("prefill_time_s", 0.0))
                 rank_data["decode_time_s"] += float(item.get("decode_time_s", 0.0))
@@ -1169,6 +1435,8 @@ def run_engine_scenario(
                 phase = phase_by_seq.get(seq_id)
                 if phase in phase_e2es:
                     phase_e2es[phase].append(latency)
+                    phase_output_tokens[phase] += len(tokens)
+                    phase_finished_at[phase] = now
                 completion_times[seq_id] = now
                 completion_token_counts[seq_id] = len(tokens)
             for rank, stats in rank_stats.items():
@@ -1179,19 +1447,50 @@ def run_engine_scenario(
                     stats["initial_cached_tokens"] / max(stats["initial_prompt_tokens"], 1)
                 )
             if (
-                workload == "memory-skew"
+                transfer_workload
                 and not inflight
                 and next_prompt_idx >= current_phase_end
                 and current_phase_index + 1 < len(phase_ends)
             ):
+                if (
+                    config.get("enable_background_copy", False)
+                    and engine.control_plane_client is not None
+                ):
+                    placement_started = time.perf_counter()
+                    flush_result = engine.control_plane_client.flush_background_copies(
+                        future_prefix_demands,
+                        timeout_s=float(
+                            config.get("background_copy_flush_timeout_s", 600.0)
+                        ),
+                    )
+                    placement_wait_s += time.perf_counter() - placement_started
+                    background_placement_stats = dict(
+                        flush_result.get("placement_stats", {})
+                    )
+                    background_placement_pair_stats = {
+                        str(pair): dict(stats)
+                        for pair, stats in flush_result.get(
+                            "placement_pair_stats", {}
+                        ).items()
+                    }
                 current_phase_index += 1
                 current_phase_end = phase_ends[current_phase_index]
             while next_prompt_idx < current_phase_end and len(inflight) < effective_submit_window:
                 submit_prompt(prompts[next_prompt_idx], next_prompt_idx)
                 next_prompt_idx += 1
+            if now - last_progress_report >= 30.0:
+                phase = phase_by_seq.get(next(iter(inflight)), "draining") if inflight else "draining"
+                print(
+                    f"[{name}] progress finished={finished_count}/{len(prompts)} "
+                    f"submitted={next_prompt_idx}/{len(prompts)} inflight={len(inflight)} "
+                    f"phase={phase} elapsed={now - start_wall:.1f}s",
+                    flush=True,
+                )
+                last_progress_report = now
         elapsed = time.perf_counter() - start_wall
     finally:
-        sampler.stop()
+        if sampler_started:
+            sampler.stop()
         engine.exit()
         if rendezvous_path is not None:
             rendezvous_path.unlink(missing_ok=True)
@@ -1235,6 +1534,15 @@ def run_engine_scenario(
             sum(int(stats["prefill_tokens"]) for stats in rank_stats.values()) - initial_prompt_tokens,
         ),
         transfer_count=transfer_count,
+        transfer_bytes=transfer_bytes,
+        transfer_time_s=transfer_time_s,
+        transfer_source_time_s=transfer_source_time_s,
+        transfer_target_time_s=transfer_target_time_s,
+        transfer_bandwidth_gib_s=(
+            transfer_bytes / (1024 ** 3) / transfer_time_s if transfer_time_s > 0 else 0.0
+        ),
+        estimated_transfer_cost_ms=estimated_transfer_cost_ms,
+        estimated_saved_prefill_ms=estimated_saved_prefill_ms,
         transfer_copy_count=transfer_copy_count,
         transfer_release_count=transfer_release_count,
         chain_transfer_count=chain_transfer_count,
@@ -1263,6 +1571,20 @@ def run_engine_scenario(
         phase_latency_stats={
             phase: {
                 "requests": float(len(phase_e2es[phase])),
+                "output_tokens": float(phase_output_tokens[phase]),
+                "elapsed_s": max(
+                    0.0,
+                    phase_finished_at.get(phase, 0.0)
+                    - phase_started_at.get(phase, 0.0),
+                ),
+                "throughput_tok_s": (
+                    phase_output_tokens[phase]
+                    / max(
+                        phase_finished_at.get(phase, 0.0)
+                        - phase_started_at.get(phase, 0.0),
+                        1e-9,
+                    )
+                ),
                 "mean_ttft_s": _mean(phase_ttfts[phase]),
                 "p90_ttft_s": _percentile(phase_ttfts[phase], 0.90),
                 "mean_e2e_s": _mean(phase_e2es[phase]),
@@ -1271,6 +1593,21 @@ def run_engine_scenario(
             for phase in ("warmup", "pressure", "reuse")
             if phase_e2es[phase]
         },
+        pair_spill_count=pair_spill_count,
+        replica_copy_route_count=replica_copy_route_count,
+        placement_lease_route_count=placement_lease_route_count,
+        background_placement_stats=background_placement_stats,
+        background_placement_pair_stats=background_placement_pair_stats,
+        prefill_prompt_tokens=sum(
+            int(stats["prefill_prompt_tokens"]) for stats in rank_stats.values()
+        ),
+        prefill_cached_tokens=sum(
+            int(stats["prefill_cached_tokens"]) for stats in rank_stats.values()
+        ),
+        prefill_uncached_tokens=sum(
+            int(stats["prefill_uncached_tokens"]) for stats in rank_stats.values()
+        ),
+        placement_wait_s=placement_wait_s,
     )
 
 
@@ -1296,11 +1633,32 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         return statistics.fmean(float(getattr(result, name)) for result in trials)
 
     def mean_reason_map(name: str) -> dict[str, int]:
-        keys = set().union(*(getattr(result, name).keys() for result in trials))
+        keys = set().union(*((getattr(result, name) or {}).keys() for result in trials))
         return {
-            key: round(statistics.fmean(getattr(result, name).get(key, 0) for result in trials))
+            key: round(statistics.fmean(
+                (getattr(result, name) or {}).get(key, 0) for result in trials
+            ))
             for key in keys
         }
+
+    def mean_nested_count_map(name: str) -> dict[str, dict[str, int]]:
+        outer_keys = set().union(*(
+            (getattr(result, name) or {}).keys() for result in trials
+        ))
+        aggregated = {}
+        for outer_key in outer_keys:
+            inner_keys = set().union(*(
+                (getattr(result, name) or {}).get(outer_key, {}).keys()
+                for result in trials
+            ))
+            aggregated[outer_key] = {
+                inner_key: round(statistics.fmean(
+                    (getattr(result, name) or {}).get(outer_key, {}).get(inner_key, 0)
+                    for result in trials
+                ))
+                for inner_key in inner_keys
+            }
+        return aggregated
 
     rank_ids = sorted(set().union(*(result.rank_stats.keys() for result in trials)))
     rank_stats = {}
@@ -1357,6 +1715,13 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         preemption_count=round(mean_attr("preemption_count")),
         redundant_prefill_tokens=round(mean_attr("redundant_prefill_tokens")),
         transfer_count=round(mean_attr("transfer_count")),
+        transfer_bytes=round(mean_attr("transfer_bytes")),
+        transfer_time_s=mean_attr("transfer_time_s"),
+        transfer_source_time_s=mean_attr("transfer_source_time_s"),
+        transfer_target_time_s=mean_attr("transfer_target_time_s"),
+        transfer_bandwidth_gib_s=mean_attr("transfer_bandwidth_gib_s"),
+        estimated_transfer_cost_ms=mean_attr("estimated_transfer_cost_ms"),
+        estimated_saved_prefill_ms=mean_attr("estimated_saved_prefill_ms"),
         transfer_copy_count=round(mean_attr("transfer_copy_count")),
         transfer_release_count=round(mean_attr("transfer_release_count")),
         chain_transfer_count=round(mean_attr("chain_transfer_count")),
@@ -1385,6 +1750,17 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         mean_ttft_s_std=statistics.pstdev(result.mean_ttft_s for result in trials),
         mean_e2e_s_std=statistics.pstdev(result.mean_e2e_s for result in trials),
         phase_latency_stats=phase_latency_stats,
+        pair_spill_count=round(mean_attr("pair_spill_count")),
+        replica_copy_route_count=round(mean_attr("replica_copy_route_count")),
+        placement_lease_route_count=round(mean_attr("placement_lease_route_count")),
+        background_placement_stats=mean_reason_map("background_placement_stats"),
+        background_placement_pair_stats=mean_nested_count_map(
+            "background_placement_pair_stats"
+        ),
+        prefill_prompt_tokens=round(mean_attr("prefill_prompt_tokens")),
+        prefill_cached_tokens=round(mean_attr("prefill_cached_tokens")),
+        prefill_uncached_tokens=round(mean_attr("prefill_uncached_tokens")),
+        placement_wait_s=mean_attr("placement_wait_s"),
     )
 
 
@@ -1393,7 +1769,14 @@ def run_repeated_engine_scenario(repetitions: int, **kwargs) -> ScenarioResult:
     for trial in range(repetitions):
         if repetitions > 1:
             print(f"[{kwargs['name']}] trial {trial + 1}/{repetitions}")
+        trial_start = time.perf_counter()
         trials.append(run_engine_scenario(**kwargs))
+        if repetitions > 1:
+            print(
+                f"[{kwargs['name']}] trial {trial + 1}/{repetitions} completed "
+                f"in {time.perf_counter() - trial_start:.1f}s",
+                flush=True,
+            )
     return aggregate_scenario_trials(trials)
 
 
@@ -1471,12 +1854,15 @@ def print_summary_table(results: list[ScenarioResult | None]):
         )
 
     print("\nTransfer Diagnostics")
-    print("=" * 151)
+    print("=" * 263)
     print(
         f"{'scenario':<22} {'sent blocks':>12} {'source kept':>12} "
         f"{'source freed':>13} {'chain plans':>12} {'hot sent':>10} {'hot ratio':>11} "
-        f"{'reuse req hit':>14} "
-        f"{'reuse tok ratio':>15} {'fg ok':>8} {'fg fail':>9}"
+        f"{'reuse req hit':>14} {'reuse tok ratio':>15} {'GiB sent':>10} "
+        f"{'src ms':>10} {'dst ms':>10} {'eff GiB/s':>11} {'est cost':>10} {'est save':>10} "
+        f"{'fg ok':>8} {'fg fail':>9} {'spill':>8} {'copy route':>11} {'lease route':>12} "
+        f"{'place q':>9} {'place cand':>11} {'place done':>11} "
+        f"{'plan run':>9} {'plan done':>10}"
     )
     for result in valid_results:
         print(
@@ -1489,15 +1875,84 @@ def print_summary_table(results: list[ScenarioResult | None]):
             f"{fmt_pct(result.hot_transfer_block_ratio):>11} "
             f"{fmt_pct(result.reuse_phase_request_hit_rate):>14} "
             f"{fmt_pct(result.reuse_phase_token_ratio):>15} "
+            f"{result.transfer_bytes / (1024 ** 3):>10.3f} "
+            f"{result.transfer_source_time_s * 1000:>10.2f} "
+            f"{result.transfer_target_time_s * 1000:>10.2f} "
+            f"{result.transfer_bandwidth_gib_s:>11.2f} "
+            f"{result.estimated_transfer_cost_ms:>10.2f} "
+            f"{result.estimated_saved_prefill_ms:>10.2f} "
             f"{result.rebalance_success:>8} "
-            f"{result.rebalance_fail:>9}"
+            f"{result.rebalance_fail:>9} "
+            f"{result.pair_spill_count:>8} "
+            f"{result.replica_copy_route_count:>11} "
+            f"{result.placement_lease_route_count:>12} "
+            f"{(result.background_placement_stats or {}).get('queued', 0):>9} "
+            f"{(result.background_placement_stats or {}).get('dispatched', 0):>11} "
+            f"{(result.background_placement_stats or {}).get('completed', 0):>11} "
+            f"{(result.background_placement_stats or {}).get('plans_dispatched', 0):>9} "
+            f"{(result.background_placement_stats or {}).get('plans_completed', 0):>10}"
         )
 
-    if any(result.phase_latency_stats for result in valid_results):
-        print("\nMemory-Skew Phase Latency")
-        print("=" * 104)
+    print("\nPrefill Compute Diagnostics")
+    print("=" * 118)
+    print(
+        f"{'scenario':<22} {'prompt tok':>12} {'cached tok':>12} "
+        f"{'uncached tok':>14} {'compute reuse':>14} {'prefill wall(s)':>16} "
+        f"{'placement wait(s)':>18}"
+    )
+    for result in valid_results:
+        prefill_wall_s = sum(
+            float(stats.get("prefill_time_s", 0.0))
+            for stats in result.rank_stats.values()
+        )
+        compute_reuse = (
+            result.prefill_cached_tokens / max(result.prefill_prompt_tokens, 1)
+        )
         print(
-            f"{'scenario':<22} {'phase':<10} {'requests':>10} "
+            f"{result.name:<22} "
+            f"{result.prefill_prompt_tokens:>12} "
+            f"{result.prefill_cached_tokens:>12} "
+            f"{result.prefill_uncached_tokens:>14} "
+            f"{fmt_pct(compute_reuse):>14} "
+            f"{prefill_wall_s:>16.3f} "
+            f"{result.placement_wait_s:>18.3f}"
+        )
+
+    placement_rows = [
+        (result.name, pair, stats)
+        for result in valid_results
+        for pair, stats in sorted(
+            (result.background_placement_pair_stats or {}).items()
+        )
+    ]
+    if placement_rows:
+        print("\nPer-Pair Placement Diagnostics")
+        print("=" * 142)
+        print(
+            f"{'scenario':<22} {'pair':>8} {'queued':>9} {'evaluated':>11} "
+            f"{'candidates':>12} {'completed':>11} {'plans':>8} {'plan done':>10} "
+            f"{'low benefit':>13} "
+            f"{'no space':>10} {'neg-cache':>11}"
+        )
+        for scenario, pair, stats in placement_rows:
+            print(
+                f"{scenario:<22} {pair:>8} "
+                f"{stats.get('queued', 0):>9} "
+                f"{stats.get('evaluated', 0):>11} "
+                f"{stats.get('dispatched', 0):>12} "
+                f"{stats.get('completed', 0):>11} "
+                f"{stats.get('plans_dispatched', 0):>8} "
+                f"{stats.get('plans_completed', 0):>10} "
+                f"{stats.get('dropped_low_benefit', 0):>13} "
+                f"{stats.get('dropped_no_target_space', 0):>10} "
+                f"{stats.get('skipped_negative_cache', 0):>11}"
+            )
+
+    if any(result.phase_latency_stats for result in valid_results):
+        print("\nTransfer Workload Phase Latency")
+        print("=" * 122)
+        print(
+            f"{'scenario':<22} {'phase':<10} {'requests':>10} {'tput(tok/s)':>13} "
             f"{'mean TTFT(ms)':>15} {'p90 TTFT(ms)':>15} "
             f"{'mean E2E(ms)':>15} {'p90 E2E(ms)':>15}"
         )
@@ -1509,6 +1964,7 @@ def print_summary_table(results: list[ScenarioResult | None]):
                 print(
                     f"{result.name:<22} {phase:<10} "
                     f"{int(round(stats.get('requests', 0.0))):>10} "
+                    f"{stats.get('throughput_tok_s', 0.0):>13.2f} "
                     f"{stats.get('mean_ttft_s', 0.0) * 1000:>15.2f} "
                     f"{stats.get('p90_ttft_s', 0.0) * 1000:>15.2f} "
                     f"{stats.get('mean_e2e_s', 0.0) * 1000:>15.2f} "
@@ -1729,6 +2185,72 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     print(f"saved figure: {output}")
 
 
+def save_reuse_phase_figure(
+    results: list[ScenarioResult | None],
+    output_path: str,
+) -> None:
+    """Plot the handoff/reuse phase separately from cold warmup traffic."""
+    valid_results = [
+        result
+        for result in results
+        if result is not None and (result.phase_latency_stats or {}).get("reuse")
+    ]
+    if not valid_results:
+        return
+
+    summary_output = Path(output_path)
+    output = summary_output.with_name(
+        f"{summary_output.stem}_reuse_phase{summary_output.suffix}"
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    names = [result.name for result in valid_results]
+    x = list(range(len(valid_results)))
+    reuse_stats = [result.phase_latency_stats["reuse"] for result in valid_results]
+    metrics = [
+        ("Reuse Throughput", "tokens/s", "throughput_tok_s", 1.0, "#0072B2"),
+        ("Reuse Mean TTFT", "ms", "mean_ttft_s", 1000.0, "#009E73"),
+        ("Reuse Mean E2E", "ms", "mean_e2e_s", 1000.0, "#D55E00"),
+        ("Reuse P90 E2E", "ms", "p90_e2e_s", 1000.0, "#CC79A7"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 9))
+    fig.suptitle("Reuse Phase Performance", fontsize=16)
+    for ax, (title, ylabel, key, scale, color) in zip(axes.flat, metrics):
+        values = [float(stats.get(key, 0.0)) * scale for stats in reuse_stats]
+        bars = ax.bar(
+            x,
+            values,
+            color=color,
+            edgecolor="#333333",
+            linewidth=0.45,
+        )
+        for bar, value in zip(bars, values):
+            ax.annotate(
+                f"{value:.1f}",
+                xy=(bar.get_x() + bar.get_width() / 2, value),
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=0,
+            )
+        if values and max(values) > 0:
+            ax.set_ylim(top=max(values) * 1.18)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(x, names, rotation=15, ha="right")
+        ax.grid(axis="y", linestyle="--", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved reuse phase figure: {output}")
+
+
 def save_rank_stats_figure(results: list[ScenarioResult | None], output_path: str) -> None:
     valid_results = [
         result for result in results
@@ -1826,14 +2348,24 @@ def parse_args():
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--repetitions", type=int, default=1)
-    parser.add_argument("--workload", choices=["locality", "load-skew", "memory-skew"], default="locality")
+    parser.add_argument(
+        "--workload",
+        choices=["locality", "load-skew", "memory-skew", "session-handoff"],
+        default="locality",
+    )
     parser.add_argument("--locality-prefix-groups", type=int, default=16)
     parser.add_argument("--memory-skew-prefix-groups", type=int, default=0)
+    parser.add_argument("--handoff-prefix-groups", type=int, default=0)
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--model-name-or-path", type=str, default=MODEL_CONFIG["model_name_or_path"])
     parser.add_argument("--nvlink-pairs", type=str, default="0,1")
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--kv-block-budget", type=int, default=None)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=MODEL_CONFIG["gpu_memory_utilization"],
+    )
     parser.add_argument("--routing-max-cached-blocks", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--eviction-max-cached-blocks", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--goodput-e2e-sla-ms", type=float, default=2000.0)
@@ -1844,7 +2376,12 @@ def parse_args():
     parser.add_argument("--background-copy-max-blocks", type=int, default=MODEL_CONFIG["background_copy_max_blocks"])
     parser.add_argument("--background-copy-cooldown-s", type=float, default=MODEL_CONFIG["background_copy_cooldown_s"])
     parser.add_argument("--background-copy-hot-threshold", type=int, default=MODEL_CONFIG["background_copy_hot_threshold"])
+    parser.add_argument("--background-copy-min-load-skew", type=float, default=MODEL_CONFIG["background_copy_min_load_skew"])
+    parser.add_argument("--background-copy-expected-reuses", type=float, default=MODEL_CONFIG["background_copy_expected_reuses"])
     parser.add_argument("--route-load-weight", type=float, default=MODEL_CONFIG["route_load_weight"])
+    parser.add_argument("--route-decode-token-weight", type=float, default=MODEL_CONFIG["route_decode_token_weight"])
+    parser.add_argument("--route-owner-spill-sequence-skew", type=float, default=MODEL_CONFIG["route_owner_spill_sequence_skew"])
+    parser.add_argument("--route-owner-spill-max-extra-cost", type=float, default=MODEL_CONFIG["route_owner_spill_max_extra_cost"])
     parser.add_argument(
         "--route-load-bypass-threshold",
         type=float,
@@ -1869,6 +2406,37 @@ def parse_args():
         "--foreground-transfer-min-benefit-ratio",
         type=float,
         default=MODEL_CONFIG["foreground_transfer_min_benefit_ratio"],
+    )
+    parser.add_argument(
+        "--foreground-transfer-bandwidth-gib-s",
+        type=float,
+        default=MODEL_CONFIG["foreground_transfer_bandwidth_gib_s"],
+    )
+    parser.add_argument(
+        "--foreground-transfer-fixed-latency-ms",
+        type=float,
+        default=MODEL_CONFIG["foreground_transfer_fixed_latency_ms"],
+    )
+    parser.add_argument(
+        "--foreground-transfer-interference-multiplier",
+        type=float,
+        default=MODEL_CONFIG["foreground_transfer_interference_multiplier"],
+    )
+    parser.add_argument(
+        "--foreground-prefill-token-time-ms",
+        type=float,
+        default=MODEL_CONFIG["foreground_prefill_token_time_ms"],
+    )
+    parser.add_argument(
+        "--foreground-future-reuse-discount",
+        type=float,
+        default=MODEL_CONFIG["foreground_future_reuse_discount"],
+    )
+    parser.add_argument(
+        "--kv-transfer-prewarm-blocks",
+        type=int,
+        default=MODEL_CONFIG["kv_transfer_prewarm_blocks"],
+        help="Representative KV blocks sent per NVLink pair before serving starts.",
     )
     parser.add_argument("--route-cache-queue-slack", type=float, default=MODEL_CONFIG["route_cache_queue_slack"])
     return parser.parse_args()
@@ -1912,10 +2480,15 @@ def apply_background_copy_args(config: dict, args) -> None:
     config["background_copy_max_blocks"] = args.background_copy_max_blocks
     config["background_copy_cooldown_s"] = args.background_copy_cooldown_s
     config["background_copy_hot_threshold"] = args.background_copy_hot_threshold
+    config["background_copy_min_load_skew"] = args.background_copy_min_load_skew
+    config["background_copy_expected_reuses"] = args.background_copy_expected_reuses
 
 
 def apply_route_args(config: dict, args) -> None:
     config["route_load_weight"] = args.route_load_weight
+    config["route_decode_token_weight"] = args.route_decode_token_weight
+    config["route_owner_spill_sequence_skew"] = args.route_owner_spill_sequence_skew
+    config["route_owner_spill_max_extra_cost"] = args.route_owner_spill_max_extra_cost
     config["route_load_bypass_threshold"] = args.route_load_bypass_threshold
     config["route_prefill_cost_weight"] = args.route_prefill_cost_weight
     config["route_reclaim_cost_weight"] = args.route_reclaim_cost_weight
@@ -1923,6 +2496,14 @@ def apply_route_args(config: dict, args) -> None:
     config["foreground_transfer_min_benefit_ratio"] = (
         args.foreground_transfer_min_benefit_ratio
     )
+    config["foreground_transfer_bandwidth_gib_s"] = args.foreground_transfer_bandwidth_gib_s
+    config["foreground_transfer_fixed_latency_ms"] = args.foreground_transfer_fixed_latency_ms
+    config["foreground_transfer_interference_multiplier"] = (
+        args.foreground_transfer_interference_multiplier
+    )
+    config["foreground_prefill_token_time_ms"] = args.foreground_prefill_token_time_ms
+    config["foreground_future_reuse_discount"] = args.foreground_future_reuse_discount
+    config["kv_transfer_prewarm_blocks"] = max(1, args.kv_transfer_prewarm_blocks)
     config["route_cache_queue_slack"] = args.route_cache_queue_slack
 
 
@@ -1940,6 +2521,8 @@ def main():
         raise SystemExit("--world-size must be >= 1")
     if args.repetitions < 1:
         raise SystemExit("--repetitions must be >= 1")
+    if not 0.0 < args.gpu_memory_utilization <= 1.0:
+        raise SystemExit("--gpu-memory-utilization must be in (0, 1]")
     try:
         kv_block_budget = resolve_kv_block_budget(args)
     except ValueError as exc:
@@ -1953,6 +2536,15 @@ def main():
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    try:
+        handoff_prefix_groups = resolve_handoff_prefix_groups(
+            args.num_prompts,
+            args.handoff_prefix_groups,
+        )
+    except ValueError as exc:
+        if args.workload == "session-handoff":
+            raise SystemExit(str(exc)) from exc
+        handoff_prefix_groups = max(1, args.num_prompts // 2)
     visible_gpus = torch.cuda.device_count()
     if args.world_size > visible_gpus:
         raise SystemExit(
@@ -1969,6 +2561,7 @@ def main():
         args.workload,
         locality_prefix_groups=args.locality_prefix_groups,
         memory_skew_prefix_groups=memory_skew_prefix_groups,
+        handoff_prefix_groups=handoff_prefix_groups,
         seed=args.seed,
     )
 
@@ -1981,22 +2574,35 @@ def main():
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
     nvlink_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else []
     memory_skew_source_ranks = sorted({int(pair[0]) for pair in nvlink_pairs}) or [0]
+    memory_skew_target_by_source = {
+        int(source): int(target) for source, target in nvlink_pairs
+    }
 
-    def apply_memory_skew_placement(config: dict) -> None:
+    def apply_transfer_placement(config: dict) -> None:
         # Workload placement must be identical across all multi-GPU scenarios,
         # including baselines that intentionally do not expose topology to the
         # engine policy itself.
         config["benchmark_memory_skew_source_ranks"] = (
             [0] if config["world_size"] == 1 else memory_skew_source_ranks
         )
+        config["benchmark_memory_skew_target_by_source"] = (
+            {} if config["world_size"] == 1 else memory_skew_target_by_source
+        )
         config["memory_skew_prefix_groups"] = memory_skew_prefix_groups
+        config["benchmark_transfer_prefix_groups"] = (
+            handoff_prefix_groups
+            if args.workload == "session-handoff"
+            else memory_skew_prefix_groups
+        )
+        config["gpu_memory_utilization"] = args.gpu_memory_utilization
+        config["require_exact_kv_block_budget"] = args.kv_block_budget is not None
 
     # single-gpu baseline：单卡独立执行，不启用全局池
     baseline_config = make_config(1, False, None)
     baseline_config["model_name_or_path"] = model_name
     baseline_config["max_cached_blocks"] = kv_block_budget
     baseline_config["random_seed"] = args.seed
-    apply_memory_skew_placement(baseline_config)
+    apply_transfer_placement(baseline_config)
     baseline = run_repeated_engine_scenario(
         args.repetitions,
         name="single-gpu",
@@ -2021,7 +2627,7 @@ def main():
     multi_gpu_config["model_name_or_path"] = model_name
     multi_gpu_config["max_cached_blocks"] = kv_block_budget
     multi_gpu_config["random_seed"] = args.seed
-    apply_memory_skew_placement(multi_gpu_config)
+    apply_transfer_placement(multi_gpu_config)
     independent_result = run_repeated_engine_scenario(
         args.repetitions,
         name="multi-gpu",
@@ -2042,7 +2648,7 @@ def main():
     routing_config["enable_foreground_rebalance"] = False
     routing_config["enable_background_copy"] = False
     routing_config["random_seed"] = args.seed
-    apply_memory_skew_placement(routing_config)
+    apply_transfer_placement(routing_config)
     apply_route_args(routing_config, args)
     kv_routing = run_repeated_engine_scenario(
         args.repetitions,
@@ -2062,8 +2668,11 @@ def main():
     eviction_config["model_name_or_path"] = model_name
     eviction_config["max_cached_blocks"] = kv_block_budget
     eviction_config["random_seed"] = args.seed
-    apply_memory_skew_placement(eviction_config)
-    eviction_config["preserve_cache_via_transfer"] = args.workload == "memory-skew"
+    apply_transfer_placement(eviction_config)
+    eviction_config["preserve_cache_via_transfer"] = args.workload in {
+        "memory-skew",
+        "session-handoff",
+    }
     apply_background_copy_args(eviction_config, args)
     apply_route_args(eviction_config, args)
     kv_eviction = run_repeated_engine_scenario(
@@ -2090,8 +2699,11 @@ def main():
             pool_config["model_name_or_path"] = model_name
             pool_config["max_cached_blocks"] = kv_block_budget
             pool_config["random_seed"] = args.seed
-            apply_memory_skew_placement(pool_config)
-            pool_config["preserve_cache_via_transfer"] = args.workload == "memory-skew"
+            apply_transfer_placement(pool_config)
+            pool_config["preserve_cache_via_transfer"] = args.workload in {
+                "memory-skew",
+                "session-handoff",
+            }
             apply_background_copy_args(pool_config, args)
             apply_route_args(pool_config, args)
             pool_result = run_repeated_engine_scenario(
@@ -2119,6 +2731,7 @@ def main():
     print_summary_table(all_results)
     if args.output_figure:
         save_summary_figure(all_results, args.output_figure)
+        save_reuse_phase_figure(all_results, args.output_figure)
         save_rank_stats_figure(all_results, args.output_figure)
     if args.output_json:
         payload = {

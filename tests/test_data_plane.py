@@ -1,4 +1,5 @@
 import queue
+import multiprocessing as mp
 import threading
 from types import SimpleNamespace
 import sys
@@ -6,6 +7,24 @@ import sys
 from lmpool.engine import data_plane as data_plane_module
 from lmpool.engine.block_manager import BlockManager
 from lmpool.engine.sequence import Sequence, SequenceStatus
+
+
+def test_worker_event_wait_wakes_for_control_queue():
+    context = mp.get_context("spawn")
+    recv_queue = context.Queue()
+    control_queue = context.Queue()
+    try:
+        control_queue.put({"type": "rebalance_execute"})
+        ingress_ready, control_ready = data_plane_module._wait_for_worker_events(
+            recv_queue,
+            control_queue,
+            timeout=1.0,
+        )
+        assert ingress_ready is False
+        assert control_ready is True
+    finally:
+        recv_queue.close()
+        control_queue.close()
 
 
 class FakeModelRunner:

@@ -373,7 +373,15 @@ class GlobalBlockManager:
         if prefix_hash not in self.global_page_table:
             return []
 
-        locations = self.global_page_table[prefix_hash]
+        # A move may release its source block before a newly routed request
+        # reaches that worker. Hide all in-flight locations until the two-phase
+        # transfer commits and fresh worker snapshots publish the final source
+        # and destination locations.
+        locations = [
+            loc
+            for loc in self.global_page_table[prefix_hash]
+            if loc.block_id not in self.transfer_inflight_block_ids[loc.gpu_id]
+        ]
         rank = self.rank if requester_rank is None else requester_rank
 
         def sort_key(loc: BlockLocation) -> float:
@@ -504,6 +512,86 @@ class GlobalBlockManager:
             + running_sequence_weight * float(
                 self.running_sequences_per_gpu[gpu_id] + self.pending_sequences_per_gpu[gpu_id]
             )
+        )
+
+    def get_hot_prefix_chains(
+        self,
+        gpu_id: int,
+        min_access_count: int,
+        max_blocks: int,
+    ) -> List[dict]:
+        """Return maximal hot prefix chains resident on one GPU.
+
+        A worker reports cumulative access counters for every ready block.  A
+        hot chain is represented by its deepest hot block; ancestors are
+        included in prefix order so a destination can register a contiguous
+        prefix after transfer.  Returning only maximal leaves avoids queuing
+        one redundant copy for every ancestor in the same chain.
+        """
+        if gpu_id < 0 or gpu_id >= self.world_size:
+            return []
+
+        hash_to_block = {
+            block_hash: block_id
+            for block_id, block_hash in self.block_hash[gpu_id].items()
+            if block_hash != -1
+        }
+        hot_hashes = {
+            block_hash
+            for block_hash, block_id in hash_to_block.items()
+            if (
+                self.block_access_count[gpu_id].get(block_id, 0)
+                >= max(1, int(min_access_count))
+                and block_id not in self.transfer_inflight_block_ids[gpu_id]
+            )
+        }
+        hot_parents = {
+            self.block_parent_hash[gpu_id].get(hash_to_block[block_hash], -1)
+            for block_hash in hot_hashes
+        }
+        leaf_hashes = hot_hashes - hot_parents
+        chains = []
+        for leaf_hash in leaf_hashes:
+            chain_hashes = []
+            seen = set()
+            current_hash = leaf_hash
+            while current_hash != -1 and current_hash in hash_to_block:
+                if current_hash in seen:
+                    break
+                seen.add(current_hash)
+                chain_hashes.append(current_hash)
+                block_id = hash_to_block[current_hash]
+                current_hash = self.block_parent_hash[gpu_id].get(block_id, -1)
+            chain_hashes.reverse()
+            chain_hashes = chain_hashes[: max(1, int(max_blocks))]
+            block_ids = [hash_to_block[block_hash] for block_hash in chain_hashes]
+            if not block_ids:
+                continue
+            chains.append({
+                "leaf_hash": chain_hashes[-1],
+                "hashes": chain_hashes,
+                "block_ids": block_ids,
+                "parent_hashes": [
+                    self.block_parent_hash[gpu_id].get(block_id, -1)
+                    for block_id in block_ids
+                ],
+                "access_counts": [
+                    self.block_access_count[gpu_id].get(block_id, 1)
+                    for block_id in block_ids
+                ],
+                "last_access_time": max(
+                    self.block_access_time[gpu_id].get(block_id, 0.0)
+                    for block_id in block_ids
+                ),
+            })
+        return sorted(
+            chains,
+            key=lambda chain: (
+                -min(chain["access_counts"]),
+                -len(chain["block_ids"]),
+                -chain["last_access_time"],
+                chain["leaf_hash"],
+            ),
         )
 
     def get_global_free_blocks_count(self) -> int:

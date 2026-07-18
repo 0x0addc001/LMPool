@@ -20,7 +20,7 @@ def _start_control_plane(world_size=2, max_cached_blocks=8, pairs=((0, 1),), ext
         # Most control-plane tests validate two-phase transfer protocol rather
         # than admission economics; dedicated scheduler tests cover the
         # production benefit threshold.
-        "foreground_transfer_min_benefit_ratio": 1.0,
+        "foreground_transfer_min_benefit_ratio": 0.0,
     }
     if extra_config:
         config.update(extra_config)
@@ -104,6 +104,13 @@ def test_route_uses_hash_chain_and_reserves_only_uncached_blocks():
         time.sleep(0.2)
 
         first = client.route_sequence(seq, return_meta=True)
+        request_queue.put({
+            "type": "route_admitted",
+            "rank": first["target_rank"],
+            "seq_id": seq.seq_id,
+            "num_tokens": seq.num_tokens,
+        })
+        time.sleep(0.05)
         second = client.route_sequence(
             Sequence(token_ids=[1, 2, 3, 4, 5, 6, 8], block_size=2),
             return_meta=True,
@@ -355,7 +362,7 @@ def test_rebalance_round_trip_executes_on_source_and_target():
         _stop_control_plane(request_queue, control_thread)
 
 
-def test_concurrent_rebalance_plans_reserve_disjoint_source_blocks():
+def test_concurrent_rebalance_plans_serialize_on_nvlink_pair():
     config, request_queue, response_queues, control_thread = _start_control_plane()
     try:
         request_queue.put({
@@ -387,13 +394,12 @@ def test_concurrent_rebalance_plans_reserve_disjoint_source_blocks():
             })
 
         first = _get_message_type(response_queues[0], "rebalance_prepare")
-        second = _get_message_type(response_queues[0], "rebalance_prepare")
-        first_blocks = set(first["plan"]["transfers"][0]["src_blocks"])
-        second_blocks = set(second["plan"]["transfers"][0]["src_blocks"])
+        second = _get_message_type(response_queues[-1], "rebalance_response")
 
-        assert first_blocks
-        assert second_blocks
-        assert first_blocks.isdisjoint(second_blocks)
+        assert first["plan"]["transfers"][0]["src_blocks"]
+        assert second["request_id"] == "second"
+        assert second["success"] is False
+        assert second["reason"] == "pair_busy"
     finally:
         _stop_control_plane(request_queue, control_thread)
 
@@ -453,13 +459,14 @@ def test_rebalance_can_plan_copy_for_pinned_source_blocks():
         _stop_control_plane(request_queue, control_thread)
 
 
-def test_route_schedules_background_copy_without_blocking_response():
+def test_hot_block_state_schedules_background_copy_without_blocking_route():
     config, request_queue, response_queues, control_thread = _start_control_plane(
         extra_config={
             "enable_background_copy": True,
             "background_copy_max_blocks": 1,
             "background_copy_cooldown_s": 0.0,
             "background_copy_hot_threshold": 1,
+            "background_copy_min_load_skew": 0.0,
         }
     )
     try:
@@ -489,6 +496,9 @@ def test_route_schedules_background_copy_without_blocking_response():
             "block_hashes": {0: prefix_hash},
             "evictable_block_hashes": {},
             "pinned_block_hashes": {0: prefix_hash},
+            "block_access_stats": {
+                0: {"last_access_time": 1.0, "access_count": 2},
+            },
         })
         request_queue.put({
             "type": "block_state",
@@ -525,6 +535,7 @@ def test_background_copy_uses_ordered_prefix_hash_chain():
             "background_copy_max_blocks": 2,
             "background_copy_cooldown_s": 0.0,
             "background_copy_hot_threshold": 1,
+            "background_copy_min_load_skew": 0.0,
         }
     )
     try:
@@ -554,6 +565,11 @@ def test_background_copy_uses_ordered_prefix_hash_chain():
             "rank": 0,
             "free_blocks": 4,
             "block_hashes": {0: h0, 1: h1, 2: h2},
+            "block_parent_hashes": {0: -1, 1: h0, 2: h1},
+            "block_access_stats": {
+                block_id: {"last_access_time": 1.0, "access_count": 2}
+                for block_id in range(3)
+            },
             "evictable_block_hashes": {},
             "pinned_block_hashes": {0: h0, 1: h1, 2: h2},
         })
@@ -595,6 +611,7 @@ def test_background_copy_waits_for_hot_prefix_threshold():
             "background_copy_max_blocks": 1,
             "background_copy_cooldown_s": 0.0,
             "background_copy_hot_threshold": 2,
+            "background_copy_min_load_skew": 0.0,
         }
     )
     try:
@@ -623,6 +640,9 @@ def test_background_copy_waits_for_hot_prefix_threshold():
             "block_hashes": {0: prefix_hash},
             "evictable_block_hashes": {},
             "pinned_block_hashes": {0: prefix_hash},
+            "block_access_stats": {
+                0: {"last_access_time": 1.0, "access_count": 1},
+            },
         })
         request_queue.put({
             "type": "block_state",
@@ -637,6 +657,19 @@ def test_background_copy_waits_for_hot_prefix_threshold():
         client1.pump_async_messages()
         assert not seen
 
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 4,
+            "block_hashes": {0: prefix_hash},
+            "evictable_block_hashes": {},
+            "pinned_block_hashes": {0: prefix_hash},
+            "block_access_stats": {
+                0: {"last_access_time": 2.0, "access_count": 2},
+            },
+        })
+        # Block-state updates are authoritative snapshots, not planner scan
+        # triggers. The next ingress decision evaluates the changed hot state.
         client0.route_sequence(Sequence(token_ids=prefix_tokens + [44], block_size=2))
         deadline = time.time() + 5
         while time.time() < deadline:
@@ -648,6 +681,297 @@ def test_background_copy_waits_for_hot_prefix_threshold():
 
         assert (0, "execute", "copy", True) in seen
         assert (1, "execute", "copy", True) in seen
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_ingress_forecast_flushes_hot_prefix_copy_before_future_requests():
+    config, request_queue, response_queues, control_thread = _start_control_plane(
+        extra_config={
+            "enable_background_copy": True,
+            "background_copy_max_blocks": 2,
+            "background_copy_cooldown_s": 0.0,
+            "background_copy_hot_threshold": 1,
+            "background_copy_expected_reuses": 4.0,
+            "background_copy_idle_pressure_threshold": 2.0,
+            "block_size": 2,
+            "foreground_prefill_token_time_ms": 1.0,
+            "foreground_transfer_min_benefit_ratio": 1.0,
+            "foreground_transfer_bandwidth_gib_s": 10.0,
+            "foreground_transfer_fixed_latency_ms": 0.0,
+            "foreground_transfer_interference_multiplier": 1.0,
+        }
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        worker0 = ControlPlaneClient(0, request_queue, response_queues[0])
+        worker1 = ControlPlaneClient(1, request_queue, response_queues[1])
+        ingress = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        executed = []
+
+        def make_executor(rank):
+            def _executor(plan):
+                if plan["_phase"] == "execute":
+                    executed.append((rank, plan))
+                return {"success": True}
+
+            return _executor
+
+        worker0.set_rebalance_executor(make_executor(0))
+        worker1.set_rebalance_executor(make_executor(1))
+        h0 = bm.compute_hash([1, 2], -1)
+        h1 = bm.compute_hash([3, 4], h0)
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 4,
+            "block_hashes": {0: h0, 1: h1},
+            "block_parent_hashes": {0: -1, 1: h0},
+            "block_access_stats": {
+                0: {"last_access_time": 1.0, "access_count": 1},
+                1: {"last_access_time": 1.0, "access_count": 1},
+            },
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 4,
+            "block_hashes": {},
+        })
+
+        stop = threading.Event()
+
+        def pump_workers():
+            while not stop.is_set():
+                worker0.pump_async_messages()
+                worker1.pump_async_messages()
+                time.sleep(0.005)
+
+        pump_thread = threading.Thread(target=pump_workers, daemon=True)
+        pump_thread.start()
+        try:
+            result = ingress.flush_background_copies({h0: 4, h1: 4}, timeout_s=5)
+        finally:
+            stop.set()
+            pump_thread.join(timeout=5)
+
+        assert result["success"] is True
+        assert result["placement_stats"]["dispatched"] == 1
+        assert result["placement_stats"]["completed"] == 1
+        source_plan = next(plan for rank, plan in executed if rank == 0)
+        assert source_plan["background_trigger"] == "ingress_forecast"
+        assert source_plan["estimated_future_reuses"] == 4
+        assert source_plan["estimated_saved_prefill_ms"] == 4.0
+        assert source_plan["transfers"][0]["hashes"] == [h0, h1]
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_completed_forecast_copy_leases_future_routes_to_replica():
+    config, request_queue, response_queues, control_thread = _start_control_plane(
+        extra_config={
+            "enable_background_copy": True,
+            "background_copy_max_blocks": 2,
+            "background_copy_cooldown_s": 0.0,
+            "background_copy_expected_reuses": 4.0,
+            "foreground_transfer_min_benefit_ratio": 0.0,
+        }
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        worker0 = ControlPlaneClient(0, request_queue, response_queues[0])
+        worker1 = ControlPlaneClient(1, request_queue, response_queues[1])
+        ingress = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        ingress.block_manager = bm
+        worker0.set_rebalance_executor(lambda _plan: {"success": True})
+        worker1.set_rebalance_executor(lambda _plan: {"success": True})
+
+        h0 = bm.compute_hash([1, 2], -1)
+        h1 = bm.compute_hash([3, 4], h0)
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 4,
+            "block_hashes": {0: h0, 1: h1},
+            "block_parent_hashes": {0: -1, 1: h0},
+            "block_access_stats": {
+                0: {"last_access_time": 1.0, "access_count": 1},
+                1: {"last_access_time": 1.0, "access_count": 1},
+            },
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 4,
+            "block_hashes": {},
+        })
+
+        stop = threading.Event()
+
+        def pump_workers():
+            while not stop.is_set():
+                worker0.pump_async_messages()
+                worker1.pump_async_messages()
+                time.sleep(0.005)
+
+        pump_thread = threading.Thread(target=pump_workers, daemon=True)
+        pump_thread.start()
+        try:
+            result = ingress.flush_background_copies({h0: 4, h1: 4}, timeout_s=5)
+        finally:
+            stop.set()
+            pump_thread.join(timeout=5)
+        assert result["placement_stats"]["completed"] == 1
+
+        # The test executor has no real local BlockManager, so publish the
+        # destination snapshot that a data-plane commit normally sends.
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 2,
+            "block_hashes": {4: h0, 5: h1},
+            "block_parent_hashes": {4: -1, 5: h0},
+        })
+        time.sleep(0.1)
+
+        for _ in range(4):
+            routed = ingress.route_sequence(
+                Sequence(token_ids=[1, 2, 3, 4], block_size=2),
+                return_meta=True,
+            )
+            assert routed["target_rank"] == 1
+            assert routed["route_info"]["reason"] == "placement_lease"
+            assert routed["route_info"]["matched_prefix_blocks"] == 2
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_ingress_forecast_batches_prefixes_for_same_directed_pair():
+    config, request_queue, response_queues, control_thread = _start_control_plane(
+        extra_config={
+            "enable_background_copy": True,
+            "background_copy_max_blocks": 2,
+            "background_copy_batch_max_candidates": 8,
+            "background_copy_batch_max_blocks": 8,
+            "background_copy_cooldown_s": 0.0,
+            "foreground_transfer_min_benefit_ratio": 0.0,
+        }
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        worker0 = ControlPlaneClient(0, request_queue, response_queues[0])
+        worker1 = ControlPlaneClient(1, request_queue, response_queues[1])
+        ingress = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        executed = []
+
+        def make_executor(rank):
+            def _executor(plan):
+                if plan["_phase"] == "execute":
+                    executed.append((rank, plan))
+                return {"success": True}
+
+            return _executor
+
+        worker0.set_rebalance_executor(make_executor(0))
+        worker1.set_rebalance_executor(make_executor(1))
+        h0 = bm.compute_hash([1, 2], -1)
+        h1 = bm.compute_hash([3, 4], h0)
+        h2 = bm.compute_hash([5, 6], -1)
+        h3 = bm.compute_hash([7, 8], h2)
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 4,
+            "block_hashes": {0: h0, 1: h1, 2: h2, 3: h3},
+            "block_parent_hashes": {0: -1, 1: h0, 2: -1, 3: h2},
+            "block_access_stats": {
+                block_id: {"last_access_time": 1.0, "access_count": 1}
+                for block_id in range(4)
+            },
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 8,
+            "block_hashes": {},
+        })
+
+        stop = threading.Event()
+
+        def pump_workers():
+            while not stop.is_set():
+                worker0.pump_async_messages()
+                worker1.pump_async_messages()
+                time.sleep(0.005)
+
+        pump_thread = threading.Thread(target=pump_workers, daemon=True)
+        pump_thread.start()
+        try:
+            result = ingress.flush_background_copies(
+                {h0: 2, h1: 2, h2: 2, h3: 2},
+                timeout_s=5,
+            )
+        finally:
+            stop.set()
+            pump_thread.join(timeout=5)
+
+        source_plans = [plan for rank, plan in executed if rank == 0]
+        assert len(source_plans) == 1
+        assert set(source_plans[0]["transfers"][0]["hashes"]) == {h0, h1, h2, h3}
+        assert len(source_plans[0]["background_candidate_keys"]) == 2
+        assert result["placement_stats"]["dispatched"] == 2
+        assert result["placement_stats"]["completed"] == 2
+        assert result["placement_stats"]["plans_dispatched"] == 1
+        assert result["placement_stats"]["plans_completed"] == 1
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_background_copy_negative_cache_suppresses_identical_rejections():
+    config, request_queue, response_queues, control_thread = _start_control_plane(
+        extra_config={
+            "enable_background_copy": True,
+            "background_copy_max_blocks": 1,
+            "background_copy_cooldown_s": 0.0,
+            "background_copy_hot_threshold": 1,
+            "background_copy_min_load_skew": 0.0,
+            "foreground_transfer_min_benefit_ratio": 1000.0,
+        }
+    )
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        ingress = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        prefix_hash = bm.compute_hash([11, 22], -1)
+        target_state = {
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 4,
+            "block_hashes": {},
+        }
+        source_state = {
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 4,
+            "block_hashes": {0: prefix_hash},
+            "block_access_stats": {
+                0: {"last_access_time": 1.0, "access_count": 2},
+            },
+        }
+        request_queue.put(target_state)
+        request_queue.put(source_state)
+
+        result = None
+        for _ in range(5):
+            result = ingress.flush_background_copies({prefix_hash: 4}, timeout_s=5)
+
+        stats = result["placement_stats"]
+        pair_stats = result["placement_pair_stats"]["0-1"]
+        assert stats["queued"] == 1
+        assert stats["evaluated"] == 1
+        assert stats["dropped_low_benefit"] == 1
+        assert stats["skipped_negative_cache"] >= 4
+        assert pair_stats["queued"] == 1
+        assert pair_stats["dropped_low_benefit"] == 1
     finally:
         _stop_control_plane(request_queue, control_thread)
 

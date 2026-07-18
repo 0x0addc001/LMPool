@@ -184,7 +184,9 @@ leaves first and recency breaks ties.
 
 **File**: `src/lmpool/engine/kv_transfer.py`
 
-Implements block migration with NCCL `send` / `recv`. Transfer is block-granular and layer-wise.
+Implements block migration with NCCL `send` / `recv`. Blocks remain the placement
+unit, while every layer and all K/V blocks in one plan are packed into one
+contiguous P2P payload and sent with one blocking P2P operation.
 
 ### 4.10 Sequence
 
@@ -223,8 +225,15 @@ These fields survive cross-process transfer through `multiprocessing.Queue`.
 | `route_load_bypass_threshold` | `float` | Minimum token-equivalent cost advantage required to bypass a prefix owner |
 | `route_prefill_cost_weight` | `float` | Cost per missing prefix token in the completion-cost model |
 | `route_reclaim_cost_weight` | `float` | Additional cost for admitting through locally reclaimable KV capacity |
-| `foreground_transfer_cost_weight` | `float` | Per-block transfer cost expressed in equivalent prefill-block work |
-| `foreground_transfer_min_benefit_ratio` | `float` | Minimum predicted saved-prefill / transfer-cost ratio |
+| `foreground_transfer_cost_weight` | `float` | Multiplier on the time-domain transfer cost |
+| `foreground_transfer_min_benefit_ratio` | `float` | Minimum predicted saved-prefill-ms / transfer-ms ratio |
+| `foreground_transfer_bandwidth_gib_s` | `float` | Measured effective bandwidth used by transfer admission |
+| `foreground_transfer_fixed_latency_ms` | `float` | Fixed protocol and coordination cost per plan |
+| `foreground_transfer_interference_multiplier` | `float` | Packing, unpacking, and inference interference multiplier |
+| `foreground_prefill_token_time_ms` | `float` | Estimated recomputation time per uncached prompt token |
+| `foreground_future_reuse_discount` | `float` | Discount from historical leaf-prefix accesses to future reuse |
+| `foreground_transfer_ewma_alpha` | `float` | EWMA weight for observed source-side transfer overhead |
+| `enable_kv_transfer_prewarm` | `bool` | Initialize configured NVLink P2P communicators before worker readiness |
 | `route_cache_queue_slack` | `float` | Maximum completion-cost slack for using a cached prefix route |
 
 ### 6.2 Running
@@ -279,11 +288,59 @@ For `memory-skew`, deterministic warm-up, pressure, and reuse phases also
 report blocks sent, retained at the source, released at the source, chain
 transfer plans, hot-prefix transfer ratio, and reuse-phase request/token hits. This distinguishes an
 attempted foreground transfer from one that actually relieves capacity and
-preserves reusable KV.
+preserves reusable KV. It also reports actual bytes, source-side transfer time,
+effective GiB/s, predicted transfer cost, and predicted saved prefill time.
+For an isolated transfer result, `session-handoff` uses equal warm-up and reuse
+phases: prefixes are built only on the source side and the same sessions then
+continue on its NVLink partner. `--handoff-prefix-groups` controls how many
+independent sessions cross the pair, preventing the baseline from self-warming
+the destination before the measured handoff.
 Workers report per-block access frequency and recency to the control plane.
+The control plane derives maximal hot prefix chains from these snapshots and
+keeps a persistent candidate queue per NVLink pair. Ingress supplies counts of
+not-yet-submitted prefix demand at a workload phase boundary; candidates are
+coalesced by directed NVLink pair into bounded batches and dispatched only
+while both ranks have low queue pressure. One batch uses one prepare/execute
+transaction and one contiguous KV payload. The phase waits for accepted
+placement plans, and that wait remains
+inside serving elapsed time. This makes background transfer proactive rather
+than waiting for a reuse request to trigger a late copy.
+Rejected placement decisions are memoized by prefix, pair, effective reuse
+demand, and target capacity, so unchanged block-state reports do not repeatedly
+run the same admission calculation. Benchmark JSON separates prompt, cached,
+and actually executed uncached prefill tokens, placement wait time, and
+per-NVLink-pair candidate lifecycle counters. Completed plans also feed their
+dispatch-to-commit latency into the pair-specific transfer cost model.
+Workers additionally feed completed uncached-prefill time into a per-rank EWMA,
+so placement admission compares observed recomputation cost against the same
+all-layer transport protocol used during startup calibration. A completed
+replica creates a forecast-bound placement lease. Because the source already
+served the drained warm-up phase, all forecast reuse requests remain on the
+replica unless it lacks KV capacity; this preserves a target-side decode batch.
+Admission counts only the first avoidable target cold miss when no eviction is
+predicted, rather than multiplying the same saving by every future reuse.
+Each configured NVLink pair uses a dedicated NCCL process group, and a prepared
+plan skips block-ID negotiation. Data-plane workers wait on ingress and control
+queue connections together, preventing an idle ingress wait from delaying a
+transfer command. The first dispatch-to-commit sample is blended with the
+calibrated prior instead of replacing it with cold-start jitter.
 Foreground transfer ranks complete prefix chains by reuse value per missing
-target block, with recency as a tie-breaker; the target inherits the source
-frequency metadata after transfer.
+target block, with recency as a tie-breaker. Admission uses a conservative
+wall-clock model and does not sum one request's access count across every block
+in its chain; the target inherits source frequency metadata after transfer.
+For topology-blind and transfer-only memory-skew scenarios, reuse requests are
+placed on the opposite side of each NVLink pair. Serving timing begins after
+worker readiness and representative-payload P2P prewarm. Completed source
+transfers feed measured excess latency back into a per-pair conservative EWMA,
+and each pair admits at most one foreground plan at a time. A completed transfer
+adds or moves page-table locations, so later routing may select the new prefix
+owner; routing still applies its load cost and is not forced to follow it.
+Routing load reservations include expected decode work. When one prefix owner
+is materially busier than its NVLink partner, routing may spill directly and
+let that request seed the partner. Proactive replicas are planned separately
+from completed access observations and queued ingress demand, so routing never
+keeps the current request on an overloaded owner in anticipation of an
+unfinished copy.
 The `locality` workload uses 16 distinct long shared-prefix groups by default,
 with a deterministic shuffled request order. Override this with
 `--locality-prefix-groups`; multiple groups prevent round-robin from matching

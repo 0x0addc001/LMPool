@@ -424,6 +424,75 @@ def test_prefill_reclaim_preserves_prefix_promised_to_next_waiting_request():
     assert promised.num_cached_tokens == 2
 
 
+def test_prefill_reclaim_drops_tail_route_promise_when_all_cache_is_protected():
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=3,
+        block_size=2,
+        eos=999,
+        global_scheduler=None,
+    )
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    promised = []
+    for tokens in ([1, 2], [3, 4]):
+        seq = Sequence(tokens, block_size=2, sampling_params=no_decode)
+        scheduler.block_manager.allocate(seq)
+        scheduler.block_manager.mark_kv_ready([seq])
+        scheduler.block_manager.deallocate(seq)
+        seq.routed_prefix_hashes = [scheduler.block_manager.compute_hash(tokens, -1)]
+        promised.append(seq)
+
+    incoming = Sequence([5, 6, 7, 8], block_size=2, sampling_params=no_decode)
+    scheduler.add_sequence(incoming)
+    scheduler.add_sequence(promised[0])
+    scheduler.add_sequence(promised[1])
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert scheduled[0] is incoming
+    assert incoming.status == SequenceStatus.RUNNING
+
+
+def test_decode_growth_preserves_waiting_routed_prefix_when_another_victim_exists():
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=1,
+        max_cached_blocks=3,
+        block_size=2,
+        eos=999,
+        global_scheduler=None,
+    )
+    no_decode = SimpleNamespace(
+        temperature=1.0, max_tokens=0, ignore_eos=True, max_model_length=None
+    )
+    cold = Sequence([1, 2], block_size=2, sampling_params=no_decode)
+    promised = Sequence([3, 4], block_size=2, sampling_params=no_decode)
+    for cached in (cold, promised):
+        scheduler.block_manager.allocate(cached)
+        scheduler.block_manager.mark_kv_ready([cached])
+        scheduler.block_manager.deallocate(cached)
+
+    promised_hash = scheduler.block_manager.compute_hash([3, 4], -1)
+    promised.routed_prefix_hashes = [promised_hash]
+    scheduler.add_sequence(promised)
+
+    running = Sequence([5, 6], block_size=2, sampling_params=no_decode)
+    scheduler.block_manager.allocate(running)
+    running.append_token(7)
+    running.status = SequenceStatus.RUNNING
+    scheduler.running.append(running)
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is False
+    assert scheduled == [running]
+    assert promised_hash in scheduler.block_manager.hash_to_block_id
+
+
 def test_structural_rebalance_failures_use_exponential_cooldown(monkeypatch):
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=1, nvlink_pairs=[(0, 1)])
     dummy = DummyGlobalScheduler(gbm, rebalance_result=False, fail_reason="no_target_space")

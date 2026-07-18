@@ -70,10 +70,19 @@ Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py
   all sent blocks. A high release count with a low hot ratio relieves capacity
   but does not preserve the data reused in the final phase.
 - `reuse req hit` / `reuse tok ratio`: request hit rate and cached-token ratio
-  in the final reuse phase of `memory-skew`; other workloads report zero.
-- `Memory-Skew Phase Latency`: request count plus mean/P90 TTFT and E2E for
-  warm-up, pressure, and reuse separately. Use the reuse row to evaluate
-  transfer benefit; the aggregate P90 can be dominated by source-side pressure.
+  in the final reuse phase of `memory-skew` or `session-handoff`; other
+  workloads report zero.
+- `lease route`: requests routed to a committed replica through a forecast-bound
+  placement lease. A completed handoff keeps the forecast reuse batch on the
+  replica instead of splitting each prefix between source and target.
+- `place cand` / `place done`: accepted and completed prefix candidates.
+  `plan run` / `plan done` count actual pair-level protocol transactions; one
+  plan can contain several candidates and one contiguous KV payload.
+- `Transfer Workload Phase Latency`: request count, phase throughput, and
+  mean/P90 TTFT and E2E
+  for warm-up, optional pressure, and reuse separately. Use the reuse row to
+  evaluate transfer benefit; aggregate P90 can be dominated by an earlier phase.
+  Supplying `--output-figure` also writes an adjacent `_reuse_phase` figure.
 - `fg ok` / `fg fail`: number of successful / failed foreground rebalance requests. Foreground rebalance is the current-request path that tries to free local KV blocks with move-style transfer.
 
 Foreground transfer candidates use worker-reported KV heat. The control plane
@@ -105,6 +114,7 @@ CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benc
   --output-json /tmp/shared_prefix_benchmark.json \
   --nvlink-pairs 0,1 \
   --kv-block-budget 64 \
+  --gpu-memory-utilization 0.20 \
   --submit-window 4 \
   --goodput-e2e-sla-ms 120000 \
   --output-figure /tmp/shared_prefix_benchmark.png
@@ -126,15 +136,22 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
   means; JSON and the console variability table include throughput, goodput,
   TTFT, and E2E population standard deviations. Use at least `3` for paper
   results; the default `1` is intended for development runs.
-- `--workload`: `locality`, `load-skew`, or `memory-skew`. `memory-skew` is a
+- `--workload`: `locality`, `load-skew`, `memory-skew`, or `session-handoff`.
+  `memory-skew` is a
   deterministic three-phase trace: hot-prefix warm-up on source ranks,
-  unique-prefix pressure on those ranks, then hot-prefix reuse under the
-  scenario's normal routing policy. Source ranks are derived once from the
+  unique-prefix pressure on those ranks, then hot-prefix reuse. For
+  topology-blind and transfer-only scenarios, reuse is deterministically sent
+  to the opposite side of each NVLink pair: the baseline recomputes there,
+  while only a completed transfer can eliminate the first partner-side
+  recomputation. Source ranks are derived once from the
   command-line NVLink pairs and applied identically to every multi-GPU
   scenario; topology-blind baselines receive only this workload placement, not
   topology-aware policy decisions.
   Per-rank JSON diagnostics expose `warmup_submitted`, `pressure_submitted`,
   and `reuse_submitted` so placement fairness can be checked directly.
+  `session-handoff` uses equal warm-up and reuse phases: prefixes are built only
+  on source ranks, then the same sessions continue on their NVLink partners.
+  Use it to isolate copy benefit; use `memory-skew` for capacity pressure.
 - `--locality-prefix-groups`: number of distinct long shared-prefix groups in
   the `locality` workload (default `16`). Requests are balanced across groups
   and deterministically shuffled with `--seed`, preventing prefix IDs from
@@ -146,26 +163,74 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
   up to `15` that fits both warm-up and reuse. Each group is warmed repeatedly
   on one source rank; the reuse phase interleaves groups so round-robin cannot
   saturate its cache after one miss to a single global hotspot.
+- `--handoff-prefix-groups`: independent session prefixes shared by the two
+  `session-handoff` phases. `0` selects up to `32`; the maximum is half of
+  `--num-prompts`. A value equal to half the requests removes destination
+  self-warmup from the baseline.
 - `--output-json`: write raw scenario results to JSON. Parent directories are created automatically, and the script prints `saved json: ...` on success.
 - `--model-name-or-path`: model name or local model path. The default config targets `Qwen/Qwen3-0.6B`.
 - `--nvlink-pairs`: logical NVLink pairs after `CUDA_VISIBLE_DEVICES` remapping, e.g. `0,1` or `0,1;2,3`. Quote values containing semicolons, e.g. `--nvlink-pairs "0,2;1,3;4,5;6,7"`. Pass an empty string to let the engine try `nvidia-smi topo -m` detection.
 - `--world-size`: number of data-plane worker ranks for multi-GPU scenarios. The default is `2`; use `--world-size 8` for eight visible GPUs.
-- `--kv-block-budget`: requested per-rank KV block cap used by all five scenarios. Workers may reduce it to the common capacity supported by available HBM. The hidden legacy options `--routing-max-cached-blocks` and `--eviction-max-cached-blocks` are accepted only when they resolve to the same value.
+- `--kv-block-budget`: requested per-rank KV block count used by all five
+  scenarios. When explicitly set, the benchmark verifies every worker realizes
+  this capacity before submitting requests and fails instead of silently
+  shrinking it. The hidden legacy options `--routing-max-cached-blocks` and
+  `--eviction-max-cached-blocks` are accepted only when they resolve to the same
+  value.
+- `--gpu-memory-utilization`: fraction of currently free HBM used when deriving
+  physical KV capacity, default `0.20`. Actual allocation remains capped by
+  `--kv-block-budget`; increase this only when the requested budget cannot be
+  realized.
 - `--goodput-e2e-sla-ms`: end-to-end latency SLA for counting goodput tokens.
 - `--skip-pool`: skip `multi-gpu-lmpool`.
 - `--output-figure`: write the summary figure to PNG. Parent directories are created automatically, and the script prints `saved figure: ...` on success.
 - `--submit-window`: maximum in-flight requests. Use `4` or `8` to let earlier requests populate the global page table before later routing decisions; use `0` or a negative value for burst submission of all requests.
 - `--disable-background-copy`: disable background speculative copy-style transfer.
-- `--background-copy-max-blocks`: maximum prefix blocks copied by one background plan. Use `1` for correctness debugging and try `2` when measuring possible locality gains.
+- `--background-copy-max-blocks`: maximum prefix blocks contributed by one
+  candidate chain. Candidates for the same directed NVLink pair are internally
+  coalesced into a bounded plan, amortizing protocol and payload setup.
 - `--background-copy-cooldown-s`: cooldown before the same prefix can trigger another copy on the same source-target pair. Try `0.5` when evaluating background copy impact.
-- `--background-copy-hot-threshold`: number of routing-time prefix hits required before background copy is allowed for that prefix. `1` is eager copy; larger values reduce speculative transfer overhead.
+- `--background-copy-hot-threshold`: minimum worker-reported access count for every block in a maximal hot prefix chain. Larger values reduce speculative placement.
+- `--background-copy-min-load-skew`: minimum owner-to-partner sequence-pressure gap for route-originated candidate discovery. Phase-boundary ingress forecasts use observed placement skew instead of this transient load gap.
+- `--background-copy-expected-reuses`: conservative cap on predicted future reuse. The actual estimate comes from not-yet-submitted ingress prefix counts, or discounted worker access history when no forecast exists.
+- `--route-decode-token-weight`: expected decode-work weight included in pending and worker load snapshots.
+- `--route-owner-spill-sequence-skew`: sequence-pressure gap that permits direct spill to the owner's NVLink partner.
+- `--route-owner-spill-max-extra-cost`: maximum extra token-equivalent recomputation cost accepted for direct pair spill.
 - `--route-load-weight`: legacy tie-break weight for token-aware load in the prefix score.
 - `--route-load-bypass-threshold`: minimum token-equivalent cost advantage required before a cold target may bypass a prefix owner.
 - `--route-prefill-cost-weight`: cost assigned to each missing prefix token; the default `1.0` keeps it in the same units as queued tokens.
 - `--route-reclaim-cost-weight`: extra cost per reclaimable block, expressed as a fraction of one block of prefill work.
-- `--foreground-transfer-cost-weight`: transfer cost of one KV block in equivalent blocks of prefill work.
-- `--foreground-transfer-min-benefit-ratio`: minimum predicted saved-prefill / transfer-cost ratio required for foreground transfer. Low-value plans fall back to local reclamation.
+- `--foreground-transfer-cost-weight`: multiplier applied to the time-domain transfer cost.
+- `--foreground-transfer-min-benefit-ratio`: minimum predicted saved-prefill-ms / transfer-ms ratio required for foreground transfer.
+- `--foreground-transfer-bandwidth-gib-s`: measured effective KV transfer bandwidth used by the admission model.
+- `--foreground-transfer-fixed-latency-ms`: fixed per-plan protocol and coordination latency.
+- `--foreground-transfer-interference-multiplier`: multiplier for packing, unpacking, and inference interference.
+- `--foreground-prefill-token-time-ms`: estimated recomputation time per uncached prompt token.
+- `--foreground-future-reuse-discount`: conservative discount from historical leaf-prefix accesses to future reuse.
+- `--kv-transfer-prewarm-blocks`: representative KV blocks sent on every NVLink pair before serving; measured pair cost seeds admission and startup is excluded from serving metrics.
 - `--route-cache-queue-slack`: token-equivalent cost slack allowed by the route-cache fast path.
+
+Serving timing and GPU sampling start only after every worker reports its
+realized KV capacity. Model loading, model warmup, process-group setup, P2P
+communicator prewarm, and KV allocation are excluded. Workers return completed
+source-transfer bytes and wall time to the control plane; a per-NVLink-pair EWMA
+of observed excess latency can only raise subsequent admission cost above the
+static model. Only one foreground plan may execute on a pair at a time.
+Startup prewarm and serving transfer both use one all-layer contiguous payload.
+Each configured pair uses a dedicated NCCL process group; prepared plans omit
+block-ID negotiation, and idle workers wake directly for control-plane transfer
+commands instead of waiting for the ingress queue timeout.
+Completed uncached-prefill batches update a per-rank recomputation-cost EWMA.
+A completed proactive replica creates a forecast-bound placement lease so the
+known reuse batch consumes the copied KV instead of leaving an unused page-table
+entry or being fragmented back across the warmup source.
+The transfer diagnostics report `spill` for direct owner-to-partner routing,
+plus candidate-level `place q` / `place cand` / `place done` and transaction-level
+`plan run` / `plan done` for proactive placement lifecycle.
+`copy route` is retained as a compatibility diagnostic but should remain zero:
+routing no longer keeps a request on an overloaded owner while waiting for a
+future copy. Actual replica completion remains visible through
+`background_copy_success` and transferred block counts.
 
 Routing cost-model defaults are set in `MODEL_CONFIG` inside `shared_prefix_benchmark.py`:
 
@@ -207,8 +272,10 @@ Routing cost-model defaults are set in `MODEL_CONFIG` inside `shared_prefix_benc
   and use `--repetitions 3` or more. A repeated JSON result includes
   `repetitions`, `throughput_tok_s_std`, `goodput_tok_s_std`,
   `mean_ttft_s_std`, and `mean_e2e_s_std`.
-- `multi-gpu` is an online round-robin baseline, not static offline sharding.
-- `multi-gpu-kv-transfer` also uses round-robin dispatch, but enables foreground transfer. Use a `memory-skew` workload to create real placement pressure; all scenarios retain the same block budget for a fair comparison.
+- `multi-gpu` is an online round-robin baseline except for memory-skew's
+  explicitly defined cross-pair reuse phase; it is not static offline sharding.
+- `multi-gpu-kv-transfer` uses the same ingress placement as `multi-gpu` and
+  enables foreground transfer. All scenarios retain the same block budget.
 - Rebalance requests are based on the actual block shortage, not the full
   sequence block count. Foreground plans transfer every missing ancestor needed
   to make a selected leaf reusable at the target. They release the deepest
@@ -228,6 +295,16 @@ Routing cost-model defaults are set in `MODEL_CONFIG` inside `shared_prefix_benc
   `--kv-block-budget` fixed and vary only workload pressure and background-copy
   parameters. A very small common budget is useful for failure analysis, but it
   often leaves too little target space for copy replication to improve hits.
+  In `memory-skew`, the ingress forecasts hashes from the not-yet-submitted reuse
+  phase after warm-up. The control plane drains accepted low-load placement
+  plans before the next phase, and this drain time is included in benchmark
+  elapsed time. `Prefill Compute Diagnostics` separates prompt, cached, and
+  actually executed uncached tokens and reports the explicit placement wait.
+  `Per-Pair Placement Diagnostics` reports queued, evaluated, dispatched, and
+  completed candidates plus rejection and negative-cache counts for each
+  NVLink pair. Repeated unchanged `low_benefit` and `no_target_space`
+  decisions are memoized until demand, access counts, or target capacity
+  changes, preventing block-state updates from creating a planner retry loop.
 - For eight-GPU runs, pass both `CUDA_VISIBLE_DEVICES=...` and `--world-size 8`. NVLink pairs use the logical GPU indices after CUDA remapping.
 
 ## KV Transfer Microbenchmark

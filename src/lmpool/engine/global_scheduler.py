@@ -49,6 +49,10 @@ class GlobalScheduler:
         self.running_token_weight = 0.25
         self.running_sequence_weight = 32.0
         self.load_bypass_threshold = 512.0
+        self.owner_spill_sequence_skew = 2.0
+        self.owner_spill_max_extra_cost = 2048.0
+        self.enable_routing_guided_copy = False
+        self.routing_guided_copy_expected_reuses = 4.0
         # Route costs use token-equivalent units so queue work, repeated
         # prefill, and cache reclamation can be compared directly.
         self.block_size = 256
@@ -56,6 +60,25 @@ class GlobalScheduler:
         self.reclaim_cost_weight = 0.5
         self.transfer_cost_weight = 1.0
         self.foreground_transfer_min_benefit_ratio = 1.5
+        # Foreground transfer admission is evaluated in wall-clock time. These
+        # defaults are deliberately conservative and can be calibrated from
+        # benchmark_kv_transfer.py on the target machine.
+        self.num_layers = 28
+        self.num_kv_heads = 8
+        self.head_dim = 128
+        self.kv_dtype_bytes = 2
+        self.transfer_bandwidth_gib_s = 3.5
+        self.transfer_fixed_latency_ms = 2.0
+        self.transfer_interference_multiplier = 1.5
+        self.prefill_token_time_ms = 0.02
+        self.prefill_observation_discount = 0.5
+        self.prefill_observation_ewma_alpha = 0.2
+        self.observed_prefill_token_time_ms_by_gpu: dict[int, float] = {}
+        self.future_reuse_discount = 0.5
+        self.transfer_cost_ewma_alpha = 0.25
+        self.observed_transfer_extra_ms: float | None = None
+        self.observed_transfer_extra_ms_by_pair: dict[tuple[int, int], float] = {}
+        self.observed_placement_extra_ms_by_pair: dict[tuple[int, int], float] = {}
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -241,22 +264,63 @@ class GlobalScheduler:
                 candidate_costs,
                 key=lambda gpu_id: (candidate_costs[gpu_id], gpu_id),
             )
+            partner_gpu = self.gbm._get_nvlink_partner(best_gpu)
+            spill_gpu = (
+                partner_gpu
+                if partner_gpu in candidate_costs
+                else least_loaded_gpu
+            )
+            owner_pressure = self.gbm.get_queue_pressure(best_gpu)
+            spill_pressure = self.gbm.get_queue_pressure(spill_gpu)
+            replica_copy_cost_ms = self._estimate_transfer_cost_ms(
+                self._estimate_transfer_bytes(gpu_hit_count.get(best_gpu, 0)),
+                best_gpu,
+                spill_gpu,
+            )
+            replica_copy_saved_ms = (
+                self.routing_guided_copy_expected_reuses
+                * gpu_hit_count.get(best_gpu, 0)
+                * self.block_size
+                * self.prefill_token_time_ms
+            )
+            replica_copy_candidate = (
+                self.enable_routing_guided_copy
+                and best_gpu != spill_gpu
+                and owner_pressure - spill_pressure >= self.owner_spill_sequence_skew
+                and replica_copy_saved_ms
+                >= replica_copy_cost_ms * self.foreground_transfer_min_benefit_ratio
+            )
+            pair_spill = (
+                not replica_copy_candidate
+                and best_gpu != spill_gpu
+                and owner_pressure - spill_pressure >= self.owner_spill_sequence_skew
+                and candidate_costs[spill_gpu]
+                <= best_cost + self.owner_spill_max_extra_cost
+            )
             if (
-                best_gpu != least_loaded_gpu
-                and candidate_costs[least_loaded_gpu]
-                + self.load_bypass_threshold < best_cost
+                pair_spill
+                or (
+                    best_gpu != least_loaded_gpu
+                    and candidate_costs[least_loaded_gpu]
+                    + self.load_bypass_threshold < best_cost
+                )
             ):
+                bypass_gpu = spill_gpu if pair_spill else least_loaded_gpu
                 route_info["prefix_hit"] = True
-                route_info["reason"] = "prefix_hit_load_bypass"
-                route_info["target_rank"] = least_loaded_gpu
+                route_info["reason"] = (
+                    "prefix_hit_pair_spill" if pair_spill else "prefix_hit_load_bypass"
+                )
+                route_info["target_rank"] = bypass_gpu
                 route_info["hit_summary"] = hit_summary
-                route_info["matched_prefix_blocks"] = gpu_hit_count.get(least_loaded_gpu, 0)
+                route_info["matched_prefix_blocks"] = gpu_hit_count.get(bypass_gpu, 0)
                 route_info["prefix_owner_rank"] = best_gpu
                 route_info["matched_prefix_hash"] = prefix_hashes[gpu_hit_count[best_gpu] - 1]
                 route_info["required_new_blocks"] = self._required_new_blocks(
                     num_blocks,
-                    gpu_hit_count.get(least_loaded_gpu, 0),
+                    gpu_hit_count.get(bypass_gpu, 0),
                 )
+                route_info["owner_pressure"] = owner_pressure
+                route_info["spill_pressure"] = spill_pressure
                 route_info["scores"] = self._score_summary(rank, gpu_hit_count)
                 route_info["load_score"] = load_summary
                 route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
@@ -269,9 +333,9 @@ class GlobalScheduler:
                 )
                 self._annotate_target_capacity(
                     route_info,
-                    least_loaded_gpu,
+                    bypass_gpu,
                     route_info["required_new_blocks"],
-                    hit_summary.get(least_loaded_gpu, []),
+                    hit_summary.get(bypass_gpu, []),
                 )
                 logger.info(
                     "route seq %s: prefix=%s hits=%s load=%s -> GPU %s "
@@ -280,10 +344,10 @@ class GlobalScheduler:
                     prefix_hash,
                     hit_summary,
                     load_summary,
-                    least_loaded_gpu,
+                    bypass_gpu,
                     best_gpu,
                 )
-                return (least_loaded_gpu, route_info) if return_info else least_loaded_gpu
+                return (bypass_gpu, route_info) if return_info else bypass_gpu
 
             route_info["prefix_hit"] = True
             route_info["reason"] = "prefix_hit"
@@ -296,6 +360,13 @@ class GlobalScheduler:
                 num_blocks,
                 gpu_hit_count[best_gpu],
             )
+            if replica_copy_candidate:
+                route_info["reason"] = "prefix_hit_replica_copy"
+                route_info["replica_copy_candidate"] = True
+                route_info["owner_pressure"] = owner_pressure
+                route_info["spill_pressure"] = spill_pressure
+                route_info["replica_copy_cost_ms"] = replica_copy_cost_ms
+                route_info["replica_copy_saved_ms"] = replica_copy_saved_ms
             route_info["scores"] = self._score_summary(rank, gpu_hit_count)
             route_info["load_score"] = load_summary
             route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
@@ -803,23 +874,194 @@ class GlobalScheduler:
             "transfers": transfers,
         }
         transferred_blocks = sum(len(item["src_blocks"]) for item in transfers)
-        predicted_reuses = sum(
-            sum(max(1, int(count)) for count in item["access_counts"])
+        transfer_bytes = self._estimate_transfer_bytes(transferred_blocks)
+        transfer_cost_ms = sum(
+            self._estimate_transfer_cost_ms(
+                self._estimate_transfer_bytes(len(item["src_blocks"])),
+                gpu_id,
+                item["dst_gpu"],
+            )
             for item in transfers
         )
-        transfer_cost = (
-            transferred_blocks
-            * max(1, int(self.block_size))
-            * self.transfer_cost_weight
+
+        # A chain's blocks share the same future request. Summing every block's
+        # historical access count overstates demand by roughly chain length.
+        # The least-frequent transferred block is the conservative leaf demand;
+        # remove the already-observed access and discount history into expected
+        # future reuse.
+        observed_chain_accesses = min(
+            (
+                max(1, int(count))
+                for item in transfers
+                for count in item["access_counts"]
+            ),
+            default=1,
         )
-        saved_prefill = predicted_reuses * max(1, int(self.block_size))
-        plan["estimated_transfer_cost"] = transfer_cost
-        plan["estimated_saved_prefill"] = saved_prefill
-        plan["estimated_benefit_ratio"] = saved_prefill / max(transfer_cost, 1e-9)
-        if saved_prefill < transfer_cost * self.foreground_transfer_min_benefit_ratio:
+        predicted_reuses = max(0.0, observed_chain_accesses - 1) * self.future_reuse_discount
+        saved_prefill_ms = (
+            predicted_reuses
+            * transferred_blocks
+            * max(1, int(self.block_size))
+            * self.prefill_token_time_ms
+        )
+        plan["estimated_transfer_bytes"] = transfer_bytes
+        plan["transfer_pairs"] = sorted({
+            tuple(sorted((int(item["src_gpu"]), int(item["dst_gpu"]))))
+            for item in transfers
+        })
+        plan["estimated_future_reuses"] = predicted_reuses
+        plan["estimated_transfer_cost_ms"] = transfer_cost_ms
+        plan["estimated_saved_prefill_ms"] = saved_prefill_ms
+        # Legacy field names remain in the protocol for older result readers,
+        # but their values are now milliseconds instead of token equivalents.
+        plan["estimated_transfer_cost"] = transfer_cost_ms
+        plan["estimated_saved_prefill"] = saved_prefill_ms
+        plan["estimated_benefit_ratio"] = saved_prefill_ms / max(transfer_cost_ms, 1e-9)
+        if saved_prefill_ms < transfer_cost_ms * self.foreground_transfer_min_benefit_ratio:
             self.last_rebalance_fail_reason = "low_benefit"
             return None
         return plan
+
+    def _estimate_transfer_bytes(self, num_blocks: int) -> int:
+        return (
+            max(0, int(num_blocks))
+            * 2
+            * max(1, int(self.num_layers))
+            * max(1, int(self.block_size))
+            * max(1, int(self.num_kv_heads))
+            * max(1, int(self.head_dim))
+            * max(1, int(self.kv_dtype_bytes))
+        )
+
+    @staticmethod
+    def _pair_key(src_gpu: int, dst_gpu: int) -> tuple[int, int]:
+        return tuple(sorted((int(src_gpu), int(dst_gpu))))
+
+    def _estimate_transfer_cost_ms(
+        self,
+        transfer_bytes: int,
+        src_gpu: int | None = None,
+        dst_gpu: int | None = None,
+    ) -> float:
+        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
+        wire_ms = max(0, int(transfer_bytes)) / bandwidth_bytes_s * 1000.0
+        static_cost_ms = (
+            self.transfer_fixed_latency_ms
+            + wire_ms * self.transfer_interference_multiplier
+        ) * self.transfer_cost_weight
+        observed_extra_ms = self.observed_transfer_extra_ms
+        if src_gpu is not None and dst_gpu is not None:
+            observed_extra_ms = self.observed_transfer_extra_ms_by_pair.get(
+                self._pair_key(src_gpu, dst_gpu),
+                None,
+            )
+        observed_cost_ms = (
+            (wire_ms + observed_extra_ms) * self.transfer_cost_weight
+            if observed_extra_ms is not None
+            else 0.0
+        )
+        placement_extra_ms = None
+        if src_gpu is not None and dst_gpu is not None:
+            placement_extra_ms = self.observed_placement_extra_ms_by_pair.get(
+                self._pair_key(src_gpu, dst_gpu)
+            )
+        placement_cost_ms = (
+            (wire_ms + placement_extra_ms) * self.transfer_cost_weight
+            if placement_extra_ms is not None
+            else 0.0
+        )
+        return max(static_cost_ms, observed_cost_ms, placement_cost_ms)
+
+    def observe_transfer(
+        self,
+        transfer_bytes: int,
+        elapsed_s: float,
+        src_gpu: int | None = None,
+        dst_gpu: int | None = None,
+    ) -> None:
+        """Update online transfer overhead from a completed source operation."""
+        if transfer_bytes <= 0 or elapsed_s <= 0:
+            return
+        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
+        wire_ms = transfer_bytes / bandwidth_bytes_s * 1000.0
+        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - wire_ms)
+        alpha = min(1.0, max(0.0, self.transfer_cost_ewma_alpha))
+        if self.observed_transfer_extra_ms is None:
+            self.observed_transfer_extra_ms = observed_extra_ms
+        else:
+            self.observed_transfer_extra_ms = (
+                alpha * observed_extra_ms
+                + (1.0 - alpha) * self.observed_transfer_extra_ms
+            )
+        if src_gpu is not None and dst_gpu is not None:
+            pair = self._pair_key(src_gpu, dst_gpu)
+            previous = self.observed_transfer_extra_ms_by_pair.get(pair)
+            self.observed_transfer_extra_ms_by_pair[pair] = (
+                observed_extra_ms
+                if previous is None
+                else alpha * observed_extra_ms + (1.0 - alpha) * previous
+            )
+
+    def observe_placement(
+        self,
+        transfer_bytes: int,
+        elapsed_s: float,
+        src_gpu: int,
+        dst_gpu: int,
+    ) -> None:
+        """Learn plan cost from dispatch through destination commit."""
+        if transfer_bytes <= 0 or elapsed_s <= 0:
+            return
+        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
+        wire_ms = transfer_bytes / bandwidth_bytes_s * 1000.0
+        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - wire_ms)
+        pair = self._pair_key(src_gpu, dst_gpu)
+        alpha = min(1.0, max(0.0, self.transfer_cost_ewma_alpha))
+        # The first dispatch-to-commit sample includes process wake-up and
+        # allocator cold-start jitter. Blend it with the calibrated static
+        # prior instead of allowing one outlier to reject the rest of a
+        # forecast batch.
+        static_extra_ms = max(
+            0.0,
+            self.transfer_fixed_latency_ms
+            + wire_ms * (self.transfer_interference_multiplier - 1.0),
+        )
+        previous = self.observed_placement_extra_ms_by_pair.get(
+            pair,
+            static_extra_ms,
+        )
+        self.observed_placement_extra_ms_by_pair[pair] = (
+            alpha * observed_extra_ms + (1.0 - alpha) * previous
+        )
+
+    def observe_prefill(
+        self,
+        gpu_id: int,
+        uncached_tokens: int,
+        elapsed_s: float,
+    ) -> None:
+        """Learn conservative marginal prefill cost from completed batches."""
+        if uncached_tokens <= 0 or elapsed_s <= 0:
+            return
+        sample_ms = (
+            elapsed_s * 1000.0 / uncached_tokens * self.prefill_observation_discount
+        )
+        sample_ms = min(1.0, max(0.001, sample_ms))
+        previous = self.observed_prefill_token_time_ms_by_gpu.get(int(gpu_id))
+        alpha = min(1.0, max(0.0, self.prefill_observation_ewma_alpha))
+        self.observed_prefill_token_time_ms_by_gpu[int(gpu_id)] = (
+            sample_ms
+            if previous is None
+            else alpha * sample_ms + (1.0 - alpha) * previous
+        )
+
+    def estimate_prefill_token_time_ms(self, gpu_id: int) -> float:
+        return max(
+            self.prefill_token_time_ms,
+            self.observed_prefill_token_time_ms_by_gpu.get(
+                int(gpu_id), self.prefill_token_time_ms
+            ),
+        )
 
     def _select_chain_move_candidates(
         self,
@@ -896,6 +1138,9 @@ class GlobalScheduler:
                 block_depth,
                 excluded_source_blocks,
             )
+            # One selected prefix chain is already transferred as one packed
+            # batch. Stop once the shortage is covered; extending into another
+            # colder chain would spend bandwidth without proven reuse benefit.
             if len(release_blocks) >= needed_blocks:
                 break
         release_blocks = self._dependency_safe_release_order(

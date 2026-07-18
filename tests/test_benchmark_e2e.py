@@ -9,7 +9,9 @@ from benchmarks.shared_prefix_benchmark import (
     measure_single_gpu_prefix_hit_rate,
     prepare_benchmark_rendezvous,
     resolve_memory_skew_prefix_groups,
+    resolve_handoff_prefix_groups,
     resolve_memory_skew_source_ranks,
+    resolve_memory_skew_target_by_source,
     resolve_kv_block_budget,
 )
 
@@ -117,6 +119,30 @@ def test_memory_skew_workload_has_warmup_pressure_and_reuse_phases():
     ]
 
 
+def test_session_handoff_repeats_the_same_groups_in_two_equal_phases():
+    prompts = build_prompts(
+        IdentityChatTokenizer(),
+        num_prompts=12,
+        prompt_repeat=2,
+        workload="session-handoff",
+        handoff_prefix_groups=6,
+    )
+
+    groups = [_prefix_group(prompt) for prompt in prompts]
+    expected = [f"handoff-{group:04d}" for group in range(6)]
+    assert groups[:6] == expected
+    assert groups[6:] == expected
+
+
+def test_handoff_prefix_groups_fit_one_phase():
+    assert resolve_handoff_prefix_groups(128, 0) == 32
+    assert resolve_handoff_prefix_groups(128, 64) == 64
+    with pytest.raises(ValueError):
+        resolve_handoff_prefix_groups(128, 65)
+    with pytest.raises(ValueError):
+        resolve_handoff_prefix_groups(127, 32)
+
+
 def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
     config = {
         "world_size": 6,
@@ -124,6 +150,15 @@ def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
     }
 
     assert resolve_memory_skew_source_ranks(config) == [0, 2, 4]
+
+
+def test_memory_skew_reuse_targets_are_explicit_for_topology_blind_baseline():
+    config = {
+        "world_size": 6,
+        "benchmark_memory_skew_target_by_source": {0: 1, 2: 3, 4: 5},
+    }
+
+    assert resolve_memory_skew_target_by_source(config) == {0: 1, 2: 3, 4: 5}
 
 
 def test_memory_skew_prefix_groups_auto_fit_phase_and_avoid_even_period():

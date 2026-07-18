@@ -26,12 +26,15 @@ The coverage is organized around the runtime structure:
 - `tests/test_benchmark_e2e.py`
   - balanced multi-prefix locality workload generation
   - deterministic seeded request ordering
+  - memory-skew and two-phase session-handoff trace construction
+  - common KV-budget and transfer-placement validation
 
 - `tests/test_control_plane.py`
   - control-plane routing
   - rebalance request / response handling
   - block-state ingestion
   - control-plane client message flow
+  - forecast placement, negative-cache, and replica-lease routing
 
 - `tests/test_data_plane.py`
   - worker process loop
@@ -57,7 +60,9 @@ The coverage is organized around the runtime structure:
   - runtime metric propagation
 
 - `tests/test_kv_transfer.py`
-  - KV transfer helpers
+  - per-layer and all-layer contiguous KV payload helpers
+  - event-driven ingress/control queue wake-up for idle data-plane workers
+  - dedicated-pair NCCL planned-transfer fast path
   - NCCL transfer round trip
   - hardware-gated integration path
 

@@ -706,6 +706,7 @@ class ModelRunner:
             num_kv_heads=self.config['num_kv_heads'],
             head_dim=self.config['head_dim'] if 'head_dim' in self.config 
                      else self.config['hidden_size'] // self.config['num_heads'],
+            negotiate_blocks=False,
         )
         logger.info(f"execute_transfer_out done: blocks={blocks} → target_blocks={target_blocks}")
         return target_blocks
@@ -736,9 +737,24 @@ class ModelRunner:
             head_dim=self.config['head_dim'] if 'head_dim' in self.config 
                      else self.config['hidden_size'] // self.config['num_heads'],
             local_target_blocks=local_target_blocks,
+            negotiate_blocks=False,
         )
         logger.info(f"execute_transfer_in done: remote_blocks={remote_blocks} → local_blocks={local_blocks}")
         return local_blocks
+
+    def kv_transfer_bytes(self, num_blocks: int) -> int:
+        """Return the exact K+V payload size for this runner's cache layout."""
+        if num_blocks <= 0:
+            return 0
+        kv_cache = self._get_kv_cache()
+        if not kv_cache:
+            return 0
+        first_k, first_v = kv_cache[0]
+        per_block = (
+            first_k[0].numel() * first_k.element_size()
+            + first_v[0].numel() * first_v.element_size()
+        )
+        return int(num_blocks) * len(kv_cache) * per_block
 
     def _get_kv_cache(self):
         """获取所有层的 (k_cache, v_cache) 引用。"""

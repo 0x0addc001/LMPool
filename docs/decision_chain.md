@@ -1147,3 +1147,372 @@ decision demand, decision plan, decision implementation, and decision result.
   sent while only the unpinned leaf is released. The next memory-skew run should
   replace at least some `no_plan` failures with successful foreground transfers;
   profitability checks may still reject low-value chains.
+
+## 2026-07-18: Make Route-Promise Protection Progress-Safe
+
+- Decision demand: The first six-GPU rerun after adding waiting-prefix
+  protection stopped making progress in the routing-only trial. With a submit
+  window of 16 and a 64-block budget, queued route promises could collectively
+  protect every cached block, leaving the FIFO head unable to reclaim its
+  admission shortage.
+- Decision plan: Treat queued route promises as priorities rather than permanent
+  pins. Preserve all promises when capacity permits, but guarantee forward
+  progress by allowing later FIFO promises to be reclaimed when they block the
+  head request.
+- Decision implementation: Local prefill admission now performs two-stage
+  reclamation. The first pass protects matched blocks for every routed waiting
+  request. If the head still cannot admit, a second pass retains the existing
+  per-sequence protection for the head but removes additional tail protections.
+  Added a scheduler regression where all cached blocks are promised to queued
+  requests and verified that the head still reaches `RUNNING`. The end-to-end
+  benchmark now emits one compact progress line every 30 seconds and reports
+  each trial's elapsed time, distinguishing a long model run from a stalled
+  admission loop without enabling verbose worker logs.
+- Decision result: Route promises remain stable in the common case while an
+  overcommitted waiting window can no longer create an admission livelock.
+  Subsequent GPU validation should complete the routing trials; some stale tail
+  hits remain acceptable under true overcommit and should be reported rather
+  than hidden.
+
+## 2026-07-18: Correct E2E Progress Timer Initialization
+
+- Decision demand: The first run with compact progress reporting failed in the
+  single-GPU scenario with `UnboundLocalError: last_progress_report`. A textual
+  patch had initialized the timer in an unused independent-baseline helper
+  rather than in `run_engine_scenario()`.
+- Decision plan: Keep progress reporting but colocate all timer state in the
+  function that owns the reporting loop.
+- Decision implementation: Removed the misplaced initialization and initialized
+  `last_progress_report` immediately after `run_engine_scenario()` records its
+  `start_wall` value.
+- Decision result: The progress branch now has initialized state for every E2E
+  scenario, including the single-GPU baseline.
+
+## 2026-07-18: Enforce the Physical KV Budget Used by Memory-Skew
+
+- Decision demand: The first completed 15-prefix run requested 64 blocks per
+  rank but every worker reported an actual capacity of 14. The benchmark's 5%
+  GPU-memory fraction constrained ModelRunner before the configured block cap,
+  turning the intended 64-block experiment into an unreported 14-block stress
+  test. Data-plane reuse fell to zero in the baselines, all foreground transfer
+  plans failed, and the resulting comparison did not represent the requested
+  experiment.
+- Decision plan: Give an explicit KV budget strict benchmark semantics and fail
+  before request submission when workers cannot realize it. Raise the benchmark
+  memory fraction enough for the requested 64-block cap while retaining that
+  cap as the actual allocation bound.
+- Decision implementation: Added `--gpu-memory-utilization` with a benchmark
+  default of 0.20. Every scenario now waits for each worker's startup capacity
+  report before submitting prompts. When `--kv-block-budget` is explicit, an
+  actual capacity below it raises an actionable error containing requested and
+  realized blocks plus the memory fraction. Per-rank capacity is retained in
+  result diagnostics. Routed-prefix protection now also covers decode-growth
+  reclamation, with the same progress-safe fallback used by prefill admission.
+- Decision result: A formal `--kv-block-budget 64` run can no longer silently
+  execute with 14 blocks. The next smoke run must either confirm 64 blocks on
+  every rank or stop before workload execution; only the former is suitable for
+  evaluating the 15-prefix trace.
+
+## 2026-07-18: Admit Transfers by Measured Time and Batch KV Payloads
+
+- Decision demand: The 15-prefix memory-skew run created real transfer opportunities:
+  LMPool raised reuse-phase request hit rate from the multi-GPU baseline's 60.94%
+  to 98.44%, but throughput did not improve and reuse P90 latency regressed. The
+  existing planner summed historical access counts for every block in a prefix
+  chain and compared token-equivalent values, while the data path issued
+  `2 * layers * blocks` blocking NCCL operations. It therefore overestimated
+  future reuse and underestimated actual transfer/interference cost.
+- Decision plan: Make zero transfer a valid outcome unless expected wall-clock
+  savings exceed measured end-to-end cost. Remove chain-length double counting,
+  use conservative future demand, batch communication, and expose enough runtime
+  measurements to calibrate the model rather than tuning thresholds blindly.
+- Decision implementation: `GlobalScheduler.plan_rebalance()` now computes KV
+  bytes from model shape and estimates transfer milliseconds from effective
+  GiB/s, fixed protocol latency, and an inference-interference multiplier. It
+  estimates saved prefill milliseconds from the least-frequent transferred
+  chain block, subtracts the already observed access, applies a future-reuse
+  discount, and admits only plans meeting the configured benefit ratio. The
+  transfer primitive now packs all K/V blocks of one layer into one contiguous
+  tensor, reducing blocking P2P calls from `2 * layers * blocks` to `layers`;
+  destination writes use indexed scatter into physical blocks. Data-plane and
+  E2E results now report actual bytes, source-side transfer time, effective
+  GiB/s, estimated cost, and estimated saved prefill time. Added CPU pack/unpack
+  correctness and conservative chain-demand tests, and exposed five calibration
+  parameters in the benchmark CLI.
+- Decision result: Static compilation and the complete CPU suite pass with
+  `123 passed, 1 skipped`; the skipped case is the opt-in NCCL integration test.
+  GPU validation should first calibrate effective bandwidth, then verify that
+  transfer diagnostics show `estimated saved > estimated cost` for admitted
+  plans. On natural workloads where this condition is absent, LMPool should
+  execute zero transfers and converge toward routing-only performance rather
+  than preserving cache at a net loss.
+
+## 2026-07-18: Isolate Serving Time and Close the Transfer Cost Feedback Loop
+
+- Decision demand: The calibrated memory-skew run showed useful routing tail
+  gains but almost no incremental transfer gain. Two admitted plans estimated
+  29.97 ms total transfer cost while source workers blocked for 337--374 ms;
+  E2E effective bandwidth was only 2.0--2.27 GiB/s despite a warmed primitive
+  reaching 10.9--18.7 GiB/s. Benchmark throughput also started before worker
+  capacity reports, so it included model loading, warmup, NCCL initialization,
+  and KV allocation. Transfer-only reused round-robin placement, which did not
+  guarantee that a future request consumed a moved prefix.
+- Decision plan: Fix measurement before changing policy. Move startup work
+  outside serving metrics, initialize every configured P2P pair before ready,
+  feed source-observed cost back to admission, and make memory-skew expose a
+  deterministic cross-pair reuse opportunity shared by its baseline and
+  transfer-only variants.
+- Decision implementation: `run_engine_scenario()` now starts wall-clock
+  throughput and GPU sampling only after all workers report realized KV
+  capacity and workload metadata is prepared. Data-plane startup calls
+  `prewarm_p2p_pairs()` for every normalized NVLink pair; the initial version
+  used a validated CUDA marker before worker readiness. Source
+  execute results return actual payload bytes and blocking time through
+  `rebalance_done`. `GlobalScheduler.observe_transfer()` converts excess time
+  over configured wire time into an EWMA, and subsequent plans use the maximum
+  of static and observed cost. In memory-skew, warmup/pressure remain on source
+  ranks while topology-blind and transfer-only reuse requests are placed on
+  the corresponding NVLink partners. Added pair normalization, target mapping,
+  online-cost, and optional NCCL prewarm coverage.
+- Decision result: Static compilation and the complete CPU suite pass with
+  `126 passed, 1 skipped`; the optional integration test now covers both P2P
+  prewarm and batched KV validation. The next GPU run should report
+  serving-only throughput, remove first-use communicator setup from transfer
+  timing, and automatically increase `low_benefit` rejections if measured E2E
+  overhead remains above the static estimate.
+
+## 2026-07-18: Serialize Transfer Admission and Calibrate Each NVLink Pair
+
+- Decision demand: The serving-only memory-skew result improved measurement
+  validity, but transfer remained incremental: transfer-only exceeded the
+  multi-GPU throughput by only about 2.6% in one run and slightly regressed
+  mean TTFT. Two plans estimated roughly 30 ms while source workers accumulated
+  277--299 ms of blocking time. Multiple first plans could be admitted before
+  any completion updated the cost model, and one global EWMA could incorrectly
+  mix NVLink pairs with different contention.
+- Decision plan: Protect throughput and delay before increasing transfer
+  frequency. Serialize foreground work per NVLink pair, calibrate and learn
+  cost independently per pair, prewarm with representative KV bytes, split
+  source/target timing, and batch only a complete proven-hot prefix chain rather
+  than attaching unrelated cold blocks.
+- Decision implementation: `control_plane_process()` now derives canonical
+  transfer pairs, rejects overlapping plans as `pair_busy`, and releases the
+  pair reservation on success, abort, failure, or worker loss. `GlobalScheduler`
+  stores pair-specific transfer-overhead EWMA values and prices each target
+  transfer separately. `prewarm_p2p_pairs()` sends configured block-shaped
+  FP16 payloads for every model layer before worker readiness and reports the
+  source observation to the control plane. Data-plane runtime statistics now
+  separate source blocking time from target receive/register time. Prefix-chain
+  selection stops once the real shortage is covered; the selected chain is
+  packed per layer, but no colder chain is added merely to fill a batch.
+  `GlobalBlockManager.lookup_prefix()` hides source locations marked
+  transfer-inflight, preventing routing from selecting a block that a move plan
+  is about to release; the destination becomes visible only through its committed
+  worker block-state update.
+- Decision result: The complete CPU suite passes with `128 passed, 1 skipped`;
+  the skipped test requires real NCCL GPUs. The next GPU run should
+  prioritize throughput, mean/P90 TTFT, and mean/P90 E2E. `pair_busy` and
+  `low_benefit` are expected protective rejections; transfer is successful only
+  when LMPool improves those serving metrics over routing-only, not when it
+  merely increases the transfer count.
+
+## 2026-07-18: Balance Prefix Locality with Decode Parallelism
+
+- Decision demand: In the serving-only memory-skew run, routing reduced
+  reuse-phase mean TTFT by 58.4% and P90 TTFT by 79.7%, but throughput was 2.5%
+  below round-robin. Per-rank submissions were `[33, 11, 35, 6, 37, 6]`
+  instead of the baseline's near-even distribution. All three foreground plans
+  were correctly rejected as `low_benefit`, so transfer could not relieve the
+  prefix-owner concentration.
+- Decision plan: Preserve the existing transfer admission threshold. Account
+  for expected decode work in routing load, cap owner/partner sequence skew,
+  and make one explicit choice when an owner is overloaded: either spill the
+  current request so it naturally seeds the partner, or keep it on the owner
+  and create one cost-gated hot-prefix replica for future requests.
+- Decision implementation: Route requests now carry `max_tokens`; optimistic
+  reservations and worker block-state snapshots add configurable expected
+  decode work. `GlobalScheduler` detects sequence-pressure skew only within the
+  owner's NVLink pair and permits spill under a bounded extra-recomputation
+  cost. When background copy is enabled and predicted repeated prefill savings
+  cover pair-specific transfer cost, the scheduler instead annotates a
+  `prefix_hit_replica_copy` decision and retains the current request locally.
+  The control plane copies the ordered prefix chain only after the hotness and
+  load-skew gates pass. A direct spill suppresses copy because that request will
+  materialize the same KV on the partner. Benchmark JSON and diagnostics add
+  `pair_spill_count` and `replica_copy_route_count`.
+- Decision result: The complete CPU suite passes with `130 passed, 1 skipped`.
+  The next GPU comparison must run with background copy enabled for LMPool and
+  report throughput plus mean/P90 TTFT and E2E. A useful combined result should
+  show a more even per-rank distribution than the previous 9.75x max/min skew,
+  while `background_copy_success` remains much smaller than routed requests.
+
+## 2026-07-18: Move Background Transfer Before Reuse Admission
+
+- Decision demand: The `e2e_202607181801_memory_skew` run copied seven hot
+  blocks in one successful plan, but LMPool remained 2.4% below routing-only
+  throughput and changed routing-only P90 TTFT by only 0.2%. All copied blocks
+  came from rank 2 to rank 3 after reuse routing had already started; the other
+  two NVLink pairs copied nothing. The implementation counted route hits rather
+  than completed block accesses, dropped candidates while a pair was busy, and
+  assumed four future reuses even when only one or two requests remained.
+- Decision plan: Turn background transfer into proactive cache placement. Use
+  worker-owned access snapshots to identify maximal hot prefix chains, combine
+  them with demand for requests already visible at ingress but not submitted,
+  preserve candidates in one FIFO per NVLink pair, dispatch only at low queue
+  pressure, and let a phase boundary wait for accepted work while charging that
+  time to benchmark elapsed.
+- Decision implementation: `GlobalBlockManager.get_hot_prefix_chains()` now
+  reconstructs ordered parent chains and emits only deepest hot leaves, avoiding
+  redundant ancestor plans. `control_plane_process()` maintains persistent
+  candidate maps and per-pair queues, validates source residency and target
+  space at dispatch, serializes each pair, retries queued work after every plan,
+  and records queued/dispatched/completed/drop-reason lifecycle counters. The
+  benefit model uses remaining prefix counts supplied by ingress, capped by
+  `background_copy_expected_reuses`; without a forecast it uses discounted
+  observed accesses. Route-triggered copy no longer keeps the current request
+  on an overloaded owner. `ControlPlaneClient.flush_background_copies()` adds a
+  synchronous placement boundary. The memory-skew benchmark computes hashes for
+  the unsubmitted reuse phase, flushes after warm-up and pressure, includes the
+  wait in serving time, and publishes planner lifecycle statistics in JSON and
+  transfer diagnostics. Tests now cover maximal-chain discovery, access-count
+  hotness, ordered transfer, and forecast-driven flush completion.
+- Decision result: Static compilation succeeds and the complete CPU suite
+  passes with `132 passed, 1 skipped`; the skipped test is the opt-in NCCL GPU
+  integration case. GPU acceptance now requires all configured NVLink pairs to
+  show proactive placement before reuse, `place done` to match dispatched plans,
+  and LMPool to preserve routing TTFT gains without falling below routing-only
+  throughput after placement time is included.
+
+## 2026-07-18: Bound Placement Planning and Measure Real Compute Savings
+
+- Decision demand: In `e2e_202607181932_memory_skew`, LMPool completed only
+  two placement plans but queued 33,049 candidates and rejected 33,027 as
+  `low_benefit`. Transfer-only improved reuse request hit from 76.6% to 87.0%
+  but reduced throughput by 6.8%. Existing diagnostics counted whole prompts
+  as prefill work and priced only source transfer time, so the planner both
+  retried unchanged decisions and compared incomplete cost/benefit values.
+- Decision plan: Bound control-plane work by the number of distinct candidate
+  states, expose actual uncached model work and phase-boundary waiting, diagnose
+  every NVLink pair independently, suppress immediate reciprocal placement,
+  and make later admission learn complete dispatch-to-commit cost.
+- Decision implementation: `control_plane_process()` now memoizes stable
+  `low_benefit` and `no_target_space` results using prefix chain, source/destination,
+  effective predicted reuse, and destination free capacity. Access-count or
+  ingress-demand changes invalidate the memo only when they change effective
+  predicted reuse. Identical
+  snapshots increment `skipped_negative_cache` without requeueing; changed
+  demand or capacity invalidates the memo. A canonical leaf/pair cooldown
+  prevents an immediate reverse copy while page-table snapshots converge.
+  Candidate lifecycle counters are maintained globally and per NVLink pair.
+  Successful background plans report dispatch-to-commit elapsed time to
+  `GlobalScheduler.observe_placement()`, and the larger of static, source-side,
+  and full-placement pair costs controls later admission. Data-plane runtime
+  reports now separate prompt, cached, and uncached prefill tokens and measure
+  through sampled-token consumption rather than asynchronous kernel enqueue.
+  The E2E benchmark records placement wait separately, preserves it in total
+  elapsed, aggregates the new metrics across repetitions, and prints prefill
+  compute and per-pair placement diagnostic tables.
+- Decision result: Static compilation succeeds and the complete CPU suite
+  passes with `134 passed, 1 skipped`; the skipped test requires opt-in NCCL
+  GPUs. The next GPU acceptance run must
+  show candidate `evaluated` near the number of unique prefix/pair states,
+  explain every configured pair independently, and demonstrate that reduced
+  uncached prefill work exceeds measured placement wait before transfer can be
+  credited with throughput or latency improvement.
+
+## 2026-07-18: Bind Proactive Placement to Handoff Traffic
+
+- Decision demand: `e2e_202607182047_memory_skew` still showed only 9--14
+  copied blocks, one or two completed background plans, and no evidence that a
+  later request consumed those replicas. The baseline self-warmed the reuse
+  targets, per-layer blocking P2P launches made serving transfer slower than
+  the calibrated link, candidate discovery still depended on repeated state
+  updates, and the fixed prefill-time prior could reject copies without using
+  measured recomputation cost. Adding more policy branches would not solve
+  these missing data-path and workload contracts.
+- Decision plan: Make one transfer plan one NCCL payload, calibrate that exact
+  protocol, learn destination prefill cost online, create a bounded route lease
+  only after the replica commits, discover placement from ingress/route events
+  rather than every block snapshot, and add a two-phase workload where reuse
+  must cross an NVLink pair.
+- Decision implementation: `kv_transfer.py` now packs every model layer, K/V
+  tensor, and selected block into one contiguous payload and executes one
+  blocking send/recv per plan. Every configured NVLink pair receives a dedicated
+  NCCL process group at startup, P2P prewarm uses the same all-layer layout, and
+  an already prepared plan skips the legacy block-ID negotiation round trips.
+  Data-plane prefill completion reports uncached tokens and elapsed time, while
+  `GlobalScheduler` maintains a discounted per-rank EWMA used by background
+  admission. Successful forecast copies create per-prefix placement leases in
+  the control process; matching routes consume roughly half of the forecast on
+  the replica when its cost is no worse than the source, preserving pair-level
+  decode parallelism. Block-state messages update authoritative state without
+  scanning all candidates; ingress forecasts and threshold-crossing routes are
+  the discovery events. The benchmark adds `session-handoff`, which warms
+  independent prefixes only on source ranks, drains accepted placement, then
+  continues the same sessions on NVLink partners. JSON and console diagnostics
+  add `placement_lease_route_count` / `lease route`. Tests cover all-layer
+  pack/unpack, online prefill cost, exact handoff trace construction, ingress
+  negative-cache behavior, and routing through a committed replica lease.
+  Data-plane workers wait on ingress and control queue connections together, so
+  an idle request-queue wait cannot delay a transfer command by 50 ms; the
+  control plane wakes the receiver before the sender. Placement-cost learning
+  blends its first dispatch-to-commit sample with the calibrated prior through
+  EWMA instead of replacing the prior with one cold-start outlier.
+- Decision result: The opt-in two-GPU NCCL round-trip passes. The real 28-layer,
+  two-block microbenchmark validates data with 3.986 ms mean latency, 5.149 ms
+  p95, and 13.72 GiB/s effective bandwidth, improving mean latency by 20.5% and
+  bandwidth by 25.9% over the previous 5.017 ms / 10.90 GiB/s measurement. In a
+  fixed two-GPU `session-handoff` acceptance run, LMPool completes all four
+  placement candidates, records two lease-routed requests, reaches the
+  workload's 75% request-hit upper bound, and reduces mean TTFT/E2E by
+  14.8%/13.3% versus topology-blind multi-GPU. The tiny four-token correctness
+  run improves total throughput by 2.1%; paper throughput evaluation must use
+  longer decode work so pair-level parallelism amortizes the placement boundary.
+  Static compilation and the complete CPU suite pass (`140 passed, 1 skipped`);
+  the skipped case is the separately passed opt-in NCCL integration test.
+
+## 2026-07-18: Batch Handoff Placement and Preserve Replica Decode Batches
+
+- Decision demand: In `e2e_202607182346_session_handoff`, LMPool reduced mean
+  TTFT/E2E by 33.7%/27.7% versus the same-run multi-GPU baseline, but its
+  throughput was statistically tied with routing-only and transfer-only and
+  aggregate P90 barely changed. The control plane executed 32 independent
+  prefix placement plans for 224 blocks, accumulated 376 ms of placement wait,
+  and produced only 17 lease routes. Code inspection showed that every prefix
+  candidate paid a separate prepare/execute transaction, while each committed
+  lease assigned only half its forecast demand to the replica and re-ran a
+  source/target cost comparison for every request. This fragmented the reuse
+  decode batch back onto the warmup source.
+- Decision plan: Keep the existing two-phase protocol and all-layer payload,
+  but amortize it across independent prefix candidates on the same directed
+  NVLink pair. Treat the drained source phase as historical work and bind the
+  complete forecast reuse batch to the committed replica. Correct placement
+  admission so repeated requests do not repeatedly claim the same cold-miss
+  saving, and report reuse performance separately from warmup.
+- Decision implementation: `control_plane_process()` now collects up to 16
+  candidates per directed pair, deduplicates shared source blocks, applies a
+  128-block default batch cap, and emits one copy transfer inside one
+  prepare/execute plan. Candidate lifecycle counters remain candidate based;
+  new `plans_dispatched` / `plans_completed` counters expose actual protocol
+  transactions. Completion creates one lease per copied leaf with `remaining`
+  equal to the ingress forecast, and lease routing no longer fragments that
+  batch through per-request source/target cost checks; target capacity remains
+  mandatory. Background admission estimates one avoidable target cold prefill
+  per unique copied block when no eviction is predicted. The E2E benchmark now
+  measures phase output tokens, elapsed time, and throughput, prints phase
+  throughput beside TTFT/E2E, and writes an adjacent `_reuse_phase` figure with
+  throughput, mean TTFT, mean E2E, and P90 E2E. Documentation distinguishes
+  prefix candidates from pair-level plans and describes the forecast-bound
+  lease contract.
+- Decision result: Static compilation and the complete CPU suite pass (`141
+  passed, 1 skipped`); the skipped test remains the opt-in NCCL integration
+  case. A two-GPU end-to-end run combines four candidates and 12 blocks into
+  one completed pair plan, routes all eight reuse requests through placement
+  leases, and produces an exact 8/8 warmup/reuse rank split. Reuse request hit
+  reaches 100%, compared with 50% for topology-blind multi-GPU, and the new
+  phase table/figure are emitted successfully. The tiny four-token run is a
+  protocol acceptance test rather than a throughput result: LMPool improves
+  mean TTFT/E2E by 3.2% versus multi-GPU, while the 58 ms placement boundary is
+  not amortized by its short decode. The six-GPU paper run should reduce 32
+  candidate placements to approximately three pair-level plans and use the
+  reuse-phase metrics to quantify amortized benefit.
