@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-| <a href="./README.md"><b>English</b></a> 
-| <a href="./README_zh.md"><b>简体中文</b></a> |
+| <a href="./README.md">English</a> 
+| <a href="./README_zh.md">简体中文</a> |
 </p>
 
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
