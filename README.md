@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-| <a href="./README.md">English</a> 
-| <a href="./README_zh.md">简体中文</a> |
+| <a href="./README.md"><b>English</b></a> 
+| <a href="./README_zh.md"><b>简体中文</b></a> |
 </p>
 
 # LMPool: Distributed KV Cache Pooling for LLM Inference
