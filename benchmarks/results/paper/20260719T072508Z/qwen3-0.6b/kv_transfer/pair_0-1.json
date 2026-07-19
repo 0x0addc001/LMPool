@@ -1,0 +1,108 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-19T07:28:50.918393+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca --dtype auto --block-size 256 --block-counts 1,2,4,8 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260719T072508Z/qwen3-0.6b/kv_transfer/pair_0-1.json --output-figure benchmarks/results/paper/20260719T072508Z/qwen3-0.6b/kv_transfer/pair_0-1.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "d72a00a59557b37ac9a9fb72b9bf9c5a791c0130",
+    "git_status": "M benchmarks/run_paper_suite.sh\n M docs/decision_chain.md\n M src/lmpool/layers/rotary_embedding.py\n M tests/README.md\n?? benchmarks/results/paper/20260719T065014Z/\n?? benchmarks/results/paper/20260719T072508Z/\n?? tests/test_rotary_embedding.py",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0,1",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8",
+      "iterations": 100,
+      "warmup": 20,
+      "output_json": "benchmarks/results/paper/20260719T072508Z/qwen3-0.6b/kv_transfer/pair_0-1.json",
+      "output_figure": "benchmarks/results/paper/20260719T072508Z/qwen3-0.6b/kv_transfer/pair_0-1.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "label": "Qwen/Qwen3-0.6B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 3.666146000032313,
+      "p95_latency_ms": 3.754701071011368,
+      "effective_bandwidth_gib_s": 7.458445462826356,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 3.555428140971344,
+      "p95_latency_ms": 3.620675249840133,
+      "effective_bandwidth_gib_s": 15.38141057325922,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 5.441920930170454,
+      "p95_latency_ms": 6.01800374861341,
+      "effective_bandwidth_gib_s": 20.09860146876006,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 8.3940861991141,
+      "p95_latency_ms": 9.945549747499172,
+      "effective_bandwidth_gib_s": 26.060013539423338,
+      "data_validation": "passed"
+    }
+  ]
+}

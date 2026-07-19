@@ -1,4 +1,4 @@
-# LMPool Decision Chain
+# Decisions
 
 This document records implementation decisions in a STAR-like format:
 decision demand, decision plan, decision implementation, and decision result.
@@ -1724,3 +1724,26 @@ decision demand, decision plan, decision implementation, and decision result.
   Qwen3-1.7B is not currently present in the local Hugging
   Face cache, so the runner fails before GPU work until `MODEL_17B` points to a
   complete local snapshot; it never substitutes 0.6B or downloads implicitly.
+
+## 2026-07-19: Preserve BF16 Through Rotary Attention
+
+- Decision demand: Enabling model-config BF16 for the dual-model paper suite
+  caused the first Qwen3 warmup to fail at the attention output projection:
+  RoPE promoted Q/K and the attention output to float32 while `o_proj` weights
+  remained bfloat16.
+- Decision plan: Fix the dtype promotion at its source in the shared rotary
+  layer, retain float32 frequency construction for numerical accuracy, store
+  the precomputed cache in the configured model dtype, and keep a boundary
+  conversion for callers whose query dtype differs from the cache. Do not add
+  a compensating cast at every output projection or change Triton kernels.
+- Decision implementation: `RotaryEmbedding` now computes frequencies in
+  float32, converts the completed cos/sin cache to `torch.get_default_dtype()`
+  during model construction, and converts indexed cache values to the query
+  dtype before applying RoPE. Added focused tests for configured BF16 cache
+  creation and for BF16 query/key dtype preservation when a float32 cache is
+  used. The tests index documents the new rotary regression coverage.
+- Decision result: Focused tests pass (`10 passed`), and real CUDA warmups for
+  both local Qwen3-0.6B and Qwen3-1.7B snapshots complete with model parameters,
+  rotary cache, and KV cache all in `torch.bfloat16`. The repository-wide suite
+  passes (`181 passed, 1 skipped`); the skipped test remains the opt-in NCCL
+  hardware integration case.

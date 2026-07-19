@@ -96,6 +96,10 @@ The coverage is organized around the runtime structure:
   - KV cache lookup helpers
   - model-config dtype resolution
 
+- `tests/test_rotary_embedding.py`
+  - configured FP16/BF16 rotary-cache dtype
+  - low-precision query/key dtype preservation through RoPE
+
 - `tests/test_scheduler.py`
   - local waiting / running queue transitions
   - prefill scheduling

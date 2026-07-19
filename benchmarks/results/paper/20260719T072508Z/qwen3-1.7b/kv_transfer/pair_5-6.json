@@ -1,0 +1,108 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-19T09:12:19.779456+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e --dtype auto --block-size 256 --block-counts 1,2,4,8 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260719T072508Z/qwen3-1.7b/kv_transfer/pair_5-6.json --output-figure benchmarks/results/paper/20260719T072508Z/qwen3-1.7b/kv_transfer/pair_5-6.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "1db28ce2a06c46eb3f303d512fd48b77ab6595a9",
+    "git_status": "M .gitignore\n D benchmarks/results/paper/20260719T015407Z/environment/git_revision.txt\n D benchmarks/results/paper/20260719T015407Z/environment/git_status.txt\n D benchmarks/results/paper/20260719T015407Z/environment/gpu_inventory.csv\n D benchmarks/results/paper/20260719T015407Z/environment/gpus.txt\n D benchmarks/results/paper/20260719T015407Z/environment/topology.txt\n D benchmarks/results/paper/20260719T015407Z/kv_transfer/summary.json\n D benchmarks/results/paper/20260719T015407Z/kv_transfer/summary.png\n D benchmarks/results/paper/20260719T015407Z/load_skew/summary.json\n D benchmarks/results/paper/20260719T015407Z/load_skew/summary.png\n D benchmarks/results/paper/20260719T015407Z/load_skew/summary_rank_stats.png\n D benchmarks/results/paper/20260719T015407Z/memory_skew/summary.json\n D benchmarks/results/paper/20260719T015407Z/memory_skew/summary.png\n D benchmarks/results/paper/20260719T015407Z/memory_skew/summary_rank_stats.png\n D benchmarks/results/paper/20260719T015407Z/memory_skew/summary_reuse_phase.png\n D benchmarks/results/paper/20260719T015407Z/routing/summary.json\n D benchmarks/results/paper/20260719T015407Z/routing/summary.png\n D benchmarks/results/paper/20260719T015407Z/session_handoff/summary.json\n D benchmarks/results/paper/20260719T015407Z/session_handoff/summary.png\n D benchmarks/results/paper/20260719T015407Z/session_handoff/summary_rank_stats.png\n D benchmarks/results/paper/20260719T015407Z/session_handoff/summary_reuse_phase.png\n M benchmarks/run_paper_suite.sh\n M docs/decision_chain.md\n M src/lmpool/layers/rotary_embedding.py\n M tests/README.md\n?? benchmarks/results/paper/20260719T072508Z/\n?? tests/test_rotary_embedding.py",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "5,6",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8",
+      "iterations": 100,
+      "warmup": 20,
+      "output_json": "benchmarks/results/paper/20260719T072508Z/qwen3-1.7b/kv_transfer/pair_5-6.json",
+      "output_figure": "benchmarks/results/paper/20260719T072508Z/qwen3-1.7b/kv_transfer/pair_5-6.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "label": "Qwen/Qwen3-1.7B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 2048,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 6144,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 2048,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 6144,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 3.4509416518267244,
+      "p95_latency_ms": 3.5485621614498086,
+      "effective_bandwidth_gib_s": 7.923561960407484,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 4.166416650405154,
+      "p95_latency_ms": 4.289763991255313,
+      "effective_bandwidth_gib_s": 13.12578759848275,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 4.711071241472382,
+      "p95_latency_ms": 4.861177298880648,
+      "effective_bandwidth_gib_s": 23.21658798898068,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 7.31678672862472,
+      "p95_latency_ms": 7.782594006857835,
+      "effective_bandwidth_gib_s": 29.89700371396731,
+      "data_validation": "passed"
+    }
+  ]
+}

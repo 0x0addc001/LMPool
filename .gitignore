@@ -205,7 +205,7 @@ cython_debug/
 
 # Generated benchmark artifacts. Keep the runbook and directory description,
 # but do not add machine-specific JSON/PNG/log output to new commits.
-benchmarks/results/tmp/*
+# benchmarks/results/*
 
 # Marimo
 marimo/_static/

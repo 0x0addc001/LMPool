@@ -64,7 +64,14 @@ class RotaryEmbedding(nn.Module):
         self.rotary_embedding = rotary_embedding
         # max position that the long context can reach
         self.max_position = max_position
-        self.inv_freq = 1/(base ** (torch.arange(0, self.rotary_embedding, 2)/self.rotary_embedding))
+        cache_dtype = torch.get_default_dtype()
+        self.inv_freq = 1 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_embedding, 2, dtype=torch.float32)
+                / self.rotary_embedding
+            )
+        )
 
         if is_llama3:
             # specifically for llama3.2
@@ -86,7 +93,7 @@ class RotaryEmbedding(nn.Module):
                 inv_freq = factor * inv_freq
             self.inv_freq = inv_freq
 
-        positions = torch.arange(self.max_position).float()
+        positions = torch.arange(self.max_position, dtype=torch.float32)
         # (max_position, rotary_embedding/2)
         freqs = torch.einsum("i,j -> ij", positions, self.inv_freq)
 
@@ -94,14 +101,14 @@ class RotaryEmbedding(nn.Module):
         sin = torch.sin(freqs)
 
         # (max_position, rotary_embedding)
-        cos_sin_cache = torch.cat([cos, sin], dim=-1)
+        cos_sin_cache = torch.cat([cos, sin], dim=-1).to(cache_dtype)
         self.register_buffer("cos_sin_cache", cos_sin_cache)
 
     @torch.compile
     # tell the position index of the token
     # apply rotary embedding to query and key
     def forward(self, positions, query, key):
-        cos_sin = self.cos_sin_cache[positions]  # (seq_len, rotary_embedding)
+        cos_sin = self.cos_sin_cache[positions].to(dtype=query.dtype)
         cos, sin = cos_sin.chunk(2, dim=-1)
         return (
             apply_rotary_pos_emb(query, cos, sin),
@@ -127,4 +134,3 @@ if __name__ == "__main__":
     print(freqs.size())
 
     print(freqs[2])
-
