@@ -6,10 +6,11 @@
 \usepackage{graphicx}
 \graphicspath{{figures/}}
 \usepackage{booktabs}
+\usepackage{array}
 \usepackage{amsmath}
 \usepackage{amssymb}
-
 \usepackage{hyperref}
+\urlstyle{same}
 \newcommand{\theHalgorithm}{\arabic{algorithm}}
 
 \usepackage[accepted]{mlsys2025}
@@ -31,305 +32,424 @@
 \makeatother
 
 \newcommand{\sys}{LMPool}
-\newcommand{\module}[1]{#1}
-\newcommand{\cmark}{$\checkmark$}
-\newcommand{\pmark}{$\sim$}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
 
-\mlsystitlerunning{LMPool: Dynamic KVCache-Centric Orchestration for Distributed LLM Inference Optimization}
+\mlsystitlerunning{LMPool: Locality-Aware Routing and NVLink KV-Cache Transfer}
 
 \begin{document}
 
 \twocolumn[
-\mlsystitle{LMPool: Dynamic KVCache-Centric Orchestration \\ for Distributed LLM Inference Optimization}
+\mlsystitle{LMPool: Locality-Aware Routing and NVLink KV-Cache Transfer for Multi-GPU LLM Serving}
 
 \begin{mlsysauthorlist}
 \mlsysauthor{Jialiang Li}{HKUST}
 \end{mlsysauthorlist}
 
 \mlsysaffiliation{HKUST}{The Hong Kong University of Science and Technology}
-
 \mlsyscorrespondingauthor{Jialiang Li}{jl.li@connect.ust.hk}
 
-\mlsyskeywords{Large Language Models, KV Cache, Inference Systems, Multi-GPU, Orchestration}
+\mlsyskeywords{Large Language Models, KV Cache, Prefix Caching, Multi-GPU Serving, NVLink}
 
 \vskip 0.3in
 
 \begin{abstract}
-Distributed LLM serving stacks always isolate or not fully utillize KVCache management on each device. However, from a global perspective, this isolation wastes total GPU HBM when many requests share long prefixes and lacks elasticity when a single GPU HBM runs out of memory.
-This paper presents \sys, a dynamic KVCache-centric orchestration layer that unifies the cluster GPU HBM into a integrated block pool. It includes a control plane for gloabl scheduling and metadata storing, as well as a data plane for single LLM inference and inter-HBM migration.
-Extended on the single LLM PagedAttention, our method implements prefix-aware routing, block-level swapping, and page-table synchronizing, considering all the cache and capacity resources as a whole.
-This paper illustrates the system design, implementation, evaluation, and current progress. The source code is available at \url{https://github.com/0x0addc001/LMPool}.
+Prefix caching avoids repeated prefill computation, but conventional data-parallel LLM replicas manage their KV caches independently. A cache hit may therefore exist on the wrong GPU, while blindly following cache ownership can create a compute hotspot. Moving every reusable prefix is also counterproductive when transfer costs exceed the saved prefill work. We present \sys{}, a Mini-vLLM-based prototype guided by two principles. First, KV-aware routing addresses \emph{cache locality}: it sends a request to a directly connected GPU that already owns the longest useful prefix when the reuse benefit exceeds queue and capacity pressure. Second, NVLink KV transfer provides \emph{cache fluidity}: it copies or moves blocks when cache placement and request load diverge, while an admission model rejects transfers that cannot amortize their cost. A centralized control process maintains authoritative, versioned metadata; one data-plane process per GPU retains ownership of physical blocks and inference execution. Transfers use a prepare--execute--publish--finalize protocol so a destination is not visible before its data is ready and a source is not released prematurely.
+
+On six RTX 3090 GPUs arranged as three direct NVLink pairs, the block-transfer microbenchmark sustains 19.0--23.2~GiB/s for four-block batches and 26.1--30.1~GiB/s for eight-block batches, with end-to-end data validation. Across Qwen3-0.6B and Qwen3-1.7B, routing reduces uncached prefill tokens by about 50\% in a multi-prefix locality workload. In a session-handoff workload, full \sys{} improves throughput by 4.2--7.1\%, lowers mean TTFT by 33.2--42.6\%, and lowers mean end-to-end latency by 9.9--13.7\% relative to round-robin data parallelism. Memory-skew and steady load-skew experiments show little or negative throughput benefit, defining an important boundary: transfer is useful only when future reuse repays its data-movement and interference cost. Source code is available at \url{https://github.com/0x0addc001/LMPool}.
 \end{abstract}
 ]
+\printAffiliationsAndNotice{}
 
 \section{Introduction}
 \label{sec:intro}
-LLM inference has become a dominant workload in production AI infrastructure.
-Serving frameworks must batch thousands of concurrent requests while keeping attention key-value cache (KVCache) in GPU high-bandwidth memory (HBM).
-PagedAttention~\citep{vLLM} and RadixAttention~\citep{SGLang} improved single-device utilization through non-contiguous block allocation and common prefix sharing, but running the independent KVCache allocator on each GPU would easily run out of memory.
-Then, Mooncake~\citep{Mooncake}, AttentionStore~\citep{AttentionStore}, MemServe~\citep{MemServe}, and LMCache~\citep{LMCache} extends KVCache storage across GPU HBM, CPU DRAM, and SSD. However, offloading to CPU DRAM or SSD through PCIe or NVMe are still slow and could not fully utilized the resourses across multi-GPU clusters.
 
-Based on above observations, three limitations persist or not jointly considered in current research.
-\textbf{(1) No cross-GPU prefix reuse:} requests with identical system prompts or retrieved contexts store duplicate prefix blocks on every GPU, inflating HBM footprint and reducing effective batch capacity.
-\textbf{(2) No elastic HBM pooling:} when one GPU is full, schedulers must preempt locally, offload to CPU memory, or drop work, severely compromise the speed and performance. 
-\textbf{(3) Not Topology-aware scheduling:} treating all
-links focuslessly ignores that NVLinks are much faster than other data paths.
+PagedAttention~\citep{vLLM} and RadixAttention~\citep{SGLang} make prefix reuse practical inside one inference engine. Multi-GPU deployments, however, commonly run one data-parallel model replica and one cache allocator per GPU. The physical KV blocks remain local to each replica, but requests arrive at a cluster-level ingress. This creates a placement problem: an incoming prompt may match a prefix already resident on one GPU while a conventional round-robin dispatcher sends it elsewhere. The target then recomputes and stores the same prefix.
 
-This paper argues that globally-scheduled KV cache pooling across tightly coupled GPUs outperforms isolated per-device PagedAttention for shared-prefix and limited-memory LLM inference workloads.
-Therefore, \sys{} is bulit to test this claim.
-Each GPU runs an independent LLM inference engine, and a cluster-wide control plane handles routing, swapping, and memory metadata storing while the data plane runs single LLM inference and inter-HBM migration.
+A naive global cache policy has two opposite failure modes. Always route to the prefix owner and a hot prefix concentrates requests on one replica, reducing batching parallelism. Always redistribute KV blocks and the system pays communication, synchronization, and memory-interference costs even when local recomputation is cheaper. The useful operating point requires the request router and KV-cache placement mechanism to share one view of locality, load, capacity, and topology.
 
-This paper makes three contributions and will then be explained in the following sections.
-\textbf{(1) Prefix-topology-aware routing:\textbf} Design a prefix-topology-aware routing strategy that scores GPUs by prefix hit count weighted by link type, with a load-based fallback (§\ref{sec:gs-route}). 
-\textbf{(2) Temporal-topology-aware swapping:} Implement three-tier eviction and rebalancing with topology-prioritized swap targets and recursive remote replacement (§\ref{sec:gbm-evict}).
-\textbf{(3) Global page table management:} Introduce a unified global page table that maps prefixes to block location replicas with synchronization mechanism (§\ref{sec:gbm}).
-The source code is also released, with a candid account of the ongoing work and the future plan.(§\ref{sec:impl}, §\ref{sec:eval}, §\ref{sec:future}).
+\sys{} follows two first principles:
+
+\textbf{Routing principle -- cache locality.} Route a request to a GPU or serving instance that already holds the relevant KV prefix when doing so saves more prefill work than it adds queueing and capacity pressure. Successful routing also reduces the demand for later data movement.
+
+\textbf{Transfer principle -- cache fluidity.} When KV placement and request load no longer match, use direct NVLink to make useful KV blocks flow to the replica that can exploit them. Transfer does not solve arbitrary request skew. It specifically addresses uneven KV placement and cross-instance reuse that otherwise requires data movement or recomputation.
+
+The resulting rule is simple: avoid transfer when routing can preserve locality; when transfer is unavoidable and profitable, use the fastest supported direct path. \sys{} therefore treats multi-GPU HBM as a \emph{logically coordinated} pool, not as physically shared memory. Each worker still owns its local allocation and KV tensor. The control plane coordinates only metadata, reservations, route decisions, and transfer transactions.
+
+This paper makes three contributions:
+
+\textbf{(1) Locality- and load-aware routing.} We design a router that matches only contiguous complete prefix blocks, considers only the initial GPU and its direct NVLink partners, and balances saved prefill work against queue, decode, capacity, and reclaim costs.
+
+\textbf{(2) Cost-gated KV-cache transfer.} We implement batched NCCL transfer for complete block chains, distinguish copy from move semantics, and use an explicit transactional protocol with generation checks and rollback.
+
+\textbf{(3) An evaluated multi-process prototype.} We implement \sys{} on Mini-vLLM and evaluate the data path, routing, load skew, memory skew, and session handoff with Qwen3-0.6B and Qwen3-1.7B. We report both improvements and workloads where transfer does not amortize its cost.
 
 \section{Background and Motivation}
 \label{sec:bg}
 
-\subsection{Paged Attention}
-\label{sec:bg-paged}
+\subsection{Paged KV Caching}
 
-LLMs generate tokens autoregressively, requiring the continuous storage of key and value tensors in each sequence.
-Traditional implementations allocate contiguous memory chunks for these sequences, leading to severe internal fragmentation and wasted capacity.
-vLLM~\citep{vLLM} introduced Paged Attention to mitigate this issue by dividing the KVCache into fixed-size physical blocks and maintains a per-sequence logical-to-physical page table.
-During prefilling, the engine allocates one block per fixed-size tokens and records the mapping, and when decoding, it appends new tokens to the current tail block and allocates a fresh block only when the tail is full.
-Reference counting allows multiple sequences to point to the same physical block, meaning that when two sequences share a common prefix, the engine computes a content hash for each complete block and increments the reference count instead of copying data.
-The block is freed only when its reference count drops to zero.
-This design keeps HBM fragmentation low and enables prefix reuse within a single GPU at negligible overhead.
+Autoregressive decoding stores a key and value vector for each processed token and layer. PagedAttention divides this state into fixed-size physical blocks and maps each sequence's logical blocks to them~\citep{vLLM}. Prefix caching hashes complete logical blocks; two requests with the same hash chain may reference the same ready physical blocks. This reduces fragmentation and avoids repeated prefill work, but reuse remains scoped to the cache allocator that owns the physical block.
 
-\subsection{Observation \& Solution}
-\label{sec:bg-solution}
+For a prompt split into complete blocks $b_0,\ldots,b_k$, \sys{} computes a chained hash
+\begin{equation}
+  h_i = \mathrm{xxhash64}(h_{i-1} \parallel b_i),
+\end{equation}
+where $h_{-1}$ is empty. Partial tail blocks are not globally reusable. A valid match must start at $h_0$ and remain contiguous; finding an isolated later hash is insufficient because its attention dependencies are absent.
 
-However, for multiple instances online serving, their KVCache pressure is unevenly distributed across time, sequences, and GPUs. The right resolution is to let the most suitable GPU handle the specific job with respect to its HBM-capacity, cache-affinity, and topology-locality at that moment. That requires scheduling decisions that go beyond the local view of a single GPU. \sys{} preserves the similar abstraction of Paged Attention but elevates the prefix mapping and reference counting architecture to a global, cluster-wide scope. Therefore, the system aims to elevate scheduling from a per-device decision to a cluster-wide optimization, increasing overall throughput and reducing total delay in limited hardware resources.
+\subsection{Observation 1: Reuse Is a Placement Property}
 
-\subsection{Applicable Workload}
-\label{sec:bg-workload}
+A prefix cache hit is useful only if the request executes where the matching KV is available, or if moving that KV is cheaper than recomputation. Independent round-robin replicas may preserve many local entries yet miss them at request admission. Conversely, a global router can increase request-level and token-level reuse without increasing the number of physical cache blocks. This motivates making routing the first action: cache locality should be repaired before data movement is considered.
 
-\textbf{(1) Shared Prefix:}  Inference workloads commonly feature concurrent, overlapping prefixes. Applications such as multi-tenant chat platforms with extensive public system prompts, retrieval-augmented generation pipelines, and autonomous agent loops with fixed tool schemas generate traffic where many concurrent sequences share substantial prefixes. Under conventional deployment architectures, each GPU operates as an isolated instance. When multiple sequences sharing a long prefix arrive at different devices, the identical KVCache are computed and stored redundantly across the cluster. This isolation consumes valuable high-bandwidth memory and limits the overall batch size. By pooling the memory, the system reduces the number of physical replicas and enables routing new requests more likely to the device holding the cached prefix, or migrating the relevant blocks over NVLink, so the prefix is computed once and shared across the cluster.
+\subsection{Observation 2: Locality Competes with Parallelism}
 
-\textbf{(2) Long Context:} The isolated memory model also struggles with long-context sessions and workload imbalances. In extended multi-turn conversations, the KVCache grows significantly, and blocks from earlier turns become cold despite potential future references. When a single GPU faces memory exhaustion, current systems typically discard blocks, which forces costly recomputation, or swapping the blocks to host CPU memory, which introduces severe latency that disrupt interactive serving. Furthermore, request distribution is often skewed, leaving some GPUs under memory pressure while peers possess idle capacity. A unified memory pool resolves these bottlenecks by dynamically rebalancing the load. Cold blocks can be immediately migrated from congested GPUs to idle peers through NVLink, effectively treating the cluster as a single high-bandwidth memory level.
+Long shared prefixes are often popular. Sending every matching request to the first owner converts locality into a load hotspot. The 20260719 evaluation artifacts include per-rank request, token, prefill/decode-time, GPU-utilization, and memory-utilization measurements precisely because an aggregate hit rate cannot reveal this failure. A route decision must price the remaining prefill work together with waiting tokens, running decode work, free blocks, and reclaim pressure. Thus, maximizing hit rate is not the objective; minimizing expected completion cost is.
 
-\subsection{Additonal Condition}
-\label{sec:bg-condition}
+\subsection{Observation 3: Transfer Must Earn Its Cost}
 
-The benefits of GPU-to-GPU migration depend critically on interconnect bandwidth.
-On nodes with NVLink, the per-link bandwidth is high enough that migrating typical KVCache could be extremely fast, making \sys's swap-based rebalancing strictly preferable to CPU offload.
-On PCIe-only nodes, GPU-to-GPU bandwidth is comparable to or only modestly better than CPU swap bandwidth, so the latency advantage narrows and in some configurations CPU offload or local recomputation may be competitive.
-\sys{} is therefore best suited to multi-GPU nodes with NVLink or equivalent high-bandwidth interconnects. The topology configuration is exposed explicitly, so operators can match the eviction policy to the hardware at hand.
+Direct NVLink is faster than host-mediated storage paths on the evaluated node, but a transfer also reserves destination blocks, synchronizes two workers, consumes link and memory bandwidth, and updates control metadata. Short-lived or cold KV should be recomputed or evicted rather than moved. Transfer becomes attractive when a complete hot chain will be reused multiple times, when a session is handed to a different replica, or when preserving reusable state relieves a true local block shortage. This observation motivates batching, measured-bandwidth cost estimation, and foreground/background admission control.
+
+\subsection{Scope}
+
+\sys{} targets replicas of the same model on a multi-GPU node with explicitly configured or automatically discovered direct NVLink pairs. A GPU is eligible for cross-device reuse only when it is directly connected to the request's initial GPU; unrelated PCIe or NUMA peers receive zero topology weight. The prototype complements RDMA-based and storage-tier systems rather than replacing them. Cross-node RDMA, CPU/SSD tiers, heterogeneous models, and transparent remote memory addressing are outside the current scope.
 
 \section{System Design}
 \label{sec:design}
 
-\sys{} is composed by centralized Control Plane and distributed Data Plane. 
-Control Plane consists of Global Scheduler and Global Block Manager.
-For Data Plane, each process runs an LLM Engine with its own Scheduler, Block Manager, and Model Runner on a GPU, and they exchange KVCache by KV Transfer between GPUs. 
-Figure~\ref{fig:arch} reflects the overall system architecture.
-
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\textwidth]{figures/fig_architecture.png}
-  \caption{\sys{} system architecture. Control Plane (Global Scheduler, Global Block Manage) makes routing and eviction decisions over a global page table. Data Plane runs on inference engine per GPU and migrates KV blocks over NVLink/NCCL via KV Transfer.}
+  \includegraphics[width=0.92\textwidth]{fig_architecture.png}
+  \caption{\sys{} architecture. LLMEngine is the launcher, ingress, and lightweight supervisor. A dedicated control-plane process owns global scheduling and metadata. Identical data-plane processes own each GPU's local scheduler, block manager, model runner, and KV tensor. Only direct NVLink pairs exchange KV payloads.}
   \label{fig:arch}
 \end{figure*}
 
-\subsection{Control Plane}
-\label{sec:control}
+\subsection{Process and Ownership Model}
 
-Control Plane is in charge of decision making and metadata storing. It maintains cluster-wide KVCache metadata and decides where sequences to route and which blocks to evict base on these data.
+LLMEngine is the user-facing process. It creates one independent control-plane process and $N$ identical data-plane processes, including a worker for rank~0. New sequences enter LLMEngine, which sends sequence metadata and prefix hashes through a ControlPlaneClient. The control plane chooses a rank before LLMEngine enqueues the full sequence to that worker. Workers do not normally rerun global routing.
 
-\subsubsection{Global Scheduler}
-\label{sec:gsched}
+The control process owns GlobalScheduler and GlobalBlockManager. A data-plane process owns one Local Scheduler, Local Block Manager, Model Runner, and CUDA device. This separation is an ownership boundary: the global page table is authoritative metadata, whereas local block managers are authoritative for physical allocation, reference counts, readiness, and the KV tensor. No Python BlockManager object is shared across processes.
 
-Global Scheduler is the cross-GPU decision center.
-It holds references to Global Block Manager for page-table queries, to the local Block Manager for prefix hash computation, and to Model Runner for invoking KV transfers.
+LLMEngine also monitors the control process and can restart it. Bidirectional heartbeat messages detect an unresponsive worker or control process; they provide failure detection, not consensus or high availability. Worker state snapshots reconstruct control metadata after a control-process restart. The current prototype does not continue service after launcher failure.
 
-\textbf{(1) Request routing:}
-\label{sec:gs-route}
-For each new sequence, Global Scheduler computes a chained prefix hash over complete blocks only, with partial tails excluded, looks up prefix on the global page table, aggregates hit counts per GPU, and scores each candidate as $hits \times w_{topo}(gpu_{source}, gpu_{target})$ with weights: $$
-w_{topo} = 
-\begin{cases}
-3, & \text{if } \text{GPU}_{\text{same}} \\
-2, & \text{if } \text{NVLink}_{\text{connected}} \\
-1.5, & \text{if } \text{PIX}_{\text{connected}} \\
-1, & \text{if } \text{NODE}_{\text{connected}}
-\end{cases}
-$$
-It picks the highest-scoring GPU that has enough free blocks. If the top candidate is short on capacity, it is still selected on the assumption that rebalancing will free the necessary space.
-When no hash exists or no hits are found, the scheduler falls back to the GPU with the most free blocks.
+\subsection{Authoritative Global Metadata}
 
-\textbf{(2) Memory rebalancing:}
-When local HBM cannot satisfy an allocation, Global Scheduler selects eviction candidate, groups cold blocks by target GPU and runs paired swap out/in on the source rank and the target rank, and updates the global page table.
-If the freed space is still insufficient, Global Scheduler will preempt for rebalance, which means requeue the shortest running sequences and release their blocks.
+GlobalBlockManager maintains:
+\begin{itemize}
+  \item a page table $h \mapsto \{(g,b,\mathrm{generation},\mathrm{ready})\}$ that may contain multiple replicas for one hash;
+  \item versioned free, used, evictable, parent, recency, and access-frequency snapshots per GPU;
+  \item route reservations, in-flight transfer blocks, and placement leases; and
+  \item worker epochs and snapshot versions used to reject stale updates.
+\end{itemize}
 
-\subsubsection{Global Block Manager}
-\label{sec:gbm}
+Workers publish a complete snapshot after allocation, append, release, preemption, transfer publication, and relevant cache-access changes. Replacement is atomic at GPU-snapshot granularity. Route-time reservations optimistically subtract capacity until the request commits its first prefill, preventing a burst of routes from all consuming the same stale free-block count. A heartbeat never advances page-table freshness; missing or stale snapshots trigger an explicit full-state request.
 
-Global Block Manager is the authoritative registry of the distributed KVCache pool.
+\subsection{KV-Aware Routing}
+\label{sec:routing}
 
-\textbf{(1) Block state maintaining:}
-The manager maintains $Global Page Table$ ($hash \mapsto [BlockLocation]$, allowing multiple replicas per hash), $Free Blocks Per Gpu$, per-GPU LRU timestamps in $Block Access Time$, and per-GPU \module{block\_hash} maps for master reconstruction.
-Each $BlockLocation$ records $(\module{gpu\ id}, \module{block\ id}, \module{hash}, \module{last\ access\ time})$.
-
-\textbf{(2) Chained prefix hashing:}
-For complete block $i$,
+For a request initially assigned to rank $s$, candidate ranks are $s$ and its directly connected NVLink partners. The topology affinity is
 \begin{equation}
-  h_i = \text{xxhash64}\big(\text{bytes}(h_{i-1}) \,\|\, \text{tokens}_i\big),
+ w(s,g)=
+ \begin{cases}
+ 2, & g=s,\\
+ 1, & g\text{ is directly connected to }s\text{ by NVLink},\\
+ 0, & \text{otherwise}.
+ \end{cases}
 \end{equation}
-where $h_{-1}$ is omitted for block~0 and partial blocks are assigned $h{=}{-}1$.
-Sequences sharing $k$ complete blocks produce the same $h_{k-1}$. Looking up prefix could receive all replica locations sorted by NVLink affinity from the source GPU's rank.
+The zero case is filtered rather than carried into later scoring.
 
-\textbf{(4) Allocation committing:}
-When a Local Block Manager allocates blocks, the Global Block Manager decrements $FreeBlocksPerGpu$, updates LRU and hash maps, and appends a $BlockLocation$ to $GlobalPageTable[h]$, registering a new replica if the hash already appears elsewhere.
+For each candidate, GlobalScheduler finds the longest contiguous ready prefix chain and estimates
+\begin{equation}
+ C(g) = C_{\mathrm{prefill}}(g) + C_{\mathrm{queue}}(g)
+       + C_{\mathrm{reclaim}}(g) - C_{\mathrm{locality}}(g).
+\end{equation}
+$C_{\mathrm{prefill}}$ grows with unmatched prompt tokens, $C_{\mathrm{queue}}$ includes waiting tokens and decode-weighted running work, and $C_{\mathrm{reclaim}}$ prices a real block shortage. $C_{\mathrm{locality}}$ rewards matched blocks using the topology affinity. Free capacity is a tie breaker rather than a substitute for load. Effective capacity includes dependency-safe reclaimable cached leaves, not pinned live decode blocks.
 
-\textbf{(5) Gloabal page table synchronization:}
-Updating GPU's state could atomically replaces one GPU's state entries on the Global Block Manager after each allocating, appending, preempting, or finishing event.
-Reserving blocks optimistically decrements the remote free count between routing and Local Block Manager committing.
-Broadcasting page table can push full state every $SyncInterval$ epochs.
+The lowest-cost feasible candidate wins. A prefix owner may be bypassed when its sequence pressure exceeds its NVLink partner by a configured ratio and the extra prefill cost remains bounded. On a miss, the router chooses the candidate with the lowest projected load and sufficient effective capacity. This policy keeps cache locality from overwhelming data-parallel utilization.
 
-\textbf{(6) Temporal-topology-aware eviction:}
-\label{sec:gbm-evict}
-Selecting eviction candidates works in three steps. First, select the $N$ locally coldest blocks by $LastAccessTime$. Then, for each block, pick a target GPU in order of NVLink partner, same-socket peers by free block count, and then cross-socket peers. Finally, if no target has space, recursively evict the coldest remote block or overwrite on arrival.
-Both allocating with swapping during prefilling and decoding go through this procedure before normal allocation.
+\subsection{Local Allocation and Reclamation}
 
-\subsection{Data Plane}
-\label{sec:data}
+The Local Block Manager first references a matching ready local block and increments its reference count. Otherwise, it allocates from a deque of free block identifiers and publishes a complete block only after the model has written its KV data. Completed prefixes remain cacheable at reference count zero. Reclamation operates on dependency-safe leaves so removing an ancestor cannot orphan a retained descendant. Coldness combines access frequency and recency; live blocks with positive references are not move-eviction victims, although they may be copied when replication is profitable.
 
-Data Plane runs model inference and physically moves KV blocks between devices.
-Each GPU's local components follow a standard single-node vLLM-style engine and KV Transfer connects them across GPUs.
+\subsection{Foreground Transfer}
+\label{sec:fg-transfer}
 
-\subsubsection{Local Scheduler}
-\label{sec:lsched}
+Foreground transfer is demand-driven. If a local prefill or decode append has a shortage of $k$ blocks, the worker asks the control plane for exactly $k$, not for the request's full block count. GlobalScheduler selects a complete source chain and determines whether the operation is a \emph{move} or \emph{copy}. A move may release a dependency-safe source suffix after publication; a copy retains the source and creates another replica. Pinned prefixes can be copied but never released.
 
-Local Scheduler works with Local Block Manager for memory management.
-During prefill, Global Scheduler would route a sequence to a Local Scheduler, and the Local Scheduler would hands the sequence to the local Block Manager for allocation.
-During decode, if fails to append, it asks Global Scheduler to rebalance and retries till success, otherwise it preempts the shortest running sequence.
-After each allocation, appending, preemption, or completion, it pushes its $ FreeBlockCount$, $BlockHashes$ to the Global Block Manager.
+Admission compares estimated transfer cost with estimated saved prefill work:
+\begin{align}
+ T_{\mathrm{xfer}} &= T_{\mathrm{fixed}} + \frac{B}{\widehat{BW}}\,I,\\
+ T_{\mathrm{save}} &= N_{\mathrm{reuse}}\,N_{\mathrm{cached}}\,t_{\mathrm{prefill}}.
+\end{align}
+Here $B$ is payload bytes, $\widehat{BW}$ is an EWMA initialized from the transfer microbenchmark, and $I$ prices memory-system interference. A plan is admitted only if it has a real shortage, executable source and destination capacity, a minimum block batch, and $T_{\mathrm{save}}/T_{\mathrm{xfer}}$ exceeds a configured threshold. Repeated failures are cooled down by reason.
 
-\subsubsection{Local Block Manager}
-\label{sec:lblock}
+\subsection{Background Placement}
+\label{sec:bg-transfer}
 
-Block Manager owns $FreeBlockIds$, $UsedBlockIds$, and the local $HashToBlockId$ mapping.
-Computing hash chains xxHash over token bytes using the preceding block's hash.
-Allocating reuses local hits by incrementing $RefCount$ and $NumCachedTokens$, or allocates new blocks on a miss, then commits the last complete block hash to the global page table.
-Appending finalizes or opens blocks as tokens arrive. Deallocating drops reference counts to zero and returns blocks to the free list.
+Background placement handles predictable future reuse rather than an immediate allocation failure. The control plane tracks complete-chain frequency and can copy a hot chain to an idle NVLink partner. It batches compatible candidates, caps blocks per plan, and creates a placement lease only after publication. Later matching requests are striped between source and replica, coupling speculative placement to routing rather than merely duplicating data. A hotness threshold, load-skew threshold, expected-reuse estimate, pair cooldown, and idle-pressure guard reject low-value work.
 
-\subsubsection{Model Runner}
-\label{sec:runner}
+The session-handoff workload exercises this path: a warmup phase creates one copy of each long prefix, then a reuse phase shifts sessions to the partner. The locality and load-skew workloads can deliberately disable background placement to isolate routing and steady-state overhead.
 
-Model Runner holds model weights, CUDA-graph decoding captures, the KVCache tensor, and the sampler.
-After warmup, the number of available blocks is derived from $GpuMemoryUtilization$.
-The KVCache tensor has shape $(2, L, B, block\_size, H_{kv}, d)$ and is sliced into per-layer $KCache$ and $VCache$ attributes.
-Before forward pass, it could swap in remote blocks by asking KV Transfer and fills its $LocalBlockTable$.
+\subsection{Transactional Transfer Protocol}
 
-\subsubsection{KV Transfer}
-\label{sec:kv}
+A plan uses four externally visible phases:
 
-KV Transfer implements NCCL send and recv block migration with $ Tags = BlockId \times 10000 + Layer \times 2 + IsK$ to avoid K/V collisions.
-Swapping-out negotiates target block IDs, streams per-layer K and V tensors from source to destination, and synchronizes with all reduce method. Swapping-in mirrors this protocol for pulling remote prefix blocks into local HBM.
+\textbf{Prepare.} The destination reserves concrete free block IDs; both workers record plan state. No new location is visible to routing.
 
-\subsubsection{Sequence Metadata}
-\label{sec:seq}
+\textbf{Execute.} Source and destination issue matching NCCL point-to-point operations. All selected layers, K/V tensors, and blocks are packed into a contiguous payload per direction to amortize communicator and launch overhead. Pair communicators are prewarmed.
 
-Sequence extends the base sequence record with $IsRemotePrefix$, $RemoteGpuId$, and $PendingSwapIn$, all serialized through $multiprocessing.Que$ for cross-process dispatch.
+\textbf{Publish.} The destination marks received blocks ready and publishes a versioned snapshot. Only then may the control plane expose the new page-table location or lease.
+
+\textbf{Finalize.} For move semantics, the source verifies block hash and generation before releasing the specified suffix. Copies skip source release. Any prepare or execute failure triggers abort, releases reservations, and keeps the source authoritative.
+
+The protocol is idempotent by plan ID and phase. Per-client receive locks serialize response-queue consumption, control-plane state is mutated in one event loop, and local block mutations remain single-threaded inside a worker. These measures avoid a global lock on the inference fast path while protecting metadata transactions.
 
 \section{Implementation}
 \label{sec:impl}
 
-\sys{} extends Mini-vLLM codebase with PyTorch models, paged-attention kernels, and multi-process LLM Engine workers under $torch.distributed$.
-
-\section{Evaluation}
-\label{sec:eval}
-
-This section describes how this paper will evaluate \sys once cluster benchmarks are ready by
-laying out hypotheses, metrics, workloads, baselines, and benchmarks, so that future results are reproducible.
-
-\subsection{Hypotheses \& Metrics}
-\label{sec:eval-metrics}
-
-This paper test three hypotheses.
-
-\textbf{(1) Capacity:} \sys{} supports more concurrent shared-prefix sequences at fixed HBM than isolated per-GPU allocation.
-
-\textbf{(2) latency:} Prefix-topology-aware routing lowers time-to-first-token (TTFT), time-per-output-token (TPOT), time-to-last-token (TTLT) compared to random GPU placement when remote prefix hits exist.
-
-\textbf{(3) Throughput:} Rebalancing reduces preemption-induced stalls versus local-only eviction under skewed load.
-
-Primary metrics are global prefix hit rate, TTFT, TPOT and TTLT at P50 and P99, as well as sustained decoding throughput (tokens/s).
-
-\subsection{Workloads \& Baselines}
-\label{sec:eval-workloads}
-
-Workloads combine synthetic shared-prefix sweeps, varying prefix length, fan-out, and decode length, with trace replay from open chat logs using prefix clustering.
-Baselines are LMPool-no-route-no-swap (pool disabled), LMPool-no-route (pool enabled, uniform random routing), LMPool-no-swap (pool disabled, routing enabled), and LMPool-full (routing, swapping all enabled).
-
-\subsection{Experimental Setup}
-\label{sec:eval-setup}
-
-Experiments will run on dual and eight GPUs with NVLink pairs and socket groups configured to match $NvlinkTopo$, using 0.6B/1.7B models at FP16/BF16.
-GPU, NCCL, and PyTorch versions will be also reported.
-
-\section{Current and Future Work}
-\label{sec:future}
-
-Table~\ref{tab:states} summarizes the current codebase progress.
-Multi-GPU asynchronous serving and prefix-aware routing are implemented.
-Global page-table push via update\_gpu\_state is in place, periodic broadcast\_page\_table through maybe\_sync is implemented but not completed and pending integration testing.
-Topology-aware eviction via select\_eviction\_candidates is complete. NCCL block migration primitives are implemented but undergoing end-to-end correctness testing.
-Future work includes implementing global synchronization, cross-GPU block migration primitives intergration testing, benchmark evaluation and unit testing.
+\sys{} extends Mini-vLLM in Python and PyTorch. Table~\ref{tab:modules} summarizes the implementation boundaries. Legacy function names swap\_out and swap\_in remain inside the KV-transfer module; the paper and public documentation consistently use \emph{transfer} because the data path supports both copies and moves and is not a CPU swap tier.
 
 \begin{table}[t]
   \centering
-  \caption{Prototype implementation states}
-  \label{tab:states}
+  \caption{Principal implementation modules.}
+  \label{tab:modules}
   \footnotesize
-  \setlength{\tabcolsep}{4pt}
-  \begin{tabular}{@{}p{0.34\linewidth}cp{0.38\linewidth}@{}}
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{@{}L{0.34\linewidth}L{0.60\linewidth}@{}}
     \toprule
-    Component & State & Notes \\
+    Module & Responsibility \\
     \midrule
-    Multi-GPU async inference & \cmark & Multiple ranks independently schedule, execute, and sample \\
-    Block-level prefix-topology-aware routing decision & \cmark & route\_sequence \\
-    Global page-table sync & \pmark & Implemented update\_gpu\_state, still testing maybe\_sync off \\
-    Temporal-topology-aware eviction & \cmark & Three-tier policy \\
-    Cross-GPU block migration primitives & \pmark & swap\_out / swap\_in pending integration testing \\
-    Benchmarks & -- & Throughput, latency, prefix hit rate metrics vs. baseline \\
-    Tests & -- & Component unit tests \\
+    LLM engine & Ingress, process launch/supervision, completion aggregation \\
+    Control plane & Protocol, clients, authoritative event loop, heartbeat \\
+    Global scheduler & Route and transfer-plan cost decisions \\
+    Global block manager & Global page table, snapshots, reservations, candidates \\
+    Data plane & Per-rank worker loop and transfer phase executor \\
+    Local scheduler & Local prefill/decode admission and shortage trigger \\
+    Local block manager & Physical blocks, prefix cache, references, reclamation \\
+    Model runner & Model execution, KV tensor, metrics, transfer entry \\
+    KV transfer & Packed NCCL GPU-to-GPU payload movement \\
     \bottomrule
   \end{tabular}
 \end{table}
 
+\subsection{Testing Strategy}
+
+The repository mirrors each engine module with focused tests rather than relying only on benchmark completion. The current CPU test run contains 181 passing tests and one hardware-gated skip. Table~\ref{tab:tests} lists the coverage intent.
+
+\begin{table}[t]
+  \centering
+  \caption{Test design and coverage.}
+  \label{tab:tests}
+  \footnotesize
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{@{}p{0.30\linewidth}p{0.62\linewidth}@{}}
+    \toprule
+    Test group & Covered behavior \\
+    \midrule
+    Block managers & Allocation/release, chain reuse, LFU/LRU leaves, generations, snapshots \\
+    Global scheduler & Hit/miss/capacity routes, load bypass, direct-pair filtering, move/copy plans \\
+    Control plane & Epochs, stale updates, reservations, leases, idempotent phases, heartbeat, concurrency \\
+    Data plane/engine & Queue protocol, master-first ingress, worker/control lifecycle, aggregation \\
+    KV transfer & Shape/byte accounting, copy/move primitives, two-rank NCCL equality and deadlock guard \\
+    Model runner & KV layout, prefill/decode preparation, dtype consistency, transfer adapters \\
+    Benchmarks & Workload construction, schemas, metrics, confidence intervals, plotting \\
+    End-to-end & Multi-process request completion and optional CUDA/NCCL integration \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Tests use fakes for deterministic control decisions and mark CUDA/NCCL cases so CPU-only CI remains usable. The hardware test sends known KV values from rank~0 to rank~1, verifies equality after transfer, and bounds completion to detect mismatched send/receive ordering.
+
+\section{Evaluation}
+\label{sec:eval}
+
+We answer four questions: (Q1) Does KV-aware routing improve useful prefix reuse? (Q2) What latency and bandwidth does the transfer data path provide? (Q3) Does combining routing and transfer improve end-to-end service when sessions move? (Q4) Under which skew workloads does transfer fail to amortize its cost?
+
+\subsection{Setup and Methodology}
+
+The evaluation uses six 24~GiB GeForce RTX 3090 GPUs selected from a seven-GPU host. Physical pairs $(0,1)$, $(3,4)$, and $(5,6)$ report NV4 connectivity; the processes see them as logical pairs $(0,1)$, $(2,3)$, and $(4,5)$. We evaluate Qwen3-0.6B and Qwen3-1.7B in BF16. Both models have 28 layers, eight KV heads, head dimension 128, and therefore the same 114,688 KV bytes per token. The KV block size is 256 tokens. System experiments use a fixed per-worker KV block budget and five repetitions with seed~0 and EOS ignored, so every request produces 64 output tokens. Goodput counts output tokens from requests whose E2E latency is at most 10~s.
+
+Every JSON artifact records the command, resolved model/configuration, Git state, per-trial values, 95\% confidence intervals, and per-rank statistics. Scenarios run in fresh processes; cache contents do not persist between them. The full artifact set is the paper batch dated 20260719T072508Z.
+
+\subsection{Synthetic Dataset Profiling}
+
+The current study uses deterministic synthetic prompts, not a public conversational trace. Each prompt applies the Qwen chat template to a repeated instruction body and group-specific suffix. This makes the amount and ownership of reusable KV explicit. Table~\ref{tab:datasets} profiles the tokenized inputs and phase construction. Dataset-level reporting is important because request hit rate alone hides how many prompt tokens are actually reused.
+
+\begin{table*}[t]
+  \centering
+  \caption{Synthetic workload dataset profiles. Prompt-token counts are tokenizer outputs for one scenario trial and are identical across the two models.}
+  \label{tab:datasets}
+  \footnotesize
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{@{}lrrrrrp{0.31\textwidth}@{}}
+    \toprule
+    Workload & Requests & Prefix groups & Prompt tokens & Output tokens & Submit window & Construction and purpose \\
+    \midrule
+    Locality/routing & 192 & 16 & 365,880 & 12,288 & 16 & Multiple long shared prefixes interleaved across requests; isolates locality-aware routing with transfer disabled. \\
+    Load skew & 192 & hot+cold & 320,232 & 12,288 & 16 & 75\% of requests target a hot family and 25\% use cold groups; tests whether load pricing avoids a cache-owner hotspot. \\
+    Memory skew & 128 & 15 & 214,064 & 8,192 & 16 & Warmup, pressure, and reuse phases under a 64-block budget; induces foreground shortage and tests transfer admission. \\
+    Session handoff & 128 & 32 & 244,048 & 8,192 & 64 & 32 warmup sessions create prefixes, then 96 reuse requests shift to each owner's NVLink partner; tests predictive copy and route coupling. \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{Baselines and Metrics}
+
+We use five normalized scenarios. \textbf{single-gpu} runs one replica. \textbf{multi-gpu} uses static round-robin data parallelism. \textbf{multi-gpu-kv-routing} enables the global router but disables transfer. \textbf{multi-gpu-kv-transfer} keeps round-robin request placement and enables transfer. \textbf{multi-gpu-lmpool} enables both mechanisms. All multi-GPU scenarios use the same per-worker KV block budget.
+
+Primary metrics are output throughput, SLA goodput, mean TTFT, mean time per output token (TTPT), mean and P90 E2E latency, and uncached prefill tokens. We distinguish control-plane request hit, route-to-owner hit, data-plane local request hit, and cached-token ratio. Transfer counters report blocks, bytes, copy/move semantics, protocol success/failure, and estimated versus observed cost. Per-rank request/token/time/utilization distributions expose load concentration.
+
+Figure~\ref{fig:results-summary} gives a visual summary of the three positive claims. Panel~(a) compares cached prompt tokens under round-robin and KV-aware routing. Panel~(b) reports measured NVLink bandwidth, where each error bar spans the minimum and maximum over two models and three physical pairs. Panel~(c) reports the improvement of full \sys{} over multi-gpu in session handoff; positive bars denote either higher throughput or lower latency.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{fig_results_summary.png}
+  \caption{Summary of locality, transfer-data-path, and end-to-end session-handoff results. Values are five-trial means for end-to-end workloads; transfer bars aggregate the six model/pair microbenchmark runs. Numeric labels make the plots interpretable without relying only on color.}
+  \label{fig:results-summary}
+\end{figure*}
+
+Figure~\ref{fig:absolute-results} retains the original units for the two workloads behind the main claims. It shows that the relative improvements in Figure~\ref{fig:results-summary} are not artifacts of normalization: routing preserves or improves absolute throughput while reducing TTFT, and full \sys{} has the highest session-handoff throughput and the lowest TTFT for both models. The complete four-panel benchmark outputs, including E2E tails, reuse, and GPU utilization, are retained with the archived artifact and the accompanying technical report.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{fig_absolute_metrics.png}
+  \caption{Absolute five-trial mean results in their original units. Routing is compared with round-robin under the same KV budget; session handoff compares round-robin, transfer-only, and full \sys{}. Numeric labels report the underlying aggregate values rather than only relative deltas.}
+  \label{fig:absolute-results}
+\end{figure*}
+
+\subsection{Q1: Routing Improves Token Reuse}
+
+Table~\ref{tab:routing} compares routing-only with round-robin. Across both models, cached-token ratio rises from about 44\% to 72\%, and uncached prefill tokens fall by about half. The same prompts and budget are used, so this is a placement effect rather than extra cache capacity. Routing improves mean TTFT by 20.2\% on Qwen3-0.6B and 10.6\% on Qwen3-1.7B. Throughput gains are smaller (2.7\% and 2.2\%) because the workload still generates 64 decode tokens and decode dominates steady-state service time. The first Qwen3-0.6B multi-GPU trial was colder than later trials, so we treat the reuse counters and cross-model direction as stronger evidence than a single throughput delta.
+
+\begin{table}[t]
+  \centering
+  \caption{Routing workload, five-trial means. Uncached is the total prompt tokens actually prefetched.}
+  \label{tab:routing}
+  \footnotesize
+  \setlength{\tabcolsep}{3.2pt}
+  \begin{tabular}{@{}llrrrr@{}}
+    \toprule
+    Model & Policy & Tok/s & TTFT (ms) & Cached & Uncached \\
+    \midrule
+    0.6B & Round-robin & 233.4 & 256.5 & 44.2\% & 204,037 \\
+         & Routing & 239.7 & 204.7 & 71.9\% & 102,814 \\
+    1.7B & Round-robin & 223.6 & 253.6 & 44.2\% & 204,293 \\
+         & Routing & 228.5 & 226.8 & 72.3\% & 101,176 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Q2: Batched NVLink Transfer}
+
+The microbenchmark moves every layer's K and V tensors between two ranks and validates the destination byte-for-byte. Four blocks contain 0.109~GiB and achieve 19.0--23.2~GiB/s across all model/pair runs, with 4.71--5.76~ms mean latency. Eight blocks contain 0.219~GiB and achieve 26.1--30.1~GiB/s with 7.26--8.39~ms mean latency. Larger batches better amortize fixed NCCL and kernel overhead. Because the two Qwen3 models have identical KV geometry, their payload sizes are identical; running both checks model-resolution and dtype paths rather than creating a different transfer size.
+
+These values calibrate the online cost model. They establish data-path correctness and attainable batch bandwidth, but do not by themselves imply an end-to-end gain: useful future reuse must exceed this latency plus runtime interference.
+
+\subsection{Q3: Session Handoff Benefits from Both Principles}
+
+Table~\ref{tab:handoff} reports the strongest end-to-end case. After 32 warmup sessions, \sys{} copies 224 hot blocks per trial in three batched pair plans, then routes the 96 reuse requests across source and replica. Cached-token ratio rises from 47.0\% under round-robin to 70.5\%. Compared with multi-gpu, full \sys{} improves throughput by 4.2\% on 0.6B and 7.1\% on 1.7B; mean TTFT falls by 33.2\% and 42.6\%; mean E2E falls by 9.9\% and 13.7\%. Transfer-only also helps, but routing plus placement gives the lowest TTFT and E2E. The per-rank submitted-request max/min ratio falls from approximately 3.3 to 1.8, showing that replication preserves locality without concentrating all reuse at the original owner.
+
+\begin{table*}[t]
+  \centering
+  \caption{Session-handoff results, five-trial means. Parentheses show change relative to multi-gpu for the same model.}
+  \label{tab:handoff}
+  \footnotesize
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{@{}llrrrrrr@{}}
+    \toprule
+    Model & Policy & Throughput & Mean TTFT & Mean E2E & P90 E2E & Cached tokens & Blocks copied \\
+          &        & (tok/s) & (ms) & (ms) & (ms) & & \\
+    \midrule
+    0.6B & Multi-gpu & 496.3 & 1,156.5 & 5,529.1 & 6,335.1 & 47.0\% & 0 \\
+         & Transfer-only & 501.4 (+1.0\%) & 1,033.6 (-10.6\%) & 5,406.8 (-2.2\%) & 6,042.9 (-4.6\%) & 70.5\% & 224 \\
+         & LMPool & 517.1 (+4.2\%) & 772.8 (-33.2\%) & 4,982.7 (-9.9\%) & 5,840.0 (-7.8\%) & 70.5\% & 224 \\
+    \midrule
+    1.7B & Multi-gpu & 454.3 & 1,434.7 & 6,093.8 & 7,032.2 & 47.0\% & 0 \\
+         & Transfer-only & 469.2 (+3.3\%) & 1,126.5 (-21.5\%) & 5,705.7 (-6.4\%) & 6,518.7 (-7.3\%) & 70.5\% & 224 \\
+         & LMPool & 486.4 (+7.1\%) & 823.3 (-42.6\%) & 5,258.3 (-13.7\%) & 6,466.9 (-8.0\%) & 70.5\% & 224 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{Q4: Boundary Results}
+
+The memory-skew workload does not yet produce a transfer-dominated win. With Qwen3-1.7B, multi-gpu reaches 221.3 tok/s, transfer-only 211.5 tok/s, and full \sys{} 216.6 tok/s. Only three to four foreground plans succeed across five trials and no preemption occurs; the baseline therefore has little pathological work for transfer to remove. Full \sys{} reduces mean TTFT from 462.0 to 407.2~ms and mean E2E from 4,514.3 to 4,476.6~ms, but throughput and P90 E2E are worse. The 0.6B results show the same pattern. This validates cost-gated execution and protocol counters, not a broad performance claim.
+
+Under steady load skew, no transfers are admitted and all multi-GPU policies remain within roughly one percent throughput of each other. This is a useful control: \sys{} does not manufacture data movement when placement is already adequate, but its control/routing overhead is not free. We therefore use locality to substantiate routing, the microbenchmark to substantiate the data path, and session handoff to substantiate their composition. Memory and load skew define the current prototype's limits rather than being omitted.
+
+\section{Discussion and Limitations}
+\label{sec:limitations}
+
+\textbf{Synthetic workloads.} The phase structure makes causal attribution possible, but it is not a substitute for profiling production traces. Future evaluation should replay a published or anonymized trace and report prefix popularity, reuse distance, prompt/decode distributions, and session-affinity transitions before selecting cache policies.
+
+\textbf{Scale and models.} The study uses one host, six consumer GPUs, and two sub-2B models with identical KV geometry. Larger models change the compute-to-transfer ratio, and larger NVLink fabrics change candidate selection. Results should not be extrapolated to RDMA or PCIe-only clusters.
+
+\textbf{Control-plane availability.} Versioned snapshots, transactional transfers, heartbeats, and launcher restart protect consistency and detect failures. They do not implement replicated consensus; launcher failure stops the service and a worker failure may lose its physical cache.
+
+\textbf{Online cost estimation.} EWMA bandwidth and configured prefill cost are coarse. Memory contention can make source and target timings diverge from isolated microbenchmarks. A production implementation should learn cost by block batch, model, pair, and concurrent compute state.
+
 \section{Related Work}
 \label{sec:related}
 
-\subsection{Inference Engines}
-\label{sec:related-engines}
+\subsection{LLM Serving and Prefix Caching}
 
-vLLM~\citep{vLLM} introduces Paged Attention, SGLang~\citep{SGLang} further optimizes it with Radix Attention.
-\sys{} is based on similar block management but extends it to cross-GPU replica tracking at cluster scale.
+Orca introduced iteration-level scheduling for transformer serving~\citep{ORCA}. vLLM's PagedAttention virtualizes KV allocation into blocks~\citep{vLLM}, while SGLang's RadixAttention organizes reusable prefix state for structured programs~\citep{SGLang}. Sarathi-Serve uses chunked prefill to control prefill/decode interference~\citep{SarathiServe}; DistServe separates the two phases and optimizes goodput under TTFT and TPOT constraints~\citep{DistServe}. These systems establish the local execution and scheduling context. \sys{} instead studies admission-time placement among data-parallel replicas whose KV blocks can be copied over direct NVLink.
 
-\subsection{Cluster Schedulers}
-\label{sec:related-sched}
+\subsection{Distributed and Tiered KV Caches}
 
-ORCA~\citep{ORCA}, Dynamo~\citep{Dynamo}, and Splitwise~\citep{Splitwise} optimize batching and prefilling decoding disaggragated placement.
-\sys{} pools KVCache HBM across co-located GPUs without requiring phase disaggregation.
+Mooncake introduced a KV-cache-centric disaggregated architecture that trades distributed storage for prefill computation~\citep{Mooncake}. The newer vLLM--Mooncake Store integration pools KV across instances through GPUDirect RDMA and a distributed DRAM/SSD service. Its official agentic-trace evaluation reports 3.8$\times$ throughput, 46$\times$ lower P50 TTFT, and 8.6$\times$ lower E2E latency on 12 GB200 GPUs; a synthetic scale-out experiment maintains over 95\% cache hits at 60 GPUs~\citep{MooncakeStore}. The integration can query block hashes during scheduling, while its authors list full cache-aware routing and multi-node NVLink as future work. PegaFlow instead moves cache ownership into a long-lived Rust service and combines pinned host DRAM, one-sided RDMA reads, and local SSD. The vLLM/Novita report shows 56\% higher throughput from sharing one fixed host-cache budget across eight Qwen3-8B instances, 72\% for deduplicated TP8 MLA KV, and 194~GB/s average reads for at least 1-GiB objects on an eight-NIC RDMA cluster~\citep{PegaFlow}.
 
-\subsection{Distributed KVCache Systems}
-\label{sec:related-kv}
+MemServe provides an elastic memory pool and global prompt-tree scheduler for disaggregated serving~\citep{MemServe}. CachedAttention retains multi-turn KV in a hierarchy and overlaps loading/saving with compute~\citep{CachedAttention}. CacheGen compresses KV for faster context loading over constrained links~\citep{CacheGen}, and LMCache exposes a reusable cache layer across engines and storage/communication backends~\citep{LMCache}. These systems emphasize capacity, persistence, or cross-node visibility. \sys{} deliberately addresses a narrower scale-up domain: physically local HBM caches on data-parallel replicas connected by direct NVLink.
 
-Mooncake~\citep{Mooncake}, AttentionStore~\citep{AttentionStore}, MemServe~\citep{MemServe}, and LMCache~\citep{LMCache} tier KVCache across GPU HBM, CPU DRAM, and SSD.
-\sys{} focuses on GPU HBM pooling and NCCL block migration.
+\subsection{Migration and Multi-GPU Memory Balance}
+
+Aqua uses spare memory on NVLink/NVSwitch-connected GPUs to page inference state for preemptive, time-sliced serving under bursty memory pressure. On eight H100 GPUs, it reports up to 20$\times$ better responsiveness and 4$\times$ higher throughput for a single long prompt~\citep{Aqua}. Aqua therefore provides fluidity for active inference state, but does not route requests by content-addressed prefix ownership. Llumnix migrates requests to support dynamic rescheduling and defragmentation~\citep{Llumnix}. MELL jointly considers multi-GPU KV load and request-migration cost~\citep{MELL}. Their work confirms that movement is a costed scheduling operation, not a universally beneficial fallback. \sys{} differs in using content-addressed prefix chains, copy-style replication, and placement leases to serve future requests from both source and destination.
+
+Table~\ref{tab:related-principles} separates three concerns that are often grouped under ``distributed KV cache.'' \emph{Locality-aware} means placing a request where its prefix already exists. \emph{Fluidity-aware} means moving state when its current placement is wrong. \emph{Coupled admission} means comparing recomputation, queueing, capacity, and measured transfer cost before choosing between those actions. The comparison does not claim that \sys{} replaces durable or cross-node stores; it shows that \sys{} is the only listed design that closes all three decisions inside the serving scheduler.
+
+\begin{table*}[t]
+  \caption{Principle-oriented comparison of KV-cache systems. ``Partial'' denotes metadata lookup without a published joint locality/load routing and transfer-admission policy.}
+  \label{tab:related-principles}
+  \centering
+  \small
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{L{0.12\textwidth}L{0.15\textwidth}L{0.17\textwidth}L{0.20\textwidth}L{0.12\textwidth}L{0.17\textwidth}}
+    \toprule
+    System & Primary scope & Locality-aware request placement & Fluidity mechanism and path & Durable / multi-tier pool & Coupled route--transfer admission \\
+    \midrule
+    Mooncake Store~\citep{MooncakeStore}
+      & Cluster-wide agentic prefix reuse
+      & Partial: hash lookup informs scheduling; full cache-aware routing is future work
+      & Asynchronous GPUDirect RDMA between GPU HBM and distributed cache workers
+      & Yes: DRAM and SSD
+      & No published recompute-vs-transfer cost model \\
+    PegaFlow~\citep{PegaFlow}
+      & External, process-independent KV lifetime and sharing
+      & No: vLLM retains request scheduling; a global index locates remote hits
+      & CUDA IPC locally and one-sided RDMA across nodes; SSD for cold blocks
+      & Yes: pinned DRAM, remote DRAM, SSD
+      & No; TinyLFU governs cache admission, not route-vs-transfer choice \\
+    Aqua~\citep{Aqua}
+      & Responsive preemption under GPU-memory bursts
+      & No content-addressed prefix routing
+      & Inference-state paging to spare GPU HBM over NVLink/NVSwitch
+      & No: volatile GPU HBM
+      & Memory-pressure placement, not future prefix-reuse economics \\
+    \sys{}
+      & KV locality and fluidity across data-parallel GPU replicas
+      & Yes: longest contiguous prefix jointly scored with load and effective capacity
+      & Copy/move directly between peer HBM on configured NVLink pairs
+      & No: volatile GPU HBM
+      & Yes: route first, then admit transfer from measured cost and expected reuse \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
 
 \section{Conclusion}
 \label{sec:concl}
 
-This paper presented \sys, a dynamic KVCache-centric orchestration system for distributed LLM inference.
-The system consists of centralized control plane and distributed data plane, which pools multi-GPU HBM and schedules via prefix-topology-aware routing and temporal-topology-aware swapping.
-The prototype implements the core policies, executing the evaluation plan and closing the integration gaps are the next steps.
+\sys{} coordinates physically local KV caches using two complementary principles: route first for cache locality, then transfer only when cache fluidity is worth its cost. The implementation separates an authoritative control process from per-GPU data processes, combines versioned metadata with transactional block movement, and limits cross-device decisions to direct NVLink pairs. Experiments show substantial reuse improvements from routing and cross-model TTFT/E2E gains for session handoff, while also showing that weak memory or load skew does not justify transfer. This boundary is central to the design: a useful KV pool is not one that moves the most data, but one that avoids recomputation and moves only data with measurable future value.
 
 \section*{Acknowledgements}
-Thanks to Yijun Sun and Prof. Kai Chen for project supervising, and the Mini-vLLM authors for the base inference engine.
+Thanks to Yijun Sun and Prof. Kai Chen for project supervision, and to the Mini-vLLM authors for the base inference engine.
 
 \bibliography{example_paper}
 \bibliographystyle{mlsys2025}

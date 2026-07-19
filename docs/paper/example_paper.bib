@@ -1,76 +1,132 @@
 @inproceedings{vLLM,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Kwon, Woosuk and others},
-  booktitle={Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP)},
-  year={2023}
+  title = {Efficient Memory Management for Large Language Model Serving with {PagedAttention}},
+  author = {Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and Sheng, Ying and Zheng, Lianmin and Yu, Cody Hao and Gonzalez, Joseph E. and Zhang, Hao and Stoica, Ion},
+  booktitle = {Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP)},
+  pages = {611--626},
+  year = {2023},
+  doi = {10.1145/3600006.3613165}
 }
 
-@article{SGLang,
-  title={SGLang: Efficient Execution of Structured Language Model Programs},
-  author={Zhu, Bingyang and others},
-  journal={arXiv preprint arXiv:2312.07104},
-  year={2024}
+@inproceedings{SGLang,
+  title = {{SGLang}: Efficient Execution of Structured Language Model Programs},
+  author = {Zheng, Lianmin and Yin, Liangsheng and Xie, Zhiqiang and Sun, Chuyue and Huang, Jeff and Yu, Cody Hao and Cao, Shiyi and Kozyrakis, Christos and Stoica, Ion and Gonzalez, Joseph E. and Barrett, Clark and Sheng, Ying},
+  booktitle = {Advances in Neural Information Processing Systems 37 (NeurIPS)},
+  year = {2024},
+  doi = {10.52202/079017-2000}
 }
 
 @inproceedings{ORCA,
-  title={Orca: A Distributed Serving System for Transformer-Based Generative Models},
-  author={Yu, Gyeong-In and others},
-  booktitle={Proceedings of the 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI)},
-  year={2022}
+  title = {Orca: A Distributed Serving System for {Transformer-Based} Generative Models},
+  author = {Yu, Gyeong-In and Jeong, Joo Seong and Kim, Geon-Woo and Kim, Soojeong and Chun, Byung-Gon},
+  booktitle = {16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22)},
+  pages = {521--538},
+  year = {2022},
+  url = {https://www.usenix.org/conference/osdi22/presentation/yu}
 }
 
-@article{Splitwise,
-  title={Splitwise: Efficient Generative LLM Inference Using Phase Splitting},
-  author={Agrawal, Amey and others},
-  journal={arXiv preprint arXiv:2311.18677},
-  year={2023}
+@inproceedings{SarathiServe,
+  title = {Taming {Throughput-Latency} Tradeoff in {LLM} Inference with {Sarathi-Serve}},
+  author = {Agrawal, Amey and Kedia, Nitin and Panwar, Ashish and Mohan, Jayashree and Kwatra, Nipun and Gulavani, Bhargav and Tumanov, Alexey and Ramjee, Ramachandran},
+  booktitle = {18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24)},
+  pages = {117--134},
+  year = {2024},
+  url = {https://www.usenix.org/conference/osdi24/presentation/agrawal}
 }
 
-@inproceedings{Dynamo,
-  title={Dynamo: Dynamic Scheduling for Large-Scale Generative AI Inference},
-  author={Patel, Pratyush and others},
-  booktitle={Proceedings of the ACM SIGCOMM Conference},
-  year={2024}
+@inproceedings{DistServe,
+  title = {{DistServe}: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving},
+  author = {Zhong, Yinmin and Liu, Shengyu and Chen, Junda and Hu, Jianbo and Zhu, Yibo and Liu, Xuanzhe and Jin, Xin and Zhang, Hao},
+  booktitle = {18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24)},
+  pages = {193--210},
+  year = {2024},
+  url = {https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin}
 }
 
-@techreport{Mooncake,
-  title={Mooncake: A Multi-tiered, Distributed KV Cache for Large Language Model Serving},
-  author={Chen, Zhe and others},
-  institution={Moonshot AI},
-  year={2024}
+@inproceedings{Mooncake,
+  title = {Mooncake: Trading More Storage for Less Computation---A {KVCache-Centric} Architecture for Serving {LLM} Chatbot},
+  author = {Qin, Ruoyu and Li, Zheming and He, Weiran and Cui, Jialei and Ren, Feng and Zhang, Mingxing and Wu, Yongwei and Zheng, Weimin and Xu, Xinran},
+  booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
+  pages = {155--170},
+  year = {2025},
+  url = {https://www.usenix.org/conference/fast25/presentation/qin}
 }
 
-@inproceedings{AttentionStore,
-  title={AttentionStore: Cost-effective Multi-tiered Distributed KV Cache for Large Language Models},
-  author={Zhao, Yilong and others},
-  booktitle={Proceedings of the 20th USENIX Conference on File and Storage Technologies (FAST)},
-  year={2025}
+@misc{MooncakeStore,
+  title = {Serving Agentic Workloads at Scale with {vLLM} x {Mooncake}},
+  author = {Qiao, Yifan and Le, Trong Dao and Shen, Ao and Li, Zhewen and Wang, Bowen},
+  year = {2026},
+  month = may,
+  url = {https://vllm.ai/blog/2026-05-06-mooncake-store},
+  note = {Software available at \url{https://github.com/kvcache-ai/Mooncake}}
 }
 
-@inproceedings{MemServe,
-  title={MemServe: Context-as-a-Service with Elastic Memory Pooling for LLM Inference},
-  author={Kim, Seongbeom and others},
-  booktitle={Proceedings of the ACM Symposium on Cloud Computing (SoCC)},
-  year={2024}
+@misc{PegaFlow,
+  title = {{vLLM} x {Novita AI}: {PegaFlow} for Production-Grade External {KV} Cache},
+  author = {{Novita AI and the vLLM Team}},
+  year = {2026},
+  month = may,
+  url = {https://vllm.ai/blog/2026-05-18-pegaflow},
+  note = {Software available at \url{https://github.com/novitalabs/pegaflow}}
 }
 
-@inproceedings{LMCache,
-  title={LMCache: Semantic Caching for Cost-Effective and Fast LLM Inference},
-  author={Zhang, Ming and others},
-  booktitle={Proceedings of the International Conference on Machine Learning (ICML)},
-  year={2024}
+@inproceedings{Aqua,
+  title = {{Aqua}: Network-Accelerated Memory Offloading for {LLM}s in Scale-Up {GPU} Domains},
+  author = {Vijaya Kumar, Abhishek and Antichi, Gianni and Singh, Rachee},
+  booktitle = {Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2},
+  pages = {48--62},
+  year = {2025},
+  doi = {10.1145/3676641.3715983},
+  url = {https://arxiv.org/abs/2407.21255},
+  note = {Software available at \url{https://github.com/aquaml/aqua}}
+}
+
+@article{MemServe,
+  title = {{MemServe}: Context Caching for Disaggregated {LLM} Serving with Elastic Memory Pool},
+  author = {Hu, Cunchen and Huang, Heyang and Hu, Junhao and Xu, Jiang and Chen, Xusheng and Xie, Tao and Wang, Chenxi and Wang, Sa and Bao, Yungang and Sun, Ninghui and Shan, Yizhou},
+  journal = {arXiv preprint arXiv:2406.17565},
+  year = {2024},
+  url = {https://arxiv.org/abs/2406.17565}
+}
+
+@inproceedings{CachedAttention,
+  title = {Cost-Efficient Large Language Model Serving for Multi-turn Conversations with {CachedAttention}},
+  author = {Gao, Bin and He, Zhuomin and Sharma, Puru and Kang, Qingxuan and Jevdjic, Djordje and Deng, Junbo and Yang, Xingkun and Yu, Zhou and Zuo, Pengfei},
+  booktitle = {2024 USENIX Annual Technical Conference (USENIX ATC 24)},
+  pages = {111--126},
+  year = {2024},
+  url = {https://www.usenix.org/conference/atc24/presentation/gao-bin-cost}
 }
 
 @inproceedings{CacheGen,
-  title={CacheGen: Fast Context Loading for Language Model Applications with KV Cache Compression},
-  author={Liu, Zichang and others},
-  booktitle={Proceedings of the USENIX Annual Technical Conference (ATC)},
-  year={2024}
+  title = {{CacheGen}: {KV} Cache Compression and Streaming for Fast Large Language Model Serving},
+  author = {Liu, Yuhan and Li, Hanchen and Cheng, Yihua and Ray, Siddhant and Huang, Yuyang and Zhang, Qizheng and others},
+  booktitle = {Proceedings of the ACM SIGCOMM 2024 Conference},
+  pages = {38--56},
+  year = {2024},
+  doi = {10.1145/3651890.3672274}
 }
 
-@inproceedings{NIXL,
-  title={NIXL: Near-Instant Transfer of Compressed KV Cache for LLM Serving},
-  author={Lee, Juhyun and others},
-  booktitle={Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS)},
-  year={2025}
+@article{LMCache,
+  title = {{LMCache}: An Efficient {KV} Cache Layer for Enterprise-Scale {LLM} Inference},
+  author = {Cheng, Yihua and Liu, Yuhan and Yao, Jiayi and An, Yuwei and Chen, Xiaokun and Feng, Shaoting and Huang, Yuyang and Shen, Samuel and Du, Kuntai and Jiang, Junchen},
+  journal = {arXiv preprint arXiv:2510.09665},
+  year = {2025},
+  url = {https://arxiv.org/abs/2510.09665}
+}
+
+@inproceedings{Llumnix,
+  title = {Llumnix: Dynamic Scheduling for Large Language Model Serving},
+  author = {Sun, Biao and Huang, Ziming and Zhao, Hanyu and Xiao, Wencong and Zhang, Xinyi and Li, Yong and Lin, Wei},
+  booktitle = {18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24)},
+  pages = {173--191},
+  year = {2024},
+  url = {https://www.usenix.org/conference/osdi24/presentation/sun-biao}
+}
+
+@article{MELL,
+  title = {Mell: Memory-Efficient Large Language Model Serving via Multi-{GPU} {KV} Cache Management},
+  author = {Liu, Qianli and Hong, Zicong and Chen, Fahao and Li, Peng and Guo, Song},
+  journal = {arXiv preprint arXiv:2501.06709},
+  year = {2025},
+  url = {https://arxiv.org/abs/2501.06709}
 }

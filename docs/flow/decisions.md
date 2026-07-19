@@ -1747,3 +1747,28 @@ decision demand, decision plan, decision implementation, and decision result.
   rotary cache, and KV cache all in `torch.bfloat16`. The repository-wide suite
   passes (`181 passed, 1 skipped`); the skipped test remains the opt-in NCCL
   hardware integration case.
+
+## 2026-07-19: Make Paper and Report Evidence Directly Auditable
+
+- Decision demand: The draft omitted the public repository URL and did not call
+  the MLSys template hook that renders registered affiliations. The paper and
+  report also emphasized a relative-gain summary without enough original-unit
+  evidence, while the repository README used a light architecture image that
+  was difficult to read in a dark presentation context.
+- Decision plan: Restore publication metadata at the template-defined output
+  points, retain the compact conclusion figure, add absolute and original
+  benchmark views sourced from the archived five-trial JSON/artifacts, and
+  generate light and dark architecture variants from one synchronized source.
+- Decision implementation: The abstract now links the public GitHub repository
+  and the title block calls `printAffiliationsAndNotice` after registering the
+  HKUST affiliation. The report embeds both an absolute-metric aggregate and
+  all four original routing/session-handoff benchmark summaries. The paper adds
+  a four-panel absolute throughput/TTFT figure alongside the relative summary.
+  The result generator exports both figures from the archived JSON. The
+  architecture generator now renders a light paper image plus light and dark
+  repository assets from shared geometry and labels; both README languages
+  reference the dark asset.
+- Decision result: Author metadata, source availability, relative claims,
+  absolute values, and full benchmark panels are now independently visible.
+  The paper and README architecture diagrams remain structurally identical
+  while using backgrounds appropriate to their display contexts.

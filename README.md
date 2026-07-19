@@ -1,406 +1,180 @@
 <p align="center">
-  <img src="./assets/fig_logo_dark.png" width="40%" height="40%">
+  <img src="./assets/fig_logo_dark.png" width="40%" height="40%" alt="LMPool">
 </p>
 
 <p align="center">
-| <a href="./README.md"><b>English</b></a> 
-| <a href="./README_zh.md"><b>简体中文</b></a> |
+  <a href="./README.md"><b>English</b></a> |
+  <a href="./README_zh.md"><b>简体中文</b></a>
 </p>
 
-# LMPool: Distributed KV Cache Pooling for LLM Inference
+# LMPool: KV-Aware Routing and NVLink Transfer for Multi-GPU LLM Serving
 
-## Table of Contents
+LMPool is a research prototype built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM). It coordinates the physically local PagedAttention KV caches of multiple data-parallel LLM replicas through a dedicated control plane.
 
-1. [Overview](#1-overview)
-2. [Architecture](#2-architecture)
-3. [Runtime Model](#3-runtime-model)
-4. [Components](#4-components)
-5. [Implementation](#5-implementation)
-6. [Configuration & Running](#6-configuration--running)
-7. [Tests](#7-tests)
-8. [Benchmarks](#8-benchmarks)
-9. [Current State & Future Work](#9-current-state--future-work)
+The design follows two principles:
 
----
+1. **Routing for cache locality.** Send a request to a GPU that already holds its useful KV prefix when the saved prefill work outweighs queue and capacity pressure.
+2. **Transfer for cache fluidity.** When KV placement and request load diverge, copy or move valuable blocks over direct NVLink if the expected reuse amortizes data movement.
 
-## 1. Overview
+In short: route to avoid transfer; use fast transfer only when movement is unavoidable and profitable. LMPool is a logically coordinated KV pool, not transparent shared HBM. Each worker remains the physical owner of its blocks and KV tensor.
 
-LMPool abstracts the HBM of multiple GPUs into a logically unified global KV cache pool. Built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM)'s Paged Attention, it adds KV Cache-aware cross-GPU routing and NVLink KV transfer.
+## Architecture
 
-### 1.1 Problem
+![LMPool architecture](./assets/fig_architecture_dark.png)
 
-| Limitation | Symptom | Consequence |
-| --- | --- | --- |
-| No cross-GPU prefix reuse | Shared prefixes are stored repeatedly on different GPUs | Memory waste, lower throughput |
-| No elasticity under pressure | Local HBM exhaustion leads to OOM or CPU fallback | Latency spikes or request aborts |
-| Hot/cold imbalance | Cold blocks occupy HBM while hot blocks are displaced | Sustained latency degradation |
+For `N` GPUs, the runtime contains one user/launcher process, one independent control-plane process, and `N` identical data-plane processes, including a separate worker for rank 0.
 
-### 1.2 Solution
-
-1. `GlobalBlockManager` maintains a cross-GPU global page table.
-2. Block-level hash chains encode prefixes for reuse decisions.
-3. `GlobalScheduler` routes requests and plans rebalance.
-4. `kv_transfer` executes NCCL-based KV transfer.
-5. `LLMEngine` runs as launcher / supervisor, with a dedicated control-plane process and per-rank data-plane workers.
-
----
-
-## 2. Architecture
-
-The implementation separates orchestration from execution:
-
-- `LLMEngine`: launcher / supervisor
-- `control_plane_process`: independent global control process
-- `data_plane_process`: per-rank worker process
-
-Each worker owns a local `Scheduler`, `BlockManager`, and `ModelRunner`. The control plane owns the authoritative `GlobalScheduler` and `GlobalBlockManager` state for routing and rebalance planning.
-
-![fig_architecture.png](/assets/fig_architecture.png)
-
----
-
-## 3. Runtime Model
-
-1. `LLMEngine` receives prompts and builds `Sequence` objects.
-2. `ControlPlaneClient` computes the cumulative hash chain for every complete prefix block.
-3. The control plane asks `GlobalScheduler` to choose a target rank.
-4. `LLMEngine` forwards the `Sequence` to the chosen worker.
-5. The worker runs prefill / decode locally through `Scheduler` and `ModelRunner`.
-6. If memory pressure appears, the worker requests rebalance from the control plane.
-7. The control plane dispatches a
-   `prepare -> execute -> publish -> finalize` transfer plan; workers retain
-   the source until every destination has published valid KV.
-
----
-
-## 4. Components
-
-### 4.1 Control Plane
-
-**Files**
-
-- `src/lmpool/engine/control_plane.py`
-- `src/lmpool/engine/global_scheduler.py`
-- `src/lmpool/engine/global_block_manager.py`
-
-The control plane receives route and rebalance requests, updates the global page table, tracks worker heartbeats, and returns decisions to the launcher and workers. A control epoch rejects replies from an obsolete control process, while per-worker epochs and monotonic snapshot versions reject stale worker state. A timed-out worker is removed from routing and page-table lookup until it publishes a fresh full snapshot.
-
-### 4.2 Data Plane
-
-**Files**
-
-- `src/lmpool/engine/data_plane.py`
-- `src/lmpool/engine/scheduler.py`
-- `src/lmpool/engine/block_manager.py`
-- `src/lmpool/engine/model_runner.py`
-- `src/lmpool/engine/kv_transfer.py`
-
-Each data-plane process binds one GPU. It schedules prefill / decode locally, allocates KV blocks, runs model forward passes, and performs KV transfer when instructed by the control plane.
-
-### 4.3 Sequence
-
-**File**: `src/lmpool/engine/sequence.py`
-
-`Sequence` carries token ids, block table state, completion tokens, and global-pool metadata such as remote-prefix state.
-
-### 4.4 Global Scheduler
-
-**File**: `src/lmpool/engine/global_scheduler.py`
-
-`GlobalScheduler` is the cross-GPU decision layer. In the current architecture it runs behind the control-plane process. It exposes two main entry points:
-
-- `route_sequence_meta()` for request routing
-- `plan_rebalance()` for transfer planning
-
-Routing policy:
-
-1. compute a cumulative hash chain over complete blocks only
-2. query the global page table and measure each GPU's longest contiguous prefix from block zero
-3. prefer the GPU with the best reusable-block score after queue-pressure penalty
-4. otherwise fall back to the least-congested GPU with enough effective
-   capacity (`free + dependency-safe reclaimable cache`)
-5. reserve only the blocks not already covered by the selected GPU's contiguous prefix
-
-Ingress reservations are tracked by sequence until first prefill commits, so
-concurrent requests cannot promise the same reclaimable blocks more than once.
-
-Foreground transfer uses reason-aware exponential backoff for structural
-failures such as `no_plan`, `no_target_space`, and `stale_source`. Repeated
-requests are suppressed until capacity state has had time to change.
-
-Topology weights in the current routing policy are:
-
-| Relationship | Weight |
+| Component | Role |
 | --- | --- |
-| Same GPU | 2.0 |
-| NVLink partner | 1.0 |
+| `LLMEngine` | User API, master-side ingress, process launch/supervision, request forwarding, completion aggregation |
+| `control_plane_process` | Owns `GlobalScheduler` and `GlobalBlockManager`; handles routing, global metadata, transfer plans, leases, and heartbeat |
+| `ControlPlaneClient` | Queue-based protocol endpoint used by LLMEngine and workers to communicate with the control process |
+| `data_plane_process` | One per GPU; owns the local `Scheduler`, `BlockManager`, and `ModelRunner` |
+| `KV Transfer` | Packs complete KV blocks and performs paired NCCL send/receive on direct NVLink pairs |
 
-### 4.5 Global Block Manager
+### Request Flow
 
-**File**: `src/lmpool/engine/global_block_manager.py`
+1. LLMEngine creates a `Sequence` and sends its complete-block prefix hashes and load metadata to the control plane.
+2. `GlobalScheduler` chooses a target rank before the full sequence enters a worker queue.
+3. The selected data-plane process performs local prefill and decode.
+4. The worker publishes versioned block snapshots after state changes; the control plane replaces that rank's global metadata atomically.
+5. A real local block shortage may trigger a cost-gated foreground transfer. Predictable future reuse may trigger a background copy and placement lease.
+6. Finished sequences and per-rank metrics return to LLMEngine.
 
-`GlobalBlockManager` stores:
+## Core Mechanisms
 
-- `global_page_table`: hash to physical block locations
-- `free_blocks_per_gpu`: per-GPU free capacity
-- dependency-safe reclaimable capacity derived from the ready-block prefix DAG
-- per-sequence optimistic block reservations for routed but uncommitted requests
-- per-block access frequency and recency for LFU-first, LRU-second selection
-- `block_hash`: per-GPU block hash snapshot
-- `block_generation`: physical block reuse generation used to reject stale
-  transfer plans that refer to a recycled block id
-- `block_parent_hash`: parent links used to preserve valid prefix chains during eviction
+### KV-Aware Routing
 
-The authoritative state lives in the control plane process. Workers report
-versioned local snapshots back through block-state messages. Control restart
-requests a full snapshot from every worker before that rank becomes routable.
+`GlobalScheduler.route_sequence_meta()` matches the longest contiguous chain of complete prefix blocks. Candidates are the initial GPU and only its directly connected NVLink partners; unrelated GPUs are excluded.
 
-### 4.6 Local Scheduler
+Topology affinity is `2` for the same GPU, `1` for a direct NVLink partner, and `0` otherwise. Selection combines missing prefill work, waiting/running load, decode-weighted work, effective free capacity, and reclaim cost. A prefix owner can be bypassed when it is sufficiently overloaded and the extra recomputation cost is bounded. Route reservations prevent concurrent requests from consuming the same stale capacity estimate.
 
-**File**: `src/lmpool/engine/scheduler.py`
+### Global and Local Block State
 
-The local scheduler manages `waiting` and `running` queues and coordinates with `BlockManager`.
+The control process owns an authoritative global page table:
 
-- Prefill: schedule waiting sequences, allocate blocks, run model forward
-- Decode: append tokens and continue running sequences
-- Memory pressure: request rebalance from the control plane
-
-### 4.7 Local Block Manager
-
-**File**: `src/lmpool/engine/block_manager.py`
-
-Each worker owns one `BlockManager` for its local KV cache blocks.
-
-Main responsibilities:
-
-- compute chained block hashes
-- allocate blocks and reclaim cold cached blocks with leaf-constrained LFU/LRU
-- append decode tokens
-- maintain local prefix cache state
-
-Complete hashed blocks remain cached after their active reference count reaches
-zero. Partial blocks are released immediately; complete cached blocks remain
-globally discoverable and evictable until capacity pressure reclaims them.
-Eviction only removes prefix-chain leaves, so a retained descendant never loses
-an ancestor required for contiguous reuse. Access frequency orders eligible
-leaves first and recency breaks ties.
-
-### 4.8 Model Runner
-
-**File**: `src/lmpool/engine/model_runner.py`
-
-`ModelRunner` holds model weights, CUDA graph captures, KV cache tensors, and the sampler. It is the execution point for forward inference and KV migration hooks.
-
-### 4.9 KV Transfer
-
-**File**: `src/lmpool/engine/kv_transfer.py`
-
-Implements block migration with NCCL `send` / `recv`. Blocks remain the placement
-unit, while every layer and all K/V blocks in one plan are packed into one
-contiguous P2P payload and sent with one blocking P2P operation.
-
-Transfer uses an idempotent four-stage protocol. `prepare` validates the
-source hash and physical-block generation, locks the source against local
-reclamation, and reserves target blocks. `execute` copies KV into target blocks
-that remain hidden from local/global prefix lookup. `publish` exposes every
-valid target while all sources remain locked. Only after all publish ACKs does
-`finalize` release source blocks for move-style plans and report the new page
-table; `abort` unlocks the source and drops hidden reservations. These locks
-cover transfer state transitions only and are not acquired by model forward or
-decode. A control-process epoch change aborts unfinished local plans before the
-worker publishes its recovery snapshot.
-
-### 4.10 Sequence
-
-**File**: `src/lmpool/engine/sequence.py`
-
-`Sequence` carries:
-
-- `is_remote_prefix`
-- `remote_gpu_id`
-- `pending_swap_in` legacy field name for pending transfer-in blocks
-
-These fields survive cross-process transfer through `multiprocessing.Queue`.
-
----
-
-## 5. [Implementation](./src/lmpool/)
-
----
-
-## 6. Configuration & Running
-
-### 6.1 Key Configuration Items
-
-| Item | Type | Description |
-| --- | --- | --- |
-| `world_size` | `int` | Number of worker GPUs participating in the pool |
-| `enable_global_pool` | `bool` | Enable global KV cache pooling |
-| `use_control_plane_process` | `bool` | Start an independent control process |
-| `gpu_memory_utilization` | `float` | Fraction of GPU memory usable |
-| `heartbeat_interval` | `float` | Heartbeat period between control and data planes |
-| `heartbeat_timeout` | `float` | Liveness timeout for control / worker detection |
-| `nvlink_topo.pairs` | `List[Tuple[int, int]]` | Optional NVLink direct-connect GPU pairs; if omitted, the code best-effort parses `nvidia-smi topo -m` |
-| `route_prefix_hit_weight` | `float` | Positive weight for reusable prefix blocks in global routing |
-| `route_queue_pressure_weight` | `float` | Penalty weight for worker waiting/running queue pressure |
-| `route_free_block_weight` | `float` | Small tie-breaker bonus for free KV blocks |
-| `route_load_bypass_threshold` | `float` | Minimum token-equivalent cost advantage required to bypass a prefix owner |
-| `route_prefill_cost_weight` | `float` | Cost per missing prefix token in the completion-cost model |
-| `route_reclaim_cost_weight` | `float` | Additional cost for admitting through locally reclaimable KV capacity |
-| `foreground_transfer_cost_weight` | `float` | Multiplier on the time-domain transfer cost |
-| `foreground_transfer_min_benefit_ratio` | `float` | Minimum predicted saved-prefill-ms / transfer-ms ratio |
-| `foreground_transfer_bandwidth_gib_s` | `float` | Measured effective bandwidth used by transfer admission |
-| `foreground_transfer_fixed_latency_ms` | `float` | Fixed protocol and coordination cost per plan |
-| `foreground_transfer_interference_multiplier` | `float` | Packing, unpacking, and inference interference multiplier |
-| `foreground_prefill_token_time_ms` | `float` | Estimated recomputation time per uncached prompt token |
-| `foreground_future_reuse_discount` | `float` | Discount from historical leaf-prefix accesses to future reuse |
-| `foreground_transfer_ewma_alpha` | `float` | EWMA weight for observed source-side transfer overhead |
-| `enable_kv_transfer_prewarm` | `bool` | Initialize configured NVLink P2P communicators before worker readiness |
-| `route_cache_queue_slack` | `float` | Maximum completion-cost slack for using a cached prefix route |
-
-### 6.2 Running
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync
-
-# Dual-GPU example
-CUDA_VISIBLE_DEVICES=0,2 uv run python main.py
-
-# Single-GPU example
-CUDA_VISIBLE_DEVICES=0 uv run python main.py
+```text
+prefix hash -> [(gpu, physical block, generation, readiness), ...]
 ```
 
----
+It also tracks per-GPU free/reclaimable capacity, parent dependencies, recency/frequency, in-flight blocks, worker epochs, and snapshot versions. Workers do not share this Python object. Each local `BlockManager` remains authoritative for allocation, reference counts, block readiness, and the physical KV tensor, then reports a versioned snapshot to the control process.
 
-## 7. [Tests](./tests/)
+Cached complete blocks are reclaimed with dependency-safe LFU-first/LRU-second ordering. Live blocks are not move-eviction victims. They may be copied when replication has sufficient expected value.
 
----
+### NVLink KV Transfer
 
-## 8. [Benchmarks](./benchmarks/)
+Foreground transfer requests only the actual shortage, not an entire sequence. Background placement batches hot prefix chains for predicted reuse. Both are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.
 
-The `benchmarks/` directory exposes three paper-oriented executable entries:
+Each plan follows an idempotent transaction:
 
-- `benchmark_kv_routing.py`: locality/routing-only ablation
-- `benchmark_kv_transfer.py`: isolated NCCL/NVLink KV data path
-- `benchmark_e2e.py`: five-configuration session-handoff comparison
+```text
+prepare -> execute -> publish -> finalize
+                    \-> abort on failure
+```
 
-Use the reproducible command matrix in
-[`benchmarks/PAPER_RUNBOOK.md`](./benchmarks/PAPER_RUNBOOK.md) for paper runs.
-The accompanying `benchmarks/run_paper_suite.sh` runs every experiment with
-both Qwen3-0.6B and Qwen3-1.7B, resolving model structure and dtype from each
-local snapshot and preserving raw trials plus 95% confidence intervals.
+`prepare` reserves concrete destination blocks. `execute` sends one packed all-layer K/V payload per direction. `publish` makes received blocks visible. `finalize` releases source blocks only for move semantics; copy semantics retain both replicas. Hash and physical-block generation checks reject stale plans.
 
-The end-to-end script reports the following scenarios:
+### Consistency and Liveness
 
-- `single-gpu`
-- `multi-gpu`
-- `multi-gpu-kv-routing`
-- `multi-gpu-kv-transfer`
-- `multi-gpu-lmpool`
+- The control plane serializes authoritative state changes in one event loop.
+- Per-client receive locks prevent multiple callers from consuming each other's queue responses.
+- Worker epoch and monotonic snapshot versions reject stale state.
+- Transfer plan IDs and phases are idempotent; reservations and in-flight markers prevent concurrent reuse/reclamation.
+- Bidirectional heartbeat detects worker/control failure. LLMEngine can restart the control process and request full worker snapshots.
 
-Reported metrics:
+This is failure detection and metadata recovery, not replicated high availability. Launcher failure still stops the service, and a failed worker can lose its physical cache.
 
-- throughput in generated tokens/s
-- goodput in generated tokens/s under `--goodput-e2e-sla-ms`
-- mean / p95 TTFT
-- mean / p95 TTPT
-- mean / p95 end-to-end latency
-- GPU utilization mean / p95
-- GPU memory utilization mean / p95
-- data-plane request-hit rate and token-reuse ratio
-- control-plane request-hit / owner-selection / matched-block ratios
-- transfer / copy count and rebalance success / failure counts
+## Repository Layout
 
-The current `multi-gpu` baseline uses online round-robin dispatch. Control-plane scenarios should use a bounded `--submit-window` such as `4` or `8` when measuring prefix reuse, because routing can only hit prefixes that previous requests have already prefetched and reported to the global page table.
-The benchmark records TTFT from explicit first-token events emitted by data-plane workers. Local prefix hit is measured only on each request's initial prefill, excluding retry hits after preemption. Cached-token ratio, prefill attempts, preemptions, and redundant prefill tokens are reported separately. Route hit and prefix-owner hit are reported separately for control-plane scenarios.
-All five scenarios use the same requested per-rank KV capacity through
-`--kv-block-budget`. The prefix diagnostics table also reports each rank's
-actual runtime block capacity, workload theoretical hit upper bound, matched
-route-block ratio, and stale-route rate.
-For `memory-skew`, deterministic warm-up, pressure, and reuse phases also
-report blocks sent, retained at the source, released at the source, chain
-transfer plans, hot-prefix transfer ratio, and reuse-phase request/token hits. This distinguishes an
-attempted foreground transfer from one that actually relieves capacity and
-preserves reusable KV. It also reports actual bytes, source-side transfer time,
-effective GiB/s, predicted transfer cost, and predicted saved prefill time.
-For an isolated transfer result, `session-handoff` builds prefixes only on the
-source side and then continues the same sessions across the NVLink pair.
-`--handoff-prefix-groups` controls how many independent sessions cross the pair.
-`--handoff-warmup-prompts` controls the cache-building phase length; setting it
-to the prefix-group count leaves the remaining requests for repeated reuse,
-instead of allowing a 50/50 warm-up phase to dilute the measured benefit.
-Workers report per-block access frequency and recency to the control plane.
-The control plane derives maximal hot prefix chains from these snapshots and
-keeps a persistent candidate queue per NVLink pair. Ingress supplies counts of
-not-yet-submitted prefix demand at a workload phase boundary; candidates are
-coalesced by directed NVLink pair into bounded batches and dispatched only
-while both ranks have low queue pressure. One batch uses one
-prepare/execute/publish/finalize transaction and one contiguous KV payload. The phase waits for accepted
-placement plans, and that wait remains
-inside serving elapsed time. This makes background transfer proactive rather
-than waiting for a reuse request to trigger a late copy.
-Rejected placement decisions are memoized by prefix, pair, effective reuse
-demand, and target capacity, so unchanged block-state reports do not repeatedly
-run the same admission calculation. Benchmark JSON separates prompt, cached,
-and actually executed uncached prefill tokens, placement wait time, and
-per-NVLink-pair candidate lifecycle counters. Completed plans also feed their
-dispatch-to-commit latency into the pair-specific transfer cost model.
-Workers additionally feed completed uncached-prefill time into a per-rank EWMA,
-so placement admission compares observed recomputation cost against the same
-all-layer transport protocol used during startup calibration. A completed
-replica creates a forecast-bound placement lease. The lease assigns half of
-the forecast reuse demand to each valid copy; odd remainders alternate between
-source and replica across adjacent prefixes. Matching requests consume these
-explicit quotas. This preserves prefix reuse while allowing both GPUs in each
-NVLink pair to execute the reuse phase instead of serializing it on either side.
-Admission counts only the first avoidable target cold miss when no eviction is
-predicted, rather than multiplying the same saving by every future reuse.
-Each configured NVLink pair uses a dedicated NCCL process group, and a prepared
-plan skips block-ID negotiation. Data-plane workers wait on ingress and control
-queue connections together, preventing an idle ingress wait from delaying a
-transfer command. The first dispatch-to-commit sample is blended with the
-calibrated prior instead of replacing it with cold-start jitter.
-Foreground transfer ranks complete prefix chains by reuse value per missing
-target block, with recency as a tie-breaker. Admission uses a conservative
-wall-clock model and does not sum one request's access count across every block
-in its chain; the target inherits source frequency metadata after transfer.
-For topology-blind and transfer-only memory-skew scenarios, reuse requests are
-placed on the opposite side of each NVLink pair. Serving timing begins after
-worker readiness and representative-payload P2P prewarm. Completed source
-transfers feed measured excess latency back into a per-pair conservative EWMA,
-and each pair admits at most one foreground plan at a time. A completed transfer
-adds or moves page-table locations, so later routing may select the new prefix
-owner; routing still applies its load cost and is not forced to follow it.
-Routing load reservations include expected decode work. When one prefix owner
-is materially busier than its NVLink partner, routing may spill directly and
-let that request seed the partner. Proactive replicas are planned separately
-from completed access observations and queued ingress demand, so routing never
-keeps the current request on an overloaded owner in anticipation of an
-unfinished copy.
-The `locality` workload uses 16 distinct long shared-prefix groups by default,
-with a deterministic shuffled request order. Override this with
-`--locality-prefix-groups`; multiple groups prevent round-robin from matching
-routing simply by replicating one hot prefix onto every GPU.
-By default it ignores EOS so every request performs the configured decode work.
-Use `--seed` for reproducibility and `--repetitions 3` or more to report
-mean/standard-deviation results for paper experiments.
+```text
+src/lmpool/engine/
+  llm_engine.py             launcher, ingress, supervision
+  control_plane.py          protocol, client, control-process event loop
+  global_scheduler.py       route and transfer-plan decisions
+  global_block_manager.py   global page table and block snapshots
+  data_plane.py             per-GPU worker and transfer-phase executor
+  scheduler.py              local prefill/decode scheduling
+  block_manager.py          local allocation and prefix cache
+  model_runner.py           model/KV execution and metrics
+  kv_transfer.py            packed NCCL transfer primitives
+  sequence.py               request and block-table state
 
-See `benchmarks/README.md` for usage.
+benchmarks/                 publishable microbenchmarks and E2E workloads
+tests/                      module, protocol, benchmark, and integration tests
+docs/paper/                 paper source and bibliography
+```
 
----
+Legacy internal functions named `swap_out`/`swap_in` remain in `kv_transfer.py`; public documentation uses **transfer** because the operation can be either a copy or a move and does not imply a CPU swap tier.
 
-## 9. Current State & Future Work
+## Installation and Basic Run
 
-| Feature | State | Notes |
-| --- | --- | --- |
-| Multi-GPU async inference | Done | Multiple ranks independently schedule, execute, and sample |
-| Control-plane routing | Done | `route_sequence_meta` is implemented |
-| NVLink-aware eviction decision | Done | `select_eviction_candidates` is implemented |
-| Benchmarks | Done | Shared-prefix benchmark with baseline comparisons |
-| Tests | Done | Module-level unit tests and NCCL integration test |
+Python 3.11 and CUDA-capable PyTorch are required.
 
-Future work:
+```bash
+uv sync --group dev
+```
 
-1. Expand benchmarks to longer traces and broader workloads.
-2. Countinue to update README and comments
+Set `world_size`, the model path, and logical NVLink pairs in `main.py` to match visible GPUs, then run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache uv run python main.py
+```
+
+GPU IDs inside `nvlink_topo.pairs` are logical IDs after `CUDA_VISIBLE_DEVICES` remapping. If topology is omitted, LMPool attempts to parse `nvidia-smi topo -m` and retains only `NV#` links. Verify the physical topology before every experiment; do not infer a pair from socket or NUMA placement.
+
+## Evaluation
+
+Three complete benchmark entry points are retained:
+
+| Entry | Claim |
+| --- | --- |
+| `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload latency, bandwidth, and data equality |
+| `benchmarks/benchmark_kv_routing.py` | Routing-only locality and prefill-reuse benefit |
+| `benchmarks/benchmark_e2e.py` | Five-way system comparison under load-skew, memory-skew, and session-handoff workloads |
+
+The exact dual-model paper matrix, fixed variables, offline model paths, acceptance criteria, and commands are in [benchmarks/PAPER_RUNBOOK.md](./benchmarks/PAPER_RUNBOOK.md). Metric and workload definitions are in [benchmarks/README.md](./benchmarks/README.md).
+
+### Current Paper Batch
+
+Artifacts: [`benchmarks/results/paper/20260719T072508Z`](./benchmarks/results/paper/20260719T072508Z)
+
+The batch uses five repetitions, six RTX 3090 GPUs arranged as three NV4 pairs, BF16 Qwen3-0.6B/Qwen3-1.7B, 256-token KV blocks, and equal per-worker block budgets.
+
+- **Transfer microbenchmark:** four-block batches sustain 19.0-23.2 GiB/s; eight-block batches sustain 26.1-30.1 GiB/s. Every payload validation passes.
+- **Routing workload:** routing raises cached prompt-token ratio from about 44% to 72% and reduces uncached prefill tokens by about 50% for both models. Throughput improves by 2.2-2.7%, while mean TTFT falls by 10.6-20.2%.
+- **Session handoff:** full LMPool improves throughput by 4.2%/7.1%, lowers mean TTFT by 33.2%/42.6%, and lowers mean E2E latency by 9.9%/13.7% for Qwen3-0.6B/Qwen3-1.7B relative to round-robin multi-GPU.
+- **Boundary results:** steady load skew admits no transfer and stays near the multi-GPU baseline. The current memory-skew trace triggers few foreground plans and does not improve throughput; it is a negative/boundary result, not evidence of universal transfer benefit.
+
+The paper reports all four observations. Session handoff is the main end-to-end transfer result; memory/load skew are not silently omitted.
+
+## Tests
+
+The test tree mirrors engine and benchmark modules. It covers allocation/reclamation, chained hashes, route hit/miss/capacity cases, load bypass, direct-pair filtering, page-table epochs/snapshots, reservations, transactional transfer phases, queue concurrency, process lifecycle, model/KV dtype, benchmark schemas/plots, and end-to-end completion.
+
+CPU and simulated tests:
+
+```bash
+CUDA_VISIBLE_DEVICES="" UV_CACHE_DIR=/tmp/uvcache uv run pytest -q
+```
+
+Two-rank NCCL data-equality/deadlock test on one physical NVLink pair:
+
+```bash
+RUN_NCCL_INTEGRATION=1 CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
+  uv run pytest -q tests/test_kv_transfer.py -s
+```
+
+See [tests/README.md](./tests/README.md) for the test-to-module map and hardware gates.
+
+## Scope and Limitations
+
+- Current transfer decisions use direct same-node NVLink pairs only; no PCIe/NUMA fallback is scored.
+- The global page table coordinates metadata; it does not provide transparent remote block addressing.
+- The paper workloads are deterministic synthetic traces, not production datasets.
+- The current evidence supports routing and session handoff. It does not show that transfer improves every memory- or request-skew workload.
+- The prototype has heartbeat and control-process restart but no replicated controller or launcher HA.
+- Cross-node RDMA, CPU/SSD cache tiers, persistent KV cache, and heterogeneous model replicas are out of scope.
+
+## Paper
+
+The [paper directory](./docs/paper/README.md) contains the source, verified bibliography, reproducible architecture figure, and build instructions. [example_paper.tex](./docs/paper/example_paper.tex) covers the motivation, detailed design, dataset/workload profiling, test methodology, evaluation, limitations, and related work synchronized with the current code and the paper artifact batch.
