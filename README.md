@@ -1,3 +1,5 @@
+![fig_architecture.png](/assets/fig_logo_dark.png)
+
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
 [English](./README.md) | [简体中文](./README_zh.md)
