@@ -2,9 +2,12 @@
   <img src="./assets/fig_logo_dark.png" width="35%" height="35%">
 </p>
 
-# LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
+<p align="center">
+| <a href="./README.md"><b>English</b></a> 
+| <a href="./README_zh.md"><b>简体中文</b></a> |
+</p>
 
-[English](./README.md) | [简体中文](./README_zh.md)
+# LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
 
 ---
 
