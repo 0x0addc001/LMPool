@@ -122,7 +122,8 @@ df -h /home/jialiangli/.cache/huggingface/hub
 这是论文结果的推荐模式。先执行第 2 节，再执行下面这一整块。统一运行器会依次对 0.6B 和
 1.7B 执行三个物理 NVLink pair 的 transfer sweep、routing、memory-skew、session-handoff
 和补充 load-skew。它会读取每个模型的 KV geometry/dtype，取三个 pair 的 4-block 实测
-带宽中位数，并自动写入该模型的 E2E transfer 成本参数：
+带宽中位数作为保守的小批初值，并自动写入该模型的 E2E transfer 成本参数；这不表示线上
+plan 固定为 4 blocks，完成的 transfer 会继续更新运行时 EWMA：
 
 首次正式采集前先完成第 5 节测试；测试不需要在每个 trial 前重复执行。
 
@@ -161,7 +162,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_SET}"
 export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 export OUT="benchmarks/results/paper/${RUN_ID}/${MODEL_LABEL}"
 export REPETITIONS=5
-# 第 6 节跑完 transfer microbenchmark 后，用 4-block 实测值替换此处。
+# 第 6 节跑完 transfer microbenchmark 后，用最接近实际 plan 大小的实测值替换此处。
 export TRANSFER_BANDWIDTH_GIB_S=22.95
 mkdir -p "${OUT}"/{environment,kv_transfer,routing,memory_skew,session_handoff,load_skew}
 
@@ -218,8 +219,15 @@ CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
 ```
 
 所有 payload 的 `data_validation` 必须为 `passed`。E2E cost model 应采用与线上常见
-transfer block 数最接近的一档有效带宽，不使用 NVLink 标称带宽。
-手工运行时，从 JSON 中读取 4-block 的 `effective_bandwidth_gib_s`，然后更新：
+transfer plan block 数最接近的一档有效带宽，不使用 NVLink 标称带宽。线上 batch 并非
+固定为 4：foreground plan 等于实际 block shortage；background 每条候选链默认最多 8
+blocks，并可对同一有向 pair 的多条候选去重合并到默认 128 blocks。当前自动 runner 使用
+4-block 中位数作为保守的小批初值，运行时完成的 transfer 还会更新 EWMA；若正式 workload
+稳定产生更大的 plan，应把 sweep 扩展到 16/32/64 blocks，并使用最接近 plan-size 分布的
+档位或拟合 `fixed_latency + bytes / bandwidth`。
+
+手工运行时，若线上 plan 主要落在 4 blocks 附近，从 JSON 中读取 4-block 的
+`effective_bandwidth_gib_s`，然后更新：
 
 ```bash
 export TRANSFER_BANDWIDTH_GIB_S=22.95  # 示例；替换为本次实测值

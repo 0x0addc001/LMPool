@@ -11,9 +11,13 @@ benchmarks/results/paper/20260719T072508Z/
 - `example_paper.tex`: paper body, system design, implementation, evaluation, and limitations.
 - `example_paper.bib`: verified bibliography used by the paper.
 - `figures/fig_architecture.png`: architecture figure included by LaTeX.
+- `figures/fig_routing_decision.png`: KV-aware routing branches and outcomes.
+- `figures/fig_hot_prefix_decision.png`: hot-prefix candidate and placement gates.
+- `figures/fig_transfer_decision.png`: transfer admission, transaction, and rollback path.
 - `figures/fig_results_summary.png`: color summary of routing, transfer, and session-handoff results.
 - `figures/fig_absolute_metrics.png`: absolute throughput and TTFT aggregates in original units.
 - `figures/generate_architecture.py`: reproducible source for the light paper figure and dark root README figure.
+- `figures/generate_decision_flow.py`: synchronized light paper/report and dark README decision-flow figures.
 - `mlsys2025.sty` / `mlsys2025.bst`: retained paper template files.
 
 ## Build
@@ -23,6 +27,13 @@ Regenerate the architecture figure after changing its source:
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib UV_CACHE_DIR=/tmp/uvcache \
   uv run python docs/paper/figures/generate_architecture.py
+```
+
+Regenerate the synchronized decision-flow figures:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib UV_CACHE_DIR=/tmp/uvcache \
+  uv run python docs/paper/figures/generate_decision_flow.py
 ```
 
 Regenerate the color results figure directly from the archived paper JSON:

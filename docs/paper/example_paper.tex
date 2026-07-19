@@ -122,6 +122,29 @@ Direct NVLink is faster than host-mediated storage paths on the evaluated node, 
   \label{fig:arch}
 \end{figure*}
 
+Figures~\ref{fig:routing-decision}--\ref{fig:transfer-decision} separate three operations that are easy to conflate: routing chooses where a request executes, hot-prefix prediction only proposes a possible replica, and transfer admission decides whether a valid proposal is worth executing. Diamonds expose the actual rejection, deferral, spill, and rollback branches. A hotness threshold never bypasses the capacity, cooldown, pair-idleness, or measured-cost gates.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.9\textwidth]{fig_routing_decision.png}
+  \caption{KV-aware routing. The master filters infeasible GPUs, prices contiguous-prefix reuse and projected load, and either keeps the prefix owner, performs a bounded load-aware spill, or selects the least-cost feasible rank.}
+  \label{fig:routing-decision}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.9\textwidth]{fig_hot_prefix_decision.png}
+  \caption{Hot-prefix prediction and background-placement admission. Observations and ingress forecasts create candidates, but replica need, load/placement conditions, cooldown, pair idleness, capacity, and measured benefit remain mandatory gates.}
+  \label{fig:hot-prefix-decision}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.9\textwidth]{fig_transfer_decision.png}
+  \caption{Shared transfer admission and execution path. Foreground shortage and admitted background placement use the same source-validity and benefit checks, transactional preparation, packed pair-local NCCL payload, publication, and abort path.}
+  \label{fig:transfer-decision}
+\end{figure*}
+
 \subsection{Process and Ownership Model}
 
 LLMEngine is the user-facing process. It creates one independent control-plane process and $N$ identical data-plane processes, including a worker for rank~0. New sequences enter LLMEngine, which sends sequence metadata and prefix hashes through a ControlPlaneClient. The control plane chooses a rank before LLMEngine enqueues the full sequence to that worker. Workers do not normally rerun global routing.
@@ -184,7 +207,9 @@ Here $B$ is payload bytes, $\widehat{BW}$ is an EWMA initialized from the transf
 \subsection{Background Placement}
 \label{sec:bg-transfer}
 
-Background placement handles predictable future reuse rather than an immediate allocation failure. The control plane tracks complete-chain frequency and can copy a hot chain to an idle NVLink partner. It batches compatible candidates, caps blocks per plan, and creates a placement lease only after publication. Later matching requests are striped between source and replica, coupling speculative placement to routing rather than merely duplicating data. A hotness threshold, load-skew threshold, expected-reuse estimate, pair cooldown, and idle-pressure guard reject low-value work.
+Background placement handles predictable future reuse rather than an immediate allocation failure. Workers report cumulative access counts and parent hashes for ready blocks; the control plane selects maximal chains by their deepest hot leaf and restores all resident ancestors in prefix order. Route-hit counts provide an online trigger. When ingress knows queued but not-yet-submitted requests, it may additionally provide a hash-to-demand forecast; the session-handoff benchmark uses this explicit signal. Predicted reuse is capped future demand when available, otherwise the minimum chain access count minus its already-observed use, discounted conservatively. This signal only creates a candidate. The destination must still lack the replica, the directed pair must clear cooldown and idle-pressure checks, and the target must have space.
+
+Compatible candidates are deduplicated and batched by directed NVLink pair. The current defaults cap one candidate chain at eight blocks and the coalesced pair payload at 128 blocks; these are upper bounds rather than a fixed transfer size. Admission counts at most the first avoidable cold prefill at the destination, because without an intervening eviction that GPU would self-warm after its first miss; it does not multiply benefit by every forecast request. A placement lease is created only after publication. Its explicit source and replica quotas stripe later matching requests across both GPUs, coupling speculative placement to routing rather than merely duplicating data.
 
 The session-handoff workload exercises this path: a warmup phase creates one copy of each long prefix, then a reuse phase shifts sessions to the partner. The locality and load-skew workloads can deliberately disable background placement to isolate routing and steady-state overhead.
 
@@ -194,7 +219,7 @@ A plan uses four externally visible phases:
 
 \textbf{Prepare.} The destination reserves concrete free block IDs; both workers record plan state. No new location is visible to routing.
 
-\textbf{Execute.} Source and destination issue matching NCCL point-to-point operations. All selected layers, K/V tensors, and blocks are packed into a contiguous payload per direction to amortize communicator and launch overhead. Pair communicators are prewarmed.
+\textbf{Execute.} Source and destination issue matching NCCL point-to-point operations. The source gathers physical blocks with index selection into one contiguous tensor of shape $[L,2,B,S,H_{kv},D]$: layers, K/V, transferred blocks, block tokens, KV heads, and head dimension. It sends that tensor once on a prewarmed pair-specific process group; the destination receives an equal-shaped buffer and scatters it into reserved physical blocks with indexed copies. Hashes, generations, and destination block IDs remain control-protocol metadata rather than part of the NCCL tensor payload.
 
 \textbf{Publish.} The destination marks received blocks ready and publishes a versioned snapshot. Only then may the control plane expose the new page-table location or lease.
 
@@ -341,7 +366,7 @@ Table~\ref{tab:routing} compares routing-only with round-robin. Across both mode
 
 The microbenchmark moves every layer's K and V tensors between two ranks and validates the destination byte-for-byte. Four blocks contain 0.109~GiB and achieve 19.0--23.2~GiB/s across all model/pair runs, with 4.71--5.76~ms mean latency. Eight blocks contain 0.219~GiB and achieve 26.1--30.1~GiB/s with 7.26--8.39~ms mean latency. Larger batches better amortize fixed NCCL and kernel overhead. Because the two Qwen3 models have identical KV geometry, their payload sizes are identical; running both checks model-resolution and dtype paths rather than creating a different transfer size.
 
-These values calibrate the online cost model. They establish data-path correctness and attainable batch bandwidth, but do not by themselves imply an end-to-end gain: useful future reuse must exceed this latency plus runtime interference.
+These values calibrate the online cost model. Four blocks are a conservative small-batch initialization point, not the runtime transfer size: foreground plans follow the actual shortage and background plans can coalesce many chains on one directed pair. A production calibration should measure the observed plan-size distribution and use a nearest-size table or a piecewise fit; the runtime EWMA partially corrects the initial estimate after completed transfers. The microbenchmark establishes data-path correctness and attainable batch bandwidth, but does not by itself imply an end-to-end gain: useful future reuse must exceed this latency plus runtime interference.
 
 \subsection{Q3: Session Handoff Benefits from Both Principles}
 

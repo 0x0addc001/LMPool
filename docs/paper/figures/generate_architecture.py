@@ -31,6 +31,7 @@ LIGHT = {
     "purple_arrow": "#6b4c8a",
     "orange": "#ee7733",
     "red": "#cc6677",
+    "arrow": "#4f5b66",
 }
 
 DARK = {
@@ -53,6 +54,7 @@ DARK = {
     "purple_arrow": "#bc8cff",
     "orange": "#ffa657",
     "red": "#ff7b72",
+    "arrow": "#b1bac4",
 }
 
 
@@ -93,6 +95,57 @@ def box(
     return patch
 
 
+def annotated_box(
+    ax,
+    x,
+    y,
+    width,
+    height,
+    title,
+    subtitle,
+    *,
+    face,
+    edge,
+    text_color,
+    muted_color,
+    title_size=13,
+    subtitle_size=9.5,
+):
+    patch = box(
+        ax,
+        x,
+        y,
+        width,
+        height,
+        "",
+        face=face,
+        edge=edge,
+        text_color=text_color,
+    )
+    center_x = x + width / 2
+    center_y = y + height / 2
+    ax.text(
+        center_x,
+        center_y + 0.017,
+        title,
+        ha="center",
+        va="center",
+        fontsize=title_size,
+        fontweight="bold",
+        color=text_color,
+    )
+    ax.text(
+        center_x,
+        center_y - 0.024,
+        subtitle,
+        ha="center",
+        va="center",
+        fontsize=subtitle_size,
+        color=muted_color,
+    )
+    return patch
+
+
 def arrow(
     ax,
     start,
@@ -121,7 +174,7 @@ def arrow(
             text,
             ha="center",
             va="center",
-            fontsize=10.5,
+            fontsize=9.2,
             color=color,
             bbox={"facecolor": label_face, "edgecolor": "none", "pad": 1.5},
         )
@@ -175,30 +228,33 @@ def worker(ax, x, rank, palette):
         text_color=palette["text"],
         size=10.5,
     )
-    box(
+    annotated_box(
         ax,
         x + 0.018,
         0.185,
         0.209,
         0.065,
-        "Model Runner + physical KV blocks",
+        "Model Runner",
+        "Physical KV blocks",
         face=palette["runner_face"],
         edge=palette["orange"],
         text_color=palette["text"],
-        size=10.5,
+        muted_color=palette["muted"],
+        title_size=10.2,
+        subtitle_size=8.2,
     )
     arrow(
         ax,
         (x + 0.113, 0.32),
         (x + 0.132, 0.32),
-        color=palette["muted"],
+        color=palette["arrow"],
         label_face=palette["background"],
     )
     arrow(
         ax,
         (x + 0.065, 0.285),
         (x + 0.065, 0.25),
-        color=palette["muted"],
+        color=palette["arrow"],
         label_face=palette["background"],
     )
     return x + width / 2
@@ -212,18 +268,20 @@ def render(output: Path, palette: dict[str, str]) -> None:
     ax.set_ylim(0, 1)
     ax.axis("off")
 
-    box(
+    annotated_box(
         ax,
         0.04,
         0.89,
         0.92,
         0.075,
-        "LLMEngine: API, ingress routing, process launcher/supervisor, result aggregation",
+        "LLMEngine",
+        "API, ingress routing, process launcher/supervisor, and result aggregation",
         face=palette["top_face"],
         edge=palette["top_edge"],
         text_color=palette["text"],
-        size=15,
-        weight="bold",
+        muted_color=palette["muted"],
+        title_size=15,
+        subtitle_size=9.8,
     )
 
     box(
@@ -247,35 +305,41 @@ def render(output: Path, palette: dict[str, str]) -> None:
         fontweight="bold",
         color=palette["control_title"],
     )
-    box(
+    annotated_box(
         ax,
         0.13,
         0.64,
         0.27,
         0.105,
-        "Global Scheduler\nroute + transfer cost decisions",
+        "Global Scheduler",
+        "Route and transfer-cost decisions",
         face=palette["scheduler_face"],
         edge=palette["blue"],
         text_color=palette["text"],
-        size=12.5,
+        muted_color=palette["muted"],
+        title_size=12.5,
+        subtitle_size=9.3,
     )
-    box(
+    annotated_box(
         ax,
         0.60,
         0.64,
         0.27,
         0.105,
-        "Global Block Manager\npage table + capacity snapshots",
+        "Global Block Manager",
+        "Page table and capacity snapshots",
         face=palette["block_face"],
         edge=palette["purple"],
         text_color=palette["text"],
-        size=12.5,
+        muted_color=palette["muted"],
+        title_size=12.5,
+        subtitle_size=9.3,
     )
     arrow(
         ax,
         (0.40, 0.692),
         (0.60, 0.692),
-        color=palette["purple_arrow"],
+        color=palette["arrow"],
         label_face=palette["control_face"],
         text="authoritative metadata lookup",
         text_offset=(0, 0.026),
@@ -285,7 +349,7 @@ def render(output: Path, palette: dict[str, str]) -> None:
         ax,
         (0.28, 0.89),
         (0.28, 0.82),
-        color=palette["blue"],
+        color=palette["arrow"],
         label_face=palette["background"],
         text="route metadata",
         text_offset=(-0.07, 0),
@@ -294,7 +358,7 @@ def render(output: Path, palette: dict[str, str]) -> None:
         ax,
         (0.72, 0.82),
         (0.72, 0.89),
-        color=palette["green"],
+        color=palette["arrow"],
         label_face=palette["background"],
         text="decision / health",
         text_offset=(0.075, 0),
@@ -329,7 +393,7 @@ def render(output: Path, palette: dict[str, str]) -> None:
         ax,
         (0.23, 0.59),
         (centers[0], 0.43),
-        color=palette["blue"],
+        color=palette["arrow"],
         label_face=palette["background"],
         text="target rank +\ntransfer phase",
         text_offset=(-0.055, 0),
@@ -338,7 +402,7 @@ def render(output: Path, palette: dict[str, str]) -> None:
         ax,
         (centers[1], 0.43),
         (0.50, 0.59),
-        color=palette["green"],
+        color=palette["arrow"],
         label_face=palette["background"],
         text="versioned block state\n+ heartbeat",
         text_offset=(0.085, 0),
@@ -347,28 +411,26 @@ def render(output: Path, palette: dict[str, str]) -> None:
         ax,
         (centers[2], 0.43),
         (0.76, 0.59),
-        color=palette["green"],
+        color=palette["arrow"],
         label_face=palette["background"],
     )
 
     arrow(
         ax,
-        (centers[0] + 0.11, 0.105),
-        (centers[1] - 0.11, 0.105),
-        color=palette["red"],
+        (0.297, 0.2175),
+        (0.396, 0.2175),
+        color=palette["arrow"],
         label_face=palette["background"],
-        text="packed KV transfer over a direct NVLink pair",
-        text_offset=(0, -0.026),
         style="<->",
     )
     ax.text(
-        0.81,
-        0.105,
-        "other configured direct pair(s)",
+        0.3465,
+        0.125,
+        "Packed KV transfer\nover one direct NVLink pair",
         ha="center",
         va="center",
-        fontsize=10.5,
-        color=palette["red"],
+        fontsize=8.8,
+        color=palette["muted"],
     )
     ax.text(
         0.5,

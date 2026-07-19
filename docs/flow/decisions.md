@@ -1772,3 +1772,56 @@ decision demand, decision plan, decision implementation, and decision result.
   absolute values, and full benchmark panels are now independently visible.
   The paper and README architecture diagrams remain structurally identical
   while using backgrounds appropriate to their display contexts.
+
+## 2026-07-19: Expose Routing, Prediction, and Packed-Transfer Decisions
+
+- Decision demand: Routing, hotspot prediction, and transfer were described in
+  prose but remained easy to conflate. In particular, an access threshold could
+  be mistaken for immediate transfer admission, and the relationship between
+  control metadata and the NCCL tensor payload was not visually explicit.
+- Decision plan: Trace the implemented route, background placement, foreground
+  shortage, and KV data paths; separate proposal from admission; and generate
+  one synchronized flowchart in light and dark themes for the paper, report,
+  and repository documentation.
+- Decision implementation: Added a reproducible three-panel decision-flow
+  generator. The routing panel shows contiguous prefix lookup, queue/prefill/
+  reclaim cost, bounded owner bypass, and route reservation. The prediction
+  panel shows complete-chain access counters, route hits, optional pending-
+  ingress demand, conservative reuse estimation, pair batching, cooldown/idle/
+  capacity checks, and the final benefit gate. The transfer panel shows actual
+  foreground shortage or admitted background copy, source generation checks,
+  prepare reservations, the contiguous `[layers, K/V, blocks, block size, KV
+  heads, head dimension]` payload, pair-local NCCL, indexed unpack, publish, and
+  copy/move finalize semantics. Paper, report, and both README languages now
+  embed the corresponding generated figure and implementation explanation.
+- Decision result: Documentation now makes clear that prediction only proposes
+  a candidate, measured cost decides execution, metadata remains on the control
+  protocol, and NCCL carries only packed K/V values. All three documents share
+  one source of truth for the decision flow.
+
+## 2026-07-19: Separate Decision Branches and Clarify Runtime Transfer Batches
+
+- Decision demand: The combined three-column decision figure looked like three
+  linear pipelines and hid rejection, deferral, spill, and rollback branches.
+  The architecture figure also placed its NVLink annotation below the workers
+  instead of visibly connecting two rank-local KV tensors. Documentation could
+  be read as if the four-block microbenchmark fixed the online transfer batch.
+- Decision plan: Render routing, hot-prefix prediction, and transfer as three
+  independent branch diagrams; use one shape/arrow accent per diagram; simplify
+  architecture labels with smaller explanatory text; use one neutral arrow
+  color; connect the direct-pair data path at the Model Runner boundaries; and
+  distinguish calibration samples from runtime plan sizing.
+- Decision implementation: `generate_decision_flow.py` now emits three light
+  paper/report images and three dark README images. Diamonds expose feasibility,
+  owner-spill, hotness, replica need, benefit, prepare, and execute outcomes.
+  `generate_architecture.py` now renders title/subtitle typography, neutral
+  arrows, and a pair-local bidirectional arrow between rank 0 and rank 1 Model
+  Runners. Paper, report, both README languages, and the paper runbook now state
+  that foreground size equals actual shortage, one background candidate is
+  capped at eight blocks by default, and same-pair candidates may coalesce up to
+  the default 128-block plan cap. Four blocks remains a conservative measured
+  initialization point, not an execution invariant.
+- Decision result: Each policy can be read and cited independently, all failure
+  paths are visible, the architecture distinguishes control edges from colored
+  components, and benchmark calibration is no longer conflated with the actual
+  transfer batch distribution.

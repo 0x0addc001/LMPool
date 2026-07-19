@@ -41,6 +41,24 @@ For `N` GPUs, the runtime contains one user/launcher process, one independent co
 5. A real local block shortage may trigger a cost-gated foreground transfer. Predictable future reuse may trigger a background copy and placement lease.
 6. Finished sequences and per-rank metrics return to LLMEngine.
 
+### Decision Flow
+
+**KV-aware routing**
+
+![LMPool KV-aware routing decision](./assets/fig_routing_decision_dark.png)
+
+**Hot-prefix prediction**
+
+![LMPool hot-prefix prediction decision](./assets/fig_hot_prefix_decision_dark.png)
+
+**Transfer admission and execution**
+
+![LMPool transfer admission and execution](./assets/fig_transfer_decision_dark.png)
+
+Hot-prefix prediction combines cumulative complete-chain block accesses, route-hit counts, and optional demand for requests already visible at ingress but not yet submitted. It reconstructs the deepest hot leaf with all resident ancestors. Passing the hotness threshold only creates a candidate: destination replica absence, source/target load skew, cooldown, pair idleness, target capacity, and the saved-prefill/transfer-cost gate must still pass.
+
+The data payload contains only K/V values. For `L` layers and `B` selected blocks, the source gathers one contiguous `[L, 2, B, block_size, num_kv_heads, head_dim]` tensor with indexed selection, sends it once on the pair-specific NCCL group, and the destination scatters it into reserved blocks. Hashes, generations, modes, and physical block IDs travel separately through the control-plane protocol.
+
 ## Core Mechanisms
 
 ### KV-Aware Routing
@@ -63,7 +81,7 @@ Cached complete blocks are reclaimed with dependency-safe LFU-first/LRU-second o
 
 ### NVLink KV Transfer
 
-Foreground transfer requests only the actual shortage, not an entire sequence. Background placement batches hot prefix chains for predicted reuse. Both are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.
+Foreground transfer requests only the actual shortage, not an entire sequence. Background placement limits each candidate chain with `background_copy_max_blocks` (default 8), then deduplicates and coalesces candidates for one directed pair up to `background_copy_batch_max_blocks` (default 128). Thus four blocks are a microbenchmark calibration point, not a fixed runtime batch. Both paths are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.
 
 Each plan follows an idempotent transaction:
 
