@@ -143,7 +143,7 @@ uv run python benchmarks/benchmark_e2e.py \
   --goodput-e2e-sla-ms 120000 \
   --disable-background-copy \
   --foreground-transfer-min-benefit-ratio 1.1 \
-  --foreground-transfer-bandwidth-gib-s 13.0 \
+  --foreground-transfer-bandwidth-gib-s 22.95 \
   --foreground-transfer-fixed-latency-ms 2.0 \
   --foreground-transfer-interference-multiplier 1.2 \
   --kv-transfer-prewarm-blocks 4 \
@@ -152,7 +152,7 @@ uv run python benchmarks/benchmark_e2e.py \
   2>&1 | tee "${OUT}/memory_skew/run.log"
 ```
 
-运行 transfer microbenchmark 后，应将 `13.0` 替换为 4-block 或实际线上 batch 对应的实测
+运行 transfer microbenchmark 后，应将 `22.95` 替换为 4-block 或实际线上 batch 对应的实测
 GiB/s。验收时同时检查 `sent blocks`、`source freed`、`fg ok` 和 reuse-phase token ratio；
 如果 transfer counters 为 0，该结果不能证明 foreground transfer。
 
