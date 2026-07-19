@@ -1,4 +1,6 @@
-![fig_architecture.png](/assets/fig_logo_dark_long.png)
+<p align="center">
+  <img src="./assets/fig_logo_dark.png" width="50%" height="50%">
+</p>
 
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
