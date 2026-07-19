@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/fig_logo_dark.png" width="35%" height="35%">
+  <img src="./assets/fig_logo_dark.png" width="40%" height="40%">
 </p>
 
 <p align="center">
@@ -8,8 +8,6 @@
 </p>
 
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
-
----
 
 ## 目录
 
