@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/fig_logo_dark.png" width="25%" height="25%">
+  <img src="./assets/fig_logo_dark.png" width="35%" height="35%">
 </p>
 
 # LMPool: Distributed KV Cache Pooling for LLM Inference
