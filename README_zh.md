@@ -1,4 +1,4 @@
-![fig_architecture.png](/assets/fig_logo_dark.png)
+![fig_architecture.png](/assets/fig_logo_dark_long.png)
 
 # LMPool：面向 LLM 推理的分布式 KV Cache 池化方案
 

@@ -1,4 +1,4 @@
-![fig_architecture.png](/assets/fig_logo_dark.png)
+![fig_architecture.png](/assets/fig_logo_dark_long.png)
 
 # LMPool: Distributed KV Cache Pooling for LLM Inference
 
