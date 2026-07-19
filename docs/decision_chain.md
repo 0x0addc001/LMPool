@@ -1516,3 +1516,149 @@ decision demand, decision plan, decision implementation, and decision result.
   not amortized by its short decode. The six-GPU paper run should reduce 32
   candidate placements to approximately three pair-level plans and use the
   reuse-phase metrics to quantify amortized benefit.
+
+## 2026-07-19: Remove Per-Token Control Sync and Expose Reuse Amortization
+
+- Decision demand: The six-GPU `e2e_202607190037_session_handoff` result was
+  initially described as worse than multi-GPU, but the JSON shows otherwise:
+  LMPool reaches 578.38 tok/s versus 561.54 tok/s, reduces mean TTFT from
+  2.304 s to 1.756 s, and reduces mean E2E from 6.973 s to 6.594 s. Its reuse
+  phase reaches 649.75 tok/s versus 560.05 tok/s and reduces reuse mean TTFT
+  from 2.281 s to 1.126 s. The aggregate throughput gain remains only 3.0%
+  because an equal 64-request warm-up phase cannot benefit from a replica that
+  does not exist yet. Code inspection also found that `Scheduler` published a
+  full local block snapshot after individual sequence/token mutations even
+  though `DataPlaneProcess` already published an authoritative snapshot after
+  each model batch.
+- Decision plan: Remove duplicate page-table traffic at its ownership boundary,
+  test whether source/replica striping can preserve cache reuse while activating
+  both sides of each NVLink pair, and make the benchmark expose how many requests
+  pay cache construction versus consume the transferred KV. Do not claim a
+  throughput win from a tiny protocol test when its output is too short to
+  amortize placement and process overhead.
+- Decision implementation: `Scheduler` now tracks `local_state_dirty` and keeps
+  direct reporting enabled for standalone use. `DataPlaneProcess` disables
+  per-sequence reporting, sends one authoritative block-state snapshot after a
+  receive/model/transfer batch, and flushes a dirty idle state once. Placement
+  leases now carry explicit source and replica quotas; adjacent prefixes start
+  on opposite sides so a bounded submit window does not create all-replica then
+  all-source waves. The E2E benchmark adds `--handoff-warmup-prompts`; its
+  default `0` preserves the old 50/50 split, while `32` with 128 requests and
+  32 prefix groups creates one 32-request cache-building round followed by 96
+  reuse requests. Validation and documentation were updated for this phase
+  contract.
+- Decision result: The final complete CPU suite passes with `144 passed, 1
+  skipped`; the skipped case is the opt-in NCCL integration test. A two-GPU,
+  four-token acceptance run proves
+  that the explicit stripe produces an exact 4/4 reuse distribution and 100%
+  reuse request hits, but it does not improve throughput: LMPool reaches 17.13
+  tok/s versus 19.14 tok/s for multi-GPU because transfer and process overhead
+  dominate four output tokens. This is retained as a correctness result, not a
+  paper performance result. The next six-GPU acceptance run must use 32 warm-up
+  plus 96 reuse requests and report both aggregate and reuse-phase confidence
+  intervals; a significant system claim requires LMPool to exceed the
+  multi-GPU, routing-only, and transfer-only ablations under that contract.
+
+## 2026-07-19: Make Every Benchmark Entry an Experimental Claim
+
+- Decision demand: The benchmark directory exposed five Python files, but
+  `benchmark_e2e.py` and `benchmark_kv_transfer.py` were only 12-line wrappers
+  around implementations under obsolete names. `benchmark_kv_routing.py` used
+  the E2E parser, fixed multi-GPU scenarios to two ranks, ignored repetitions
+  and current budget/configuration helpers, and could silently diverge from the
+  routing-only ablation used in the paper. Duplicate compatibility entries did
+  not add evidence and made the artifact harder to audit.
+- Decision plan: Keep exactly three executable claims: routing locality,
+  isolated KV transport, and full-system composition. Put the complete E2E and
+  transfer implementations under their canonical names, remove obsolete entry
+  files and hidden capacity aliases, and give the routing experiment its own
+  constrained argument surface and three-scenario execution flow.
+- Decision implementation: The full shared-prefix implementation now lives in
+  `benchmarks/benchmark_e2e.py`, whose default workload is the validated
+  `session-handoff` comparison. The full NCCL microbenchmark now lives in
+  `benchmarks/benchmark_kv_transfer.py`. The old
+  `shared_prefix_benchmark.py` / `kv_transfer_benchmark.py` files and hidden
+  `--routing-max-cached-blocks` / `--eviction-max-cached-blocks` options were
+  removed. `benchmark_kv_routing.py` now independently parses only locality,
+  topology, common-capacity, repetition, output, and routing-cost parameters;
+  honors arbitrary `--world-size`; uses the same exact per-rank KV budget in
+  all three scenarios; and explicitly disables foreground transfer,
+  background placement, and cache-preserving transfer. Tests and English/
+  Chinese documentation now import and advertise only the canonical entries.
+- Decision result: All three scripts compile and expose independent `--help`
+  output. Benchmark-focused tests pass (`26 passed, 1 skipped`), and the final
+  repository-wide suite passes (`148 passed, 1 skipped`). The skipped case is
+  the opt-in NCCL integration test exercised separately on GPU systems.
+
+## 2026-07-19: Harden Control Concurrency and Atomic KV Transfer
+
+- Decision demand: Local scheduler and block-manager mutations are owned by one
+  data-plane event loop, so adding coarse locks to allocation, model forward,
+  or decode would add overhead without fixing the actual distributed races.
+  The real hazards were protocol boundaries: a move could release its source
+  before every destination acknowledged durable placement; a recycled physical
+  block id could satisfy a stale transfer plan; concurrent callers sharing one
+  control response queue could consume one another's replies; stale snapshots
+  could overwrite newer state; and a failed worker could remain routable.
+- Decision plan: Preserve single-owner data-plane execution and protect only
+  cross-process state transitions. Make transfer publication atomic and
+  idempotent, attach identity/version metadata to reusable state, demultiplex
+  concurrent RPC responses by request id, exclude unavailable ranks, replace
+  queue-emptiness guesses with event-driven draining, and serialize only
+  launcher lifecycle operations. Add fault-oriented tests for every boundary.
+- Decision implementation: `BlockManager` now increments a generation whenever
+  a physical block is allocated, validates hash/generation before transfer,
+  locks prepared source blocks against reclamation, and keeps received target
+  blocks hidden until publish. Foreground and background plans carry source
+  generations. `DataPlaneProcess` implements bounded idempotent
+  `prepare -> execute -> publish -> finalize/abort` state: execute copies into
+  hidden targets, publish establishes every destination while retaining all
+  sources, finalize then releases move sources, and abort releases reservations.
+  `control_plane_process` waits for all target publication and finalization ACKs
+  before reporting success. Control/worker epochs, monotonic
+  snapshot versions, restart-time full-state requests, and unavailable-rank
+  filtering prevent stale control and page-table state from being reused.
+  `ControlPlaneClient` uses a short receive lock plus per-request response
+  buffers for concurrent callers, while control restart converts an in-flight
+  rebalance into a counted `control_restarted` failure instead of crashing the
+  worker. The data-plane loop no longer calls unreliable `Queue.empty()`, and
+  `LLMEngine` serializes `step`, process recovery, and idempotent shutdown.
+- Decision result: The focused control, block-manager, scheduler, data-plane,
+  and launcher safety suite passes (`108 passed`). No model-forward, decode, or
+  CUDA tensor access acquired a new steady-state lock; added work is limited to
+  integer generation/version updates and control-message transitions. The final
+  repository-wide suite passes (`159 passed, 1 skipped`); the skipped case is
+  the opt-in NCCL hardware integration test.
+
+## 2026-07-19: Consolidate the Publishable Benchmark Artifact
+
+- Decision demand: The repository had converged to three canonical benchmark
+  entries, but the execution contract was still fragmented across long source
+  comments and historical commands. The transfer microbenchmark could measure
+  only one payload size per process invocation and could not export JSON or a
+  figure. New machine-specific results also appeared as untracked source-tree
+  files, while 151 historical artifacts needed to be preserved rather than
+  silently deleted.
+- Decision plan: Keep one executable per paper claim, add machine-readable
+  transfer sweeps, define one topology-specific paper runbook with explicit
+  primary and supplementary workloads, preserve old results, and prevent new
+  generated artifacts from polluting Git status. Validate the benchmark CLI,
+  export contract, plotting path, and complete repository tests.
+- Decision implementation: `benchmark_kv_transfer.py` now accepts a stable
+  `--block-counts` sweep, runs each payload with independent NCCL processes,
+  prints one comparison table, and exports JSON plus a two-panel latency/
+  bandwidth figure. NCCL initialization now binds the process group to the
+  explicit CUDA device in the microbenchmark, hardware test, and `ModelRunner`,
+  removing rank-to-device guessing from paper logs. `PAPER_RUNBOOK.md` defines
+  the current six-GPU logical topology, environment capture, CPU/NCCL tests,
+  routing locality, foreground memory-skew transfer, full session-handoff, and
+  supplementary load-skew commands with fixed budgets and acceptance criteria.
+  `benchmarks/results/README.md` defines the output layout, and `.gitignore`
+  ignores future generated result files while retaining all existing history.
+  Root and benchmark READMEs link to the canonical runbook; obsolete protocol
+  wording in benchmark comments was removed.
+- Decision result: Transfer benchmark parser/JSON/figure tests pass, all three
+  canonical scripts expose current independent `--help` output, and the final
+  repository-wide suite passes (`162 passed, 1 skipped`). The skipped case is
+  the opt-in NCCL hardware round-trip that the paper runbook executes explicitly
+  on one visible NVLink pair.

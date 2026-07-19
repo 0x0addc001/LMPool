@@ -1,5 +1,6 @@
 import logging
 import queue
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -33,6 +34,7 @@ class ControlPlaneClient:
         response_queue: Queue,
         heartbeat_interval: float = 1.0,
         heartbeat_timeout: float = 3.0,
+        control_epoch: str | None = None,
     ):
         self.rank = rank
         self.request_queue = request_queue
@@ -40,7 +42,16 @@ class ControlPlaneClient:
         self.block_manager = None
         self.gbm = None
         self.rebalance_executor = None
-        self._stashed_messages = deque()
+        self.state_reporter = None
+        self.worker_epoch = uuid.uuid4().hex if rank >= 0 else None
+        self.control_epoch = control_epoch
+        self._state_version = 0
+        self._response_receive_lock = threading.Lock()
+        self._response_condition = threading.Condition()
+        self._responses_by_request: dict[str, deque] = defaultdict(deque)
+        self._handled_plan_phases: dict[tuple[str, str], dict] = {}
+        self._handled_plan_phase_order: deque[tuple[str, str]] = deque()
+        self._handled_plan_phase_limit = 2048
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
         self._last_control_heartbeat = time.monotonic()
@@ -50,6 +61,12 @@ class ControlPlaneClient:
         self.rebalance_fail_count = 0
         self.rebalance_fail_reasons = defaultdict(int)
         self.last_rebalance_fail_reason = ""
+
+    def _request_metadata(self) -> dict:
+        return {
+            "control_epoch": self.control_epoch,
+            "worker_epoch": self.worker_epoch,
+        }
 
     def route_sequence(self, seq: Sequence, return_meta: bool = False) -> int | dict:
         request_id = uuid.uuid4().hex
@@ -66,26 +83,20 @@ class ControlPlaneClient:
             "num_blocks": seq.num_blocks,
             "prefix_hash": prefix_hash,
             "prefix_hashes": prefix_hashes,
+            **self._request_metadata(),
         })
-        while True:
-            msg = self._next_response()
-            if msg.get("request_id") != request_id:
-                if self._handle_async_message(msg):
-                    continue
-                self._stashed_messages.append(msg)
-                continue
-            if msg.get("type") == "route_response":
-                route_info = msg.get("route_info", {})
-                matched_blocks = max(0, int(route_info.get("matched_prefix_blocks", 0)))
-                seq.routed_prefix_hashes = list(prefix_hashes[:matched_blocks])
-                if return_meta:
-                    return {
-                        "target_rank": msg["target_rank"],
-                        "route_info": route_info,
-                    }
-                return msg["target_rank"]
-            if msg.get("type") == "error":
-                raise RuntimeError(msg.get("error", "control plane request failed"))
+        msg = self._wait_for_response(request_id)
+        if msg.get("type") == "route_response":
+            route_info = msg.get("route_info", {})
+            matched_blocks = max(0, int(route_info.get("matched_prefix_blocks", 0)))
+            seq.routed_prefix_hashes = list(prefix_hashes[:matched_blocks])
+            if return_meta:
+                return {
+                    "target_rank": msg["target_rank"],
+                    "route_info": route_info,
+                }
+            return msg["target_rank"]
+        raise RuntimeError(msg.get("error", "control plane request failed"))
 
     def report_block_state(
         self,
@@ -99,9 +110,11 @@ class ControlPlaneClient:
         running_tokens: int = 0,
         block_parent_hashes: dict[int, int] | None = None,
         block_access_stats: dict[int, dict] | None = None,
+        block_generations: dict[int, int] | None = None,
     ):
         if self.rank < 0:
             return
+        self._state_version += 1
         self.request_queue.put({
             "type": "block_state",
             "rank": self.rank,
@@ -115,6 +128,9 @@ class ControlPlaneClient:
             "running_tokens": running_tokens,
             "block_parent_hashes": block_parent_hashes,
             "block_access_stats": block_access_stats,
+            "block_generations": block_generations,
+            "state_version": self._state_version,
+            **self._request_metadata(),
         })
 
     def acknowledge_route_admission(self, seq_id: int, num_tokens: int) -> None:
@@ -124,6 +140,7 @@ class ControlPlaneClient:
             "rank": self.rank,
             "seq_id": int(seq_id),
             "num_tokens": int(num_tokens),
+            **self._request_metadata(),
         })
 
     def acknowledge_route_blocks(self, seq_ids: list[int]) -> None:
@@ -134,6 +151,7 @@ class ControlPlaneClient:
             "type": "route_blocks_committed",
             "rank": self.rank,
             "seq_ids": [int(seq_id) for seq_id in seq_ids],
+            **self._request_metadata(),
         })
 
     def report_transfer_observation(
@@ -151,6 +169,7 @@ class ControlPlaneClient:
             "dst_gpu": int(dst_gpu),
             "transfer_bytes": int(transfer_bytes),
             "transfer_time_s": float(transfer_time_s),
+            **self._request_metadata(),
         })
 
     def report_prefill_observation(
@@ -165,6 +184,7 @@ class ControlPlaneClient:
             "rank": self.rank,
             "uncached_tokens": int(uncached_tokens),
             "elapsed_s": float(elapsed_s),
+            **self._request_metadata(),
         })
 
     def rebalance(self, gpu_id: int, needed_blocks: int, allow_copy: bool = False) -> bool:
@@ -176,16 +196,21 @@ class ControlPlaneClient:
             "gpu_id": gpu_id,
             "needed_blocks": needed_blocks,
             "allow_copy": allow_copy,
+            **self._request_metadata(),
         })
-        while True:
-            msg = self._next_response()
-            if msg.get("request_id") != request_id:
-                if self._handle_async_message(msg):
-                    continue
-                self._stashed_messages.append(msg)
-                continue
-            if msg.get("type") == "rebalance_response":
-                success = bool(msg.get("success", False))
+        try:
+            msg = self._wait_for_response(request_id)
+        except RuntimeError as exc:
+            if "control plane restarted" not in str(exc):
+                raise
+            with self._response_condition:
+                self.rebalance_fail_count += 1
+                self.last_rebalance_fail_reason = "control_restarted"
+                self.rebalance_fail_reasons["control_restarted"] += 1
+            return False
+        if msg.get("type") == "rebalance_response":
+            success = bool(msg.get("success", False))
+            with self._response_condition:
                 if success:
                     self.rebalance_success_count += 1
                     self.last_rebalance_fail_reason = ""
@@ -193,19 +218,20 @@ class ControlPlaneClient:
                     self.last_rebalance_fail_reason = msg.get("reason", "unknown")
                     self.rebalance_fail_count += 1
                     self.rebalance_fail_reasons[self.last_rebalance_fail_reason] += 1
-                return success
-            if msg.get("type") == "error":
-                logger.error(
-                    "rank %s rebalance error for gpu=%s needed=%s: %s",
-                    self.rank,
-                    gpu_id,
-                    needed_blocks,
-                    msg.get("error", "unknown error"),
-                )
+            return success
+        if msg.get("type") == "error":
+            logger.error(
+                "rank %s rebalance error for gpu=%s needed=%s: %s",
+                self.rank,
+                gpu_id,
+                needed_blocks,
+                msg.get("error", "unknown error"),
+            )
+            with self._response_condition:
                 self.rebalance_fail_count += 1
                 self.last_rebalance_fail_reason = "error"
                 self.rebalance_fail_reasons["error"] += 1
-                return False
+            return False
 
     def flush_background_copies(
         self,
@@ -228,25 +254,12 @@ class ControlPlaneClient:
                 int(block_hash): max(0, int(count))
                 for block_hash, count in (prefix_demands or {}).items()
             },
+            **self._request_metadata(),
         })
-        deadline = time.monotonic() + max(0.1, float(timeout_s))
-        while True:
-            if self._stashed_messages:
-                msg = self._stashed_messages.popleft()
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("timed out waiting for background copy flush")
-                msg = self.response_queue.get(timeout=remaining)
-            if msg.get("request_id") != request_id:
-                if self._handle_async_message(msg):
-                    continue
-                self._stashed_messages.append(msg)
-                continue
-            if msg.get("type") == "background_copy_flush_response":
-                return msg
-            if msg.get("type") == "error":
-                raise RuntimeError(msg.get("error", "background copy flush failed"))
+        msg = self._wait_for_response(request_id, timeout_s=max(0.1, float(timeout_s)))
+        if msg.get("type") == "background_copy_flush_response":
+            return msg
+        raise RuntimeError(msg.get("error", "background copy flush failed"))
 
     def close(self):
         if self.rank < 0:
@@ -254,6 +267,7 @@ class ControlPlaneClient:
         self.request_queue.put({
             "type": "client_exit",
             "rank": self.rank,
+            **self._request_metadata(),
         })
 
     def send_heartbeat(self):
@@ -264,11 +278,40 @@ class ControlPlaneClient:
             "type": "heartbeat",
             "rank": self.rank,
             "ts": time.time(),
+            **self._request_metadata(),
         })
 
-    def note_control_heartbeat(self, ts: Optional[float] = None):
+    def note_control_heartbeat(
+        self,
+        ts: Optional[float] = None,
+        control_epoch: str | None = None,
+    ):
+        if control_epoch is not None and control_epoch != self.control_epoch:
+            self.reset_control_epoch(control_epoch)
         self._last_control_heartbeat = time.monotonic()
         self._control_down_reported = False
+
+    def reset_control_epoch(self, control_epoch: str) -> None:
+        """Discard buffered responses from a previous control-plane process."""
+        epoch_changed = control_epoch != self.control_epoch
+        with self._response_condition:
+            self.control_epoch = control_epoch
+            self._responses_by_request.clear()
+            self._handled_plan_phases.clear()
+            self._handled_plan_phase_order.clear()
+            self._response_condition.notify_all()
+        if epoch_changed and self.rebalance_executor is not None:
+            try:
+                self.rebalance_executor({
+                    "_phase": "control_reset",
+                    "plan_id": None,
+                    "transfers": [],
+                })
+            except Exception:
+                logger.exception(
+                    "rank %s failed to clean transfer state after control restart",
+                    self.rank,
+                )
 
     def check_control_health(self) -> bool:
         if self.rank < 0:
@@ -287,21 +330,27 @@ class ControlPlaneClient:
     def set_rebalance_executor(self, executor):
         self.rebalance_executor = executor
 
+    def set_state_reporter(self, reporter):
+        self.state_reporter = reporter
+
     def pump_async_messages(self) -> None:
-        while True:
-            try:
-                msg = self.response_queue.get_nowait()
-            except queue.Empty:
-                break
-            if msg.get("type") in {
-                "route_response",
-                "rebalance_response",
-                "background_copy_flush_response",
-                "error",
-            }:
-                self._stashed_messages.appendleft(msg)
-                break
-            self._handle_async_message(msg)
+        if not self._response_receive_lock.acquire(blocking=False):
+            return
+        try:
+            while True:
+                try:
+                    msg = self.response_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if not self._message_is_current(msg):
+                    continue
+                request_id = msg.get("request_id")
+                if request_id is not None:
+                    self._buffer_response(request_id, msg)
+                    continue
+                self._handle_async_message(msg)
+        finally:
+            self._response_receive_lock.release()
 
     def _compute_prefix_hash(self, seq: Sequence) -> Optional[int]:
         prefix_hashes = self._compute_prefix_hashes(seq)
@@ -334,16 +383,93 @@ class ControlPlaneClient:
             hashes.append(hash_val)
         return hashes
 
-    def _next_response(self):
-        if self._stashed_messages:
-            return self._stashed_messages.popleft()
-        return self.response_queue.get()
+    def _buffer_response(self, request_id: str, msg: dict) -> None:
+        with self._response_condition:
+            self._responses_by_request[request_id].append(msg)
+            self._response_condition.notify_all()
+
+    def _pop_buffered_response(self, request_id: str) -> dict | None:
+        with self._response_condition:
+            responses = self._responses_by_request.get(request_id)
+            if not responses:
+                return None
+            msg = responses.popleft()
+            if not responses:
+                self._responses_by_request.pop(request_id, None)
+            return msg
+
+    def _message_is_current(self, msg: dict) -> bool:
+        message_epoch = msg.get("control_epoch")
+        return (
+            message_epoch is None
+            or self.control_epoch is None
+            or message_epoch == self.control_epoch
+            or msg.get("type") in {"heartbeat", "full_state_request"}
+        )
+
+    def _wait_for_response(
+        self,
+        request_id: str,
+        timeout_s: float | None = None,
+    ) -> dict:
+        """Demultiplex one shared response queue without serializing callers."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        request_epoch = self.control_epoch
+        while True:
+            buffered = self._pop_buffered_response(request_id)
+            if buffered is not None:
+                return buffered
+            if (
+                request_epoch is not None
+                and self.control_epoch is not None
+                and request_epoch != self.control_epoch
+            ):
+                raise RuntimeError("control plane restarted while request was in flight")
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(f"timed out waiting for control request {request_id}")
+            acquire_timeout = 0.05 if remaining is None else min(0.05, remaining)
+            if not self._response_receive_lock.acquire(timeout=acquire_timeout):
+                with self._response_condition:
+                    self._response_condition.wait(timeout=acquire_timeout)
+                continue
+            try:
+                buffered = self._pop_buffered_response(request_id)
+                if buffered is not None:
+                    return buffered
+                queue_timeout = 0.05 if remaining is None else min(0.05, remaining)
+                try:
+                    msg = self.response_queue.get(timeout=queue_timeout)
+                except queue.Empty:
+                    continue
+                if not self._message_is_current(msg):
+                    continue
+                response_request_id = msg.get("request_id")
+                if response_request_id == request_id:
+                    return msg
+                if response_request_id is not None:
+                    self._buffer_response(response_request_id, msg)
+                    continue
+                self._handle_async_message(msg)
+            finally:
+                self._response_receive_lock.release()
 
     def _handle_async_message(self, msg: dict) -> bool:
         if msg.get("type") == "heartbeat":
-            self.note_control_heartbeat(msg.get("ts"))
+            self.note_control_heartbeat(msg.get("ts"), msg.get("control_epoch"))
             return True
-        if msg.get("type") not in {"rebalance_prepare", "rebalance_execute", "rebalance_abort"}:
+        if msg.get("type") == "full_state_request":
+            self.note_control_heartbeat(msg.get("ts"), msg.get("control_epoch"))
+            if self.state_reporter is not None:
+                self.state_reporter()
+            return True
+        if msg.get("type") not in {
+            "rebalance_prepare",
+            "rebalance_execute",
+            "rebalance_publish",
+            "rebalance_finalize",
+            "rebalance_abort",
+        }:
             return False
         if self.rebalance_executor is None:
             raise RuntimeError("rebalance_executor is not installed on ControlPlaneClient")
@@ -352,10 +478,37 @@ class ControlPlaneClient:
             phase = "prepare"
         elif msg.get("type") == "rebalance_abort":
             phase = "abort"
+        elif msg.get("type") == "rebalance_publish":
+            phase = "publish"
+        elif msg.get("type") == "rebalance_finalize":
+            phase = "finalize"
         else:
             phase = "execute"
         plan["_phase"] = phase
-        result = self.rebalance_executor(plan)
+        phase_key = (str(msg.get("plan_id")), phase)
+        result = self._handled_plan_phases.get(phase_key)
+        if result is None:
+            try:
+                result = self.rebalance_executor(plan)
+            except Exception as exc:
+                logger.exception(
+                    "rank %s transfer plan %s phase %s failed",
+                    self.rank,
+                    msg.get("plan_id"),
+                    phase,
+                )
+                result = {
+                    "success": False,
+                    "reason": "executor_error",
+                    "error": str(exc),
+                }
+            if not isinstance(result, dict):
+                result = {"success": bool(result)}
+            self._handled_plan_phases[phase_key] = dict(result)
+            self._handled_plan_phase_order.append(phase_key)
+            while len(self._handled_plan_phase_order) > self._handled_plan_phase_limit:
+                expired = self._handled_plan_phase_order.popleft()
+                self._handled_plan_phases.pop(expired, None)
         self.request_queue.put({
             "type": "rebalance_done",
             "plan_id": msg["plan_id"],
@@ -363,6 +516,7 @@ class ControlPlaneClient:
             "role": msg.get("role"),
             "phase": phase,
             "result": result,
+            **self._request_metadata(),
         })
         return True
 
@@ -375,6 +529,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     )
 
     world_size = config["world_size"]
+    control_epoch = str(config.get("control_epoch") or uuid.uuid4().hex)
     heartbeat_interval = float(config.get("heartbeat_interval", 1.0))
     heartbeat_timeout = float(config.get("heartbeat_timeout", 3.0))
     gbm = GlobalBlockManager(
@@ -384,6 +539,8 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         master_rank=-1,
         nvlink_pairs=config.get("nvlink_topo", {}).get("pairs"),
     )
+    if config.get("control_plane_recovery", False):
+        gbm.available_gpus.clear()
     scheduler = GlobalScheduler(gbm=gbm, block_manager=None)
     scheduler.prefix_hit_weight = float(config.get("route_prefix_hit_weight", scheduler.prefix_hit_weight))
     scheduler.queue_pressure_weight = float(config.get("route_queue_pressure_weight", scheduler.queue_pressure_weight))
@@ -517,9 +674,12 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         lambda: defaultdict(int)
     )
     placement_leases: dict[int, dict] = {}
+    placement_lease_creation_count: dict[tuple[int, int], int] = defaultdict(int)
     prefix_route_hits: dict[int, int] = defaultdict(int)
     worker_last_heartbeat: dict[int, float] = {rank: time.monotonic() for rank in range(world_size)}
     worker_down: set[int] = set()
+    worker_epochs: dict[int, str] = {}
+    worker_state_versions: dict[int, int] = {}
     last_control_heartbeat_sent = 0.0
 
     def _pair_label(pair: tuple[int, int]) -> str:
@@ -534,12 +694,24 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         if pair is not None:
             background_placement_pair_stats[_pair_label(pair)][metric] += int(amount)
 
+    def send_response(reply_rank: int, message: dict) -> None:
+        payload = dict(message)
+        payload.setdefault("control_epoch", control_epoch)
+        response_queues[reply_rank].put(payload)
+
+    def request_full_state(rank: int) -> None:
+        send_response(rank, {
+            "type": "full_state_request",
+            "rank": -1,
+            "ts": time.time(),
+        })
+
     def broadcast_control_heartbeat():
         now = time.time()
-        for reply_rank, q in response_queues.items():
+        for reply_rank in response_queues:
             if reply_rank < 0:
                 continue
-            q.put({
+            send_response(reply_rank, {
                 "type": "heartbeat",
                 "rank": -1,
                 "ts": now,
@@ -549,15 +721,16 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         if rank in worker_down:
             return
         worker_down.add(rank)
+        gbm.mark_gpu_unavailable(rank)
         logger.error("worker rank %s heartbeat timeout", rank)
         for plan_id, plan in list(pending_rebalances.items()):
             if rank not in plan["execute_ranks"]:
                 continue
             prepared_ranks = set(plan.get("prepared_ranks", set())) - {rank}
-            if prepared_ranks:
+            if prepared_ranks and plan.get("phase") != "finalize":
                 _send_rebalance_abort(plan_id, plan["plan"], prepared_ranks)
             if plan.get("reply_rank") is not None:
-                response_queues[plan["reply_rank"]].put({
+                send_response(plan["reply_rank"], {
                     "type": "rebalance_response",
                     "request_id": plan["request_id"],
                     "success": False,
@@ -581,14 +754,14 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         for dst_rank in target_ranks:
             if dst_rank in source_ranks:
                 continue
-            response_queues[dst_rank].put({
+            send_response(dst_rank, {
                 "type": "rebalance_execute",
                 "plan_id": plan_id,
                 "role": "target",
                 "plan": plan,
             })
         for src_rank in source_ranks:
-            response_queues[src_rank].put({
+            send_response(src_rank, {
                 "type": "rebalance_execute",
                 "plan_id": plan_id,
                 "role": "source",
@@ -597,10 +770,28 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
 
     def _send_rebalance_abort(plan_id: str, plan: dict, ranks: set[int]):
         for rank in ranks:
-            response_queues[rank].put({
+            send_response(rank, {
                 "type": "rebalance_abort",
                 "plan_id": plan_id,
                 "role": "abort",
+                "plan": plan,
+            })
+
+    def _send_rebalance_publish(plan_id: str, plan: dict, ranks: set[int]):
+        for rank in ranks:
+            send_response(rank, {
+                "type": "rebalance_publish",
+                "plan_id": plan_id,
+                "role": "publish",
+                "plan": plan,
+            })
+
+    def _send_rebalance_finalize(plan_id: str, plan: dict, ranks: set[int]):
+        for rank in ranks:
+            send_response(rank, {
+                "type": "rebalance_finalize",
+                "plan_id": plan_id,
+                "role": "finalize",
                 "plan": plan,
             })
 
@@ -663,14 +854,31 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 int(background_future_demands.get(int(candidate_key[0]), 0)),
             )
             if candidate is not None and future_demand > 0:
+                start_with_target = placement_lease_creation_count[pair] % 2 == 0
+                placement_lease_creation_count[pair] += 1
+                split = future_demand // 2
+                if future_demand == 1:
+                    target_quota, source_quota = 1, 0
+                else:
+                    target_quota = split + int(
+                        future_demand % 2 == 1 and start_with_target
+                    )
+                    source_quota = split + int(
+                        future_demand % 2 == 1 and not start_with_target
+                    )
                 placement_leases[int(candidate_key[0])] = {
                     "src_gpu": int(candidate["src_gpu"]),
                     "target_gpu": int(candidate["dst_gpu"]),
-                    # The source already served the completed warmup phase.
-                    # Keep the forecast reuse phase on the replica as one
-                    # batch, instead of fragmenting every prefix across both
-                    # ranks through per-request load comparisons.
-                    "remaining": future_demand,
+                    # Explicit quotas are required on both sides: after the
+                    # replica quota is consumed, an unconstrained prefix scorer
+                    # can still prefer that replica and collapse pair-level
+                    # parallelism again.
+                    "target_remaining": target_quota,
+                    "source_remaining": source_quota,
+                    # Adjacent prefixes start on opposite sides. This prevents
+                    # a bounded submit window from sending one all-replica wave
+                    # followed by one all-source wave.
+                    "next_target": start_with_target,
                     "pair": pair,
                 }
                 _record_placement_stat("lease_created", pair)
@@ -722,7 +930,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
 
         for prepare_rank in execute_ranks:
             role = "source" if prepare_rank in source_ranks else "target"
-            response_queues[prepare_rank].put({
+            send_response(prepare_rank, {
                 "type": "rebalance_prepare",
                 "plan_id": plan_id,
                 "role": role,
@@ -858,6 +1066,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         hashes = []
         parent_hashes = []
         access_counts = []
+        generations = []
         for block_hash in candidate["hashes"]:
             source_locations = [
                 location
@@ -876,6 +1085,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             hashes.append(block_hash)
             parent_hashes.append(gbm.get_block_parent_hash(src_gpu, block_id))
             access_counts.append(gbm.block_access_count[src_gpu].get(block_id, 1))
+            generations.append(gbm.get_block_generation(src_gpu, block_id))
         if not src_blocks:
             return None, "already_placed"
         return {
@@ -885,6 +1095,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             "hashes": hashes,
             "parent_hashes": parent_hashes,
             "access_counts": access_counts,
+            "generations": generations,
             "mode": "copy",
         }, ""
 
@@ -898,7 +1109,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         dst_gpu = int(candidates[0]["dst_gpu"])
         selected_keys = []
         rejected = []
-        block_metadata: dict[int, tuple[int, int, int]] = {}
+        block_metadata: dict[int, tuple[int, int, int, int]] = {}
         selected_candidates = []
         for candidate in candidates:
             transfer, reason = _build_background_transfer(candidate)
@@ -917,15 +1128,21 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 > background_copy_batch_max_blocks
             ):
                 continue
-            for block_id, block_hash, parent_hash, access_count in zip(
+            for block_id, block_hash, parent_hash, access_count, generation in zip(
                 transfer["src_blocks"],
                 transfer["hashes"],
                 transfer["parent_hashes"],
                 transfer["access_counts"],
+                transfer["generations"],
             ):
                 block_metadata.setdefault(
                     int(block_id),
-                    (int(block_hash), int(parent_hash), int(access_count)),
+                    (
+                        int(block_hash),
+                        int(parent_hash),
+                        int(access_count),
+                        int(generation),
+                    ),
                 )
             selected_keys.append(candidate_key)
             selected_candidates.append(candidate)
@@ -943,6 +1160,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         hashes = [block_metadata[block_id][0] for block_id in src_blocks]
         parent_hashes = [block_metadata[block_id][1] for block_id in src_blocks]
         access_counts = [block_metadata[block_id][2] for block_id in src_blocks]
+        generations = [block_metadata[block_id][3] for block_id in src_blocks]
         transfer_bytes = scheduler._estimate_transfer_bytes(len(src_blocks))
         transfer_cost_ms = scheduler._estimate_transfer_cost_ms(
             transfer_bytes,
@@ -986,6 +1204,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 "hashes": hashes,
                 "parent_hashes": parent_hashes,
                 "access_counts": access_counts,
+                "generations": generations,
                 "mode": "copy",
             }],
         }, rejected
@@ -1084,7 +1303,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             return
         while background_flush_waiters:
             waiter = background_flush_waiters.pop(0)
-            response_queues[waiter["reply_rank"]].put({
+            send_response(waiter["reply_rank"], {
                 "type": "background_copy_flush_response",
                 "request_id": waiter["request_id"],
                 "success": True,
@@ -1115,19 +1334,28 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         _service_background_placement(discover=True, trigger="route")
 
     def _route_from_placement_lease(msg: dict, prefix_hashes: list[int]) -> tuple[int, dict] | None:
-        """Bind copied prefixes to future requests while balancing pair load."""
+        """Stripe forecast reuse across the committed replica and its source."""
         matched_hash = next(
             (
                 block_hash
                 for block_hash in reversed(prefix_hashes)
-                if placement_leases.get(int(block_hash), {}).get("remaining", 0) > 0
+                if sum(
+                    placement_leases.get(int(block_hash), {}).get(key, 0)
+                    for key in ("target_remaining", "source_remaining")
+                ) > 0
             ),
             None,
         )
         if matched_hash is None:
             return None
         lease = placement_leases[int(matched_hash)]
-        target_gpu = int(lease["target_gpu"])
+        target_remaining = int(lease.get("target_remaining", 0))
+        source_remaining = int(lease.get("source_remaining", 0))
+        if target_remaining > 0 and source_remaining > 0:
+            use_replica = bool(lease.get("next_target", True))
+        else:
+            use_replica = target_remaining > 0
+        target_gpu = int(lease["target_gpu"] if use_replica else lease["src_gpu"])
         hit_summary = scheduler._lookup_contiguous_prefix(
             prefix_hashes,
             msg["requester_rank"],
@@ -1140,11 +1368,16 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         )
         if not gbm.can_allocate_effective(target_gpu, required_blocks, target_blocks):
             return None
-        lease["remaining"] -= 1
-        if lease["remaining"] <= 0:
+        quota_key = "target_remaining" if use_replica else "source_remaining"
+        lease[quota_key] -= 1
+        lease["next_target"] = not use_replica
+        if sum(lease.get(key, 0) for key in ("target_remaining", "source_remaining")) <= 0:
             placement_leases.pop(int(matched_hash), None)
         pair = tuple(lease["pair"])
-        _record_placement_stat("lease_routes", pair)
+        _record_placement_stat(
+            "lease_routes" if use_replica else "lease_source_routes",
+            pair,
+        )
         route_info = {
             "requester_rank": msg["requester_rank"],
             "seq_id": msg["seq_id"],
@@ -1153,7 +1386,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             "prefix_hash": matched_hash,
             "prefix_hashes": prefix_hashes,
             "prefix_hit": True,
-            "reason": "placement_lease",
+            "reason": "placement_lease" if use_replica else "placement_stripe_source",
             "target_rank": target_gpu,
             "hit_summary": hit_summary,
             "matched_prefix_blocks": len(target_blocks),
@@ -1168,7 +1401,8 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 {gpu_id: len(blocks) for gpu_id, blocks in hit_summary.items()},
                 hit_summary,
             ),
-            "placement_lease": True,
+            "placement_lease": use_replica,
+            "placement_stripe": True,
         }
         scheduler._annotate_target_capacity(
             route_info, target_gpu, required_blocks, target_blocks
@@ -1186,6 +1420,8 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 mark_worker_down(worker_rank)
 
     service_heartbeats(force=True)
+    for worker_rank in range(world_size):
+        request_full_state(worker_rank)
     while True:
         try:
             msg = request_queue.get(timeout=0.1)
@@ -1200,17 +1436,73 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             return
         if msg_type == "client_exit":
             continue
+        message_epoch = msg.get("control_epoch")
+        if (
+            msg_type not in {"heartbeat", "block_state"}
+            and message_epoch is not None
+            and message_epoch != control_epoch
+        ):
+            reply_rank = msg.get("reply_rank")
+            if reply_rank in response_queues and msg.get("request_id") is not None:
+                send_response(reply_rank, {
+                    "type": "error",
+                    "request_id": msg["request_id"],
+                    "error": "stale control-plane epoch",
+                    "reason": "stale_control_epoch",
+                })
+            worker_rank = msg.get("rank")
+            if isinstance(worker_rank, int) and worker_rank >= 0:
+                request_full_state(worker_rank)
+            continue
         if msg_type == "heartbeat":
             worker_rank = msg["rank"]
             worker_last_heartbeat[worker_rank] = time.monotonic()
-            if worker_rank in worker_down:
-                worker_down.discard(worker_rank)
-                logger.info("worker rank %s heartbeat recovered", worker_rank)
+            message_epoch = msg.get("control_epoch")
+            incoming_worker_epoch = msg.get("worker_epoch")
+            if message_epoch not in {None, control_epoch}:
+                request_full_state(worker_rank)
+                service_heartbeats()
+                continue
+            known_worker_epoch = worker_epochs.get(worker_rank)
+            if (
+                incoming_worker_epoch is not None
+                and known_worker_epoch is not None
+                and incoming_worker_epoch != known_worker_epoch
+            ):
+                gbm.mark_gpu_unavailable(worker_rank)
+                worker_down.add(worker_rank)
+                worker_epochs[worker_rank] = incoming_worker_epoch
+                worker_state_versions[worker_rank] = -1
+                request_full_state(worker_rank)
+            elif worker_rank in worker_down:
+                # A heartbeat proves liveness, not page-table freshness. Keep the
+                # worker unroutable until its full snapshot arrives.
+                request_full_state(worker_rank)
             service_heartbeats()
             continue
         if msg_type == "block_state":
+            worker_rank = int(msg["rank"])
+            message_epoch = msg.get("control_epoch")
+            if message_epoch not in {None, control_epoch}:
+                request_full_state(worker_rank)
+                service_heartbeats()
+                continue
+            incoming_worker_epoch = str(
+                msg.get("worker_epoch") or worker_epochs.get(worker_rank) or f"legacy-{worker_rank}"
+            )
+            known_worker_epoch = worker_epochs.get(worker_rank)
+            if known_worker_epoch != incoming_worker_epoch:
+                gbm.mark_gpu_unavailable(worker_rank)
+                worker_epochs[worker_rank] = incoming_worker_epoch
+                worker_state_versions[worker_rank] = -1
+            state_version = int(
+                msg.get("state_version", worker_state_versions.get(worker_rank, -1) + 1)
+            )
+            if state_version <= worker_state_versions.get(worker_rank, -1):
+                service_heartbeats()
+                continue
             gbm.update_gpu_state(
-                msg["rank"],
+                worker_rank,
                 msg["free_blocks"],
                 msg["block_hashes"],
                 msg.get("evictable_block_hashes"),
@@ -1221,7 +1513,14 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 msg.get("running_tokens", 0),
                 msg.get("block_parent_hashes"),
                 msg.get("block_access_stats"),
+                msg.get("block_generations"),
             )
+            worker_state_versions[worker_rank] = state_version
+            gbm.mark_gpu_available(worker_rank)
+            worker_last_heartbeat[worker_rank] = time.monotonic()
+            if worker_rank in worker_down:
+                worker_down.discard(worker_rank)
+                logger.info("worker rank %s recovered with a fresh block snapshot", worker_rank)
             # Worker snapshots update authoritative state, but candidate
             # discovery is ingress/route driven. Scanning every decode-step
             # snapshot previously produced tens of thousands of no-op scans.
@@ -1277,6 +1576,12 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             if plan is None:
                 service_heartbeats()
                 continue
+            phase = msg.get("phase", plan.get("phase", "execute"))
+            if phase != plan.get("phase"):
+                # Duplicate or delayed acknowledgements must not advance a newer
+                # phase of the same plan.
+                service_heartbeats()
+                continue
             result = msg.get("result")
             if isinstance(result, dict):
                 result_success = bool(result.get("success", False))
@@ -1299,11 +1604,12 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 result_error = "rebalance failed"
                 result_reason = "unknown"
             if not result_success:
-                prepared_ranks = set(plan.get("prepared_ranks", set()))
-                if prepared_ranks:
-                    _send_rebalance_abort(plan_id, plan["plan"], prepared_ranks)
+                if phase != "finalize":
+                    prepared_ranks = set(plan.get("prepared_ranks", set()))
+                    if prepared_ranks:
+                        _send_rebalance_abort(plan_id, plan["plan"], prepared_ranks)
                 if plan.get("reply_rank") is not None:
-                    response_queues[plan["reply_rank"]].put({
+                    send_response(plan["reply_rank"], {
                         "type": "rebalance_response",
                         "request_id": plan["request_id"],
                         "success": False,
@@ -1317,7 +1623,6 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 service_heartbeats()
                 continue
 
-            phase = msg.get("phase", plan.get("phase", "execute"))
             if phase == "prepare":
                 plan.setdefault("prepared_ranks", set()).add(msg["rank"])
             plan["pending_ranks"].discard(msg["rank"])
@@ -1326,9 +1631,23 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     plan["phase"] = "execute"
                     plan["pending_ranks"] = set(plan["execute_ranks"])
                     _send_rebalance_execute(plan_id, plan["plan"])
+                elif phase == "execute":
+                    # Execute only copies and registers hidden destination KV.
+                    # Publish every target before any source can be released.
+                    plan["phase"] = "publish"
+                    plan["pending_ranks"] = set(plan["execute_ranks"])
+                    _send_rebalance_publish(
+                        plan_id, plan["plan"], set(plan["execute_ranks"])
+                    )
+                elif phase == "publish":
+                    plan["phase"] = "finalize"
+                    plan["pending_ranks"] = set(plan["execute_ranks"])
+                    _send_rebalance_finalize(
+                        plan_id, plan["plan"], set(plan["execute_ranks"])
+                    )
                 else:
                     if plan.get("reply_rank") is not None:
-                        response_queues[plan["reply_rank"]].put({
+                        send_response(plan["reply_rank"], {
                             "type": "rebalance_response",
                             "request_id": plan["request_id"],
                             "success": True,
@@ -1494,7 +1813,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     int(msg["num_tokens"] + route_decode_token_weight * msg.get("max_tokens", 0)),
                     seq_id=msg["seq_id"],
                 )
-                response_queues[msg["reply_rank"]].put({
+                send_response(msg["reply_rank"], {
                     "type": "route_response",
                     "request_id": msg["request_id"],
                     "target_rank": target_rank,
@@ -1505,7 +1824,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 except Exception:
                     logger.exception("background transfer copy scheduling failed")
             except Exception as exc:
-                response_queues[msg["reply_rank"]].put({
+                send_response(msg["reply_rank"], {
                     "type": "error",
                     "request_id": msg["request_id"],
                     "error": str(exc),
@@ -1525,7 +1844,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     },
                 )
                 if plan is None:
-                    response_queues[msg["reply_rank"]].put({
+                    send_response(msg["reply_rank"], {
                         "type": "rebalance_response",
                         "request_id": msg["request_id"],
                         "success": False,
@@ -1535,7 +1854,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
 
                 if not _enqueue_rebalance_plan(plan, msg["request_id"], msg["reply_rank"]):
                     reason = plan.get("enqueue_fail_reason", "no_plan")
-                    response_queues[msg["reply_rank"]].put({
+                    send_response(msg["reply_rank"], {
                         "type": "rebalance_response",
                         "request_id": msg["request_id"],
                         "success": False,
@@ -1545,7 +1864,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     continue
                 # 先等待目标 rank 预留成功，再下发 execute，避免源端单边进入 NCCL send。
             except Exception as exc:
-                response_queues[msg["reply_rank"]].put({
+                send_response(msg["reply_rank"], {
                     "type": "error",
                     "request_id": msg["request_id"],
                     "error": str(exc),

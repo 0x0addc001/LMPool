@@ -105,13 +105,14 @@ def test_pack_and_unpack_all_layers_use_one_contiguous_payload():
 def _swap_worker(rank: int, world_size: int, port: int, result_queue):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://127.0.0.1:{port}",
         world_size=world_size,
         rank=rank,
+        device_id=torch.device(f"cuda:{rank}"),
     )
-    torch.cuda.set_device(rank)
     prewarm_p2p_pairs([(0, 1)])
 
     num_blocks = 4

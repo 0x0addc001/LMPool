@@ -29,24 +29,34 @@ The coverage is organized around the runtime structure:
   - memory-skew and two-phase session-handoff trace construction
   - common KV-budget and transfer-placement validation
 
+- `tests/test_benchmark_kv_routing.py`
+  - routing benchmark's independent argument surface
+  - exact shared KV-budget propagation
+  - routing-only transfer-path isolation
+
+- `tests/test_benchmark_kv_transfer.py`
+  - transfer block-count sweep parsing and validation
+  - machine-readable JSON export contract
+
 - `tests/test_control_plane.py`
   - control-plane routing
-  - rebalance request / response handling
-  - block-state ingestion
-  - control-plane client message flow
+  - idempotent prepare / execute / publish / finalize rebalance handling
+  - epoch-aware, versioned block-state ingestion and worker isolation
+  - concurrent control-plane client response demultiplexing
   - forecast placement, negative-cache, and replica-lease routing
 
 - `tests/test_data_plane.py`
   - worker process loop
   - sequence reception and forwarding
   - local scheduling and finished / idle reporting
+  - event-driven queue handling without unreliable `Queue.empty()` checks
 
 - `tests/test_global_block_manager.py`
   - global page table maintenance
   - prefix lookup
   - NVLink topology parsing
   - eviction candidate selection
-  - transfer bookkeeping
+  - transfer bookkeeping, block generations, and unavailable-rank filtering
 
 - `tests/test_global_scheduler.py`
   - route scoring
@@ -70,6 +80,7 @@ The coverage is organized around the runtime structure:
   - launcher / supervisor orchestration
   - prompt ingress
   - worker message collection
+  - serialized stepping and idempotent shutdown
 
 - `tests/test_model_runner.py`
   - KV cache allocation
@@ -83,6 +94,11 @@ The coverage is organized around the runtime structure:
   - decode scheduling
   - decode-headroom admission and preemption avoidance
   - local rebalance trigger path
+
+- `tests/test_block_manager.py`
+  - local allocation, prefix caching, and dependency-safe reclamation
+  - physical block generation checks against ABA reuse
+  - transfer source locking and commit-time target publication
 
 - `tests/test_sequence.py`
   - `Sequence` state and serialization

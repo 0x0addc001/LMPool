@@ -1,7 +1,9 @@
 import atexit
 import logging
 import socket
+import threading
 import time
+import uuid
 import torch.multiprocessing as mp
 from queue import Empty
 
@@ -49,6 +51,11 @@ class LLMEngine:
             f"tcp://127.0.0.1:{_find_free_port()}",
         )
         self._mp_ctx = mp.get_context("spawn")
+        self._lifecycle_lock = threading.RLock()
+        self._pump_lock = threading.Lock()
+        self._exiting = False
+        self._exited = False
+        self._control_epoch = None
 
         self.processes = []
         self.recv_queues = {}   # rank -> Queue，用于接收其他 rank 的消息
@@ -77,6 +84,7 @@ class LLMEngine:
                 self.control_plane_response_queues[-1],
                 heartbeat_interval=float(self.config.get("heartbeat_interval", 1.0)),
                 heartbeat_timeout=float(self.config.get("heartbeat_timeout", 3.0)),
+                control_epoch=self._control_epoch,
             )
 
         for i in range(self.world_size):
@@ -106,35 +114,46 @@ class LLMEngine:
     def _start_control_plane_process(self) -> None:
         if self.control_plane_request_queue is None:
             return
+        self._control_epoch = uuid.uuid4().hex
+        self.config["control_epoch"] = self._control_epoch
+        self.config["control_plane_recovery"] = self._control_plane_restart_count > 0
+        process_config = dict(self.config)
         self.control_plane_process_handle = self._mp_ctx.Process(
             target=control_plane_process,
-            args=(self.config, self.control_plane_request_queue, self.control_plane_response_queues),
+            args=(process_config, self.control_plane_request_queue, self.control_plane_response_queues),
         )
         self.control_plane_process_handle.start()
+        if self.control_plane_client is not None:
+            self.control_plane_client.reset_control_epoch(self._control_epoch)
         logger.info("control plane process started pid=%s", self.control_plane_process_handle.pid)
 
     def _ensure_control_plane_process(self) -> None:
-        if self.control_plane_request_queue is None:
-            return
-        if self.control_plane_process_handle is None:
+        with self._lifecycle_lock:
+            if self._exiting or self.control_plane_request_queue is None:
+                return
+            if self.control_plane_process_handle is None:
+                self._start_control_plane_process()
+                return
+            if self.control_plane_process_handle.is_alive():
+                return
+            exitcode = self.control_plane_process_handle.exitcode
+            logger.warning(
+                "control plane process exited with code %s; restarting",
+                exitcode,
+            )
+            try:
+                self.control_plane_process_handle.join(timeout=0)
+            except Exception:
+                pass
+            self._control_plane_restart_count += 1
             self._start_control_plane_process()
-            return
-        if self.control_plane_process_handle.is_alive():
-            return
-        exitcode = self.control_plane_process_handle.exitcode
-        logger.warning(
-            "control plane process exited with code %s; restarting",
-            exitcode,
-        )
-        try:
-            self.control_plane_process_handle.join(timeout=0)
-        except Exception:
-            pass
-        self._control_plane_restart_count += 1
-        self._start_control_plane_process()
 
 
     def exit(self):
+        with self._lifecycle_lock:
+            if self._exiting or self._exited:
+                return
+            self._exiting = True
         worker_join_timeout = float(self.config.get("worker_join_timeout", 30.0))
         for rank, q in self.send_queues.items():
             q.put({"type": "exit"})
@@ -152,6 +171,8 @@ class LLMEngine:
                 logger.warning("control plane process pid=%s did not exit in %.1fs; terminating", self.control_plane_process_handle.pid, worker_join_timeout)
                 self.control_plane_process_handle.terminate()
                 self.control_plane_process_handle.join(timeout=worker_join_timeout)
+        with self._lifecycle_lock:
+            self._exited = True
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling
@@ -201,11 +222,12 @@ class LLMEngine:
 
     def step(self) -> tuple[list[tuple[int, list[int]]], list[tuple[int, int]], list[dict], list[dict]]:
         """Pump worker messages once and return any newly finished sequences."""
-        self._ensure_control_plane_process()
-        finished, first_tokens, prefill_stats, runtime_stats = self._drain_worker_messages()
-        if not finished:
-            time.sleep(0.01)
-        return finished, first_tokens, prefill_stats, runtime_stats
+        with self._pump_lock:
+            self._ensure_control_plane_process()
+            finished, first_tokens, prefill_stats, runtime_stats = self._drain_worker_messages()
+            if not finished:
+                time.sleep(0.01)
+            return finished, first_tokens, prefill_stats, runtime_stats
 
 
     # add prompt string to the waiting queue by first transforming it to Sequence object
@@ -230,7 +252,7 @@ class LLMEngine:
         while len(generated_tokens) < expected_num_outputs:
             try:
                 self._ensure_control_plane_process()
-                outputs, _, _ = self.step()
+                outputs, _, _, _ = self.step()
             except Exception:
                 import traceback
                 logger.error("engine pump error")

@@ -12,10 +12,15 @@ from lmpool.engine.sequence import Sequence
 class Block:
     def __init__(self, block_id: int):
         self.block_id = block_id
+        # Identifies reuse of the same physical block ID. Transfer plans carry
+        # this value to prevent block-ID ABA from silently copying different KV.
+        self.generation = 0
         self.hash = -1 
         self.ref_count = 0
         self.token_ids = []
         self.kv_ready = False
+        self.transfer_locked = False
+        self.transfer_pending_publish = False
         self.parent_hash = -1
         self.prefix_depth = -1
         self.last_access_time = time.monotonic()
@@ -41,6 +46,8 @@ class Block:
         self.ref_count = 0
         self.token_ids = []
         self.kv_ready = False
+        self.transfer_locked = False
+        self.transfer_pending_publish = False
         self.parent_hash = -1
         self.prefix_depth = -1
         self.last_access_time = time.monotonic()
@@ -90,6 +97,7 @@ class BlockManager:
         block = self.blocks[block_id]
         assert block.ref_count == 0, "Block is already allocated"
         block.reset()
+        block.generation += 1
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return block
@@ -129,7 +137,7 @@ class BlockManager:
 
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h)
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1:
+            if block_id == -1 or self.blocks[block_id].transfer_locked:
                 required += 1
                 continue
 
@@ -163,6 +171,7 @@ class BlockManager:
                 if (
                     block_id not in protected
                     and self.blocks[block_id].ref_count == 0
+                    and not self.blocks[block_id].transfer_locked
                     and self.blocks[block_id].hash not in parent_hashes
                 )
             ]
@@ -204,7 +213,7 @@ class BlockManager:
                 break
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h)
             block_id = self.hash_to_block_id.get(h)
-            if block_id is not None:
+            if block_id is not None and not self.blocks[block_id].transfer_locked:
                 protected.add(block_id)
         return self.reclaim_cached_blocks(shortage, protected)
 
@@ -216,7 +225,7 @@ class BlockManager:
             if block_id is None:
                 continue
             block = self.blocks[block_id]
-            if block.kv_ready and block.ref_count == 0:
+            if block.kv_ready and block.ref_count == 0 and not block.transfer_locked:
                 resolved.add(block_id)
         return resolved
 
@@ -232,6 +241,8 @@ class BlockManager:
             parent_hash = h
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
+            if block_id != -1 and self.blocks[block_id].transfer_locked:
+                block_id = -1
             
             # if cache miss or hash collision
             if block_id == -1:
@@ -526,6 +537,46 @@ class BlockManager:
             reserved.append(block_id)
         return reserved
 
+    def lock_transfer_blocks(self, block_ids: list[int]) -> None:
+        """Prevent local reuse or reclamation while a transfer plan is active."""
+        for block_id in block_ids:
+            if block_id not in self.used_block_ids:
+                raise RuntimeError(f"Cannot lock block {block_id}: block is not allocated")
+            self.blocks[block_id].transfer_locked = True
+
+    def unlock_transfer_blocks(self, block_ids: list[int]) -> None:
+        """Release source-side transfer locks without changing KV ownership."""
+        for block_id in block_ids:
+            if block_id in self.used_block_ids:
+                self.blocks[block_id].transfer_locked = False
+
+    def validate_transfer_blocks(
+        self,
+        block_ids: list[int],
+        hashes: list[int],
+        generations: list[int],
+    ) -> tuple[bool, str]:
+        """Validate immutable source identities captured by the control plane."""
+        if not (len(block_ids) == len(hashes) == len(generations)):
+            return False, "transfer metadata length mismatch"
+        for block_id, expected_hash, expected_generation in zip(
+            block_ids, hashes, generations
+        ):
+            if block_id not in self.used_block_ids:
+                return False, f"block {block_id} is no longer allocated"
+            block = self.blocks[block_id]
+            if block.generation != int(expected_generation):
+                return False, (
+                    f"block {block_id} generation changed: "
+                    f"expected {expected_generation}, found {block.generation}"
+                )
+            if not block.kv_ready or block.hash != int(expected_hash):
+                return False, (
+                    f"block {block_id} identity changed: expected hash "
+                    f"{expected_hash}, found {block.hash}, kv_ready={block.kv_ready}"
+                )
+        return True, ""
+
     def release_blocks(self, block_ids: list[int]) -> None:
         """
         释放指定块回空闲池。
@@ -557,6 +608,7 @@ class BlockManager:
         hashes: list[int],
         parent_hashes: list[int] | None = None,
         access_counts: list[int] | None = None,
+        publish: bool = True,
     ) -> None:
         """
         将已接收的 transfer-in 块登记到本地 hash 表。
@@ -584,8 +636,23 @@ class BlockManager:
             # transfer-in blocks already contain valid KV data but do not carry
             # original token ids. Treat token_ids=None as a trusted hash match.
             block.token_ids = None
-            if h != -1:
+            block.transfer_pending_publish = not publish
+            block.transfer_locked = not publish
+            if publish and h != -1:
                 self.hash_to_block_id[h] = block_id
+
+    def publish_transfer_blocks(self, block_ids: list[int]) -> None:
+        """Expose received KV blocks only after the control plane commits."""
+        for block_id in block_ids:
+            if block_id not in self.used_block_ids:
+                raise RuntimeError(f"Cannot publish block {block_id}: block is not allocated")
+            block = self.blocks[block_id]
+            if not block.kv_ready:
+                raise RuntimeError(f"Cannot publish block {block_id}: KV is not ready")
+            block.transfer_pending_publish = False
+            block.transfer_locked = False
+            if block.hash != -1:
+                self.hash_to_block_id[block.hash] = block_id
 
     def mark_kv_ready(self, seqs: list[Sequence]) -> None:
         """Publish complete block hashes only after model execution wrote KV."""
@@ -608,7 +675,15 @@ class BlockManager:
         return {
             bid: self.blocks[bid].hash
             for bid in self.used_block_ids
-            if self.blocks[bid].kv_ready
+            if self.blocks[bid].kv_ready and not self.blocks[bid].transfer_pending_publish
+        }
+
+    def get_local_block_generations(self) -> dict[int, int]:
+        """Return generations for ready blocks included in the local snapshot."""
+        return {
+            bid: self.blocks[bid].generation
+            for bid in self.used_block_ids
+            if self.blocks[bid].kv_ready and not self.blocks[bid].transfer_pending_publish
         }
 
     def get_local_block_parent_hashes(self) -> dict[int, int]:
@@ -616,7 +691,7 @@ class BlockManager:
         return {
             bid: self.blocks[bid].parent_hash
             for bid in self.used_block_ids
-            if self.blocks[bid].kv_ready
+            if self.blocks[bid].kv_ready and not self.blocks[bid].transfer_pending_publish
         }
 
     def get_local_block_access_stats(self) -> dict[int, dict[str, float | int]]:
@@ -627,7 +702,7 @@ class BlockManager:
                 "access_count": self.blocks[bid].access_count,
             }
             for bid in self.used_block_ids
-            if self.blocks[bid].kv_ready
+            if self.blocks[bid].kv_ready and not self.blocks[bid].transfer_pending_publish
         }
 
     def get_evictable_block_hashes(self) -> dict[int, int]:
@@ -648,6 +723,8 @@ class BlockManager:
             if (
                 self.blocks[bid].ref_count == 0
                 and self.blocks[bid].kv_ready
+                and not self.blocks[bid].transfer_locked
+                and not self.blocks[bid].transfer_pending_publish
                 and self.blocks[bid].hash not in ready_parent_hashes
             )
         }
@@ -657,7 +734,11 @@ class BlockManager:
         return {
             bid: self.blocks[bid].hash
             for bid in self.used_block_ids
-            if self.blocks[bid].ref_count > 0 and self.blocks[bid].kv_ready
+            if (
+                self.blocks[bid].kv_ready
+                and not self.blocks[bid].transfer_pending_publish
+                and (self.blocks[bid].ref_count > 0 or self.blocks[bid].transfer_locked)
+            )
         }
 
     def sync_with_global(self):

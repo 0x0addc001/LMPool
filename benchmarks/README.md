@@ -1,14 +1,27 @@
 # Benchmarks
 
-`benchmark_e2e.py` runs an online shared-prefix workload across the current LMPool engine stack. It compares five configurations in one horizontal summary table and can export the same results as JSON and a PNG figure.
+The directory contains three publishable benchmark entries. Each answers one
+specific evaluation question and is a complete executable script rather than a
+compatibility wrapper:
 
-Canonical entries:
+- `benchmark_kv_routing.py`: does global KV-aware routing improve locality,
+  throughput, and request latency over topology-blind multi-GPU dispatch? It
+  runs only `single-gpu`, `multi-gpu`, and `multi-gpu-kv-routing`, with every
+  transfer path disabled.
+- `benchmark_kv_transfer.py`: does the NCCL/NVLink data path move the configured
+  KV payload correctly and at competitive latency/bandwidth? It contains no
+  model serving or routing work.
+- `benchmark_e2e.py`: does full LMPool outperform the routing-only and
+  transfer-only ablations in the controlled session-handoff workload? It runs
+  all five system configurations and reports warm-up and reuse phases
+  separately.
 
-- `benchmark_e2e.py`: full end-to-end comparison.
-- `benchmark_kv_routing.py`: routing-focused comparison.
-- `benchmark_kv_transfer.py`: direct KV transfer microbenchmark.
+The old `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py` names were
+removed. Keeping duplicate entry names made the artifact ambiguous without
+adding an independent experimental claim.
 
-Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py` are kept for older commands.
+The complete six-GPU paper command matrix, environment capture, acceptance
+criteria, and test commands are in [`PAPER_RUNBOOK.md`](./PAPER_RUNBOOK.md).
 
 ## Scenarios
 
@@ -73,8 +86,9 @@ Compatibility entries `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py
   in the final reuse phase of `memory-skew` or `session-handoff`; other
   workloads report zero.
 - `lease route`: requests routed to a committed replica through a forecast-bound
-  placement lease. A completed handoff keeps the forecast reuse batch on the
-  replica instead of splitting each prefix between source and target.
+  placement lease. A completed handoff assigns half of each prefix's forecast
+  demand to each valid copy; odd remainders alternate across adjacent prefixes
+  so both sides of the NVLink pair serve reuse from the first submit window.
 - `place cand` / `place done`: accepted and completed prefix candidates.
   `plan run` / `plan done` count actual pair-level protocol transactions; one
   plan can contain several candidates and one contiguous KV payload.
@@ -97,30 +111,44 @@ recently.
 - `no plan`: rebalance failures where the control plane could not build an executable plan.
 - `bg space`: background copy failures caused by the target rank not having enough free blocks during prepare.
 
-## Example
+## Routing Experiment
 
 If physical GPU 0 and 2 are NVLink-connected, expose them as two logical devices and pass the logical pair `0,1`:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_e2e.py \
-  --num-prompts 32 \
-  --prompt-repeat 10 \
-  --max-tokens 16 \
+CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_kv_routing.py \
+  --world-size 2 \
+  --num-prompts 128 \
+  --prompt-repeat 16 \
+  --max-tokens 64 \
   --temperature 0.6 \
   --ignore-eos \
   --seed 0 \
-  --repetitions 3 \
+  --repetitions 5 \
   --locality-prefix-groups 16 \
-  --output-json /tmp/shared_prefix_benchmark.json \
   --nvlink-pairs 0,1 \
-  --kv-block-budget 64 \
-  --gpu-memory-utilization 0.20 \
-  --submit-window 4 \
+  --kv-block-budget 128 \
+  --gpu-memory-utilization 0.5 \
+  --submit-window 16 \
   --goodput-e2e-sla-ms 120000 \
-  --output-figure /tmp/shared_prefix_benchmark.png
+  --output-json /tmp/routing.json \
+  --output-figure /tmp/routing.png
 ```
 
-The script prints `saved json: ...` and `saved figure: ...` after successful export. Parent directories are created automatically.
+This experiment supports the routing claim only if routing-only improves
+throughput or latency while increasing data-plane token reuse over multi-GPU.
+Transfer counters must remain zero.
+
+## End-to-End Experiment
+
+Use `benchmark_e2e.py --workload session-handoff` for the five-configuration
+system comparison. Set `--handoff-warmup-prompts` equal to
+`--handoff-prefix-groups` so one cache-building round is followed by multiple
+reuse rounds. LMPool must exceed both routing-only and transfer-only; otherwise
+the result supports the individual mechanisms but not their composition.
+
+All scripts print `saved json: ...` and `saved figure: ...` after successful
+export. Parent directories are created automatically.
 
 ## Parameters
 
@@ -149,8 +177,8 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
   topology-aware policy decisions.
   Per-rank JSON diagnostics expose `warmup_submitted`, `pressure_submitted`,
   and `reuse_submitted` so placement fairness can be checked directly.
-  `session-handoff` uses equal warm-up and reuse phases: prefixes are built only
-  on source ranks, then the same sessions continue on their NVLink partners.
+  `session-handoff` builds prefixes only on source ranks, then continues the
+  same sessions on their NVLink partners. Its warm-up/reuse ratio is explicit.
   Use it to isolate copy benefit; use `memory-skew` for capacity pressure.
 - `--locality-prefix-groups`: number of distinct long shared-prefix groups in
   the `locality` workload (default `16`). Requests are balanced across groups
@@ -164,9 +192,13 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
   on one source rank; the reuse phase interleaves groups so round-robin cannot
   saturate its cache after one miss to a single global hotspot.
 - `--handoff-prefix-groups`: independent session prefixes shared by the two
-  `session-handoff` phases. `0` selects up to `32`; the maximum is half of
-  `--num-prompts`. A value equal to half the requests removes destination
+  `session-handoff` phases. `0` selects up to `32`; the maximum must fit both
+  phases. A value equal to the warm-up request count removes destination
   self-warmup from the baseline.
+- `--handoff-warmup-prompts`: requests used to build source-side KV before the
+  handoff. `0` preserves the original 50/50 split. Set it to the prefix-group
+  count to measure several reuse rounds after one cache-building round, e.g.
+  `32` warm-up and `96` reuse requests for `--num-prompts 128`.
 - `--output-json`: write raw scenario results to JSON. Parent directories are created automatically, and the script prints `saved json: ...` on success.
 - `--model-name-or-path`: model name or local model path. The default config targets `Qwen/Qwen3-0.6B`.
 - `--nvlink-pairs`: logical NVLink pairs after `CUDA_VISIBLE_DEVICES` remapping, e.g. `0,1` or `0,1;2,3`. Quote values containing semicolons, e.g. `--nvlink-pairs "0,2;1,3;4,5;6,7"`. Pass an empty string to let the engine try `nvidia-smi topo -m` detection.
@@ -174,9 +206,7 @@ The script prints `saved json: ...` and `saved figure: ...` after successful exp
 - `--kv-block-budget`: requested per-rank KV block count used by all five
   scenarios. When explicitly set, the benchmark verifies every worker realizes
   this capacity before submitting requests and fails instead of silently
-  shrinking it. The hidden legacy options `--routing-max-cached-blocks` and
-  `--eviction-max-cached-blocks` are accepted only when they resolve to the same
-  value.
+  shrinking it.
 - `--gpu-memory-utilization`: fraction of currently free HBM used when deriving
   physical KV capacity, default `0.20`. Actual allocation remains capped by
   `--kv-block-budget`; increase this only when the requested budget cannot be
@@ -222,8 +252,9 @@ block-ID negotiation, and idle workers wake directly for control-plane transfer
 commands instead of waiting for the ingress queue timeout.
 Completed uncached-prefill batches update a per-rank recomputation-cost EWMA.
 A completed proactive replica creates a forecast-bound placement lease so the
-known reuse batch consumes the copied KV instead of leaving an unused page-table
-entry or being fragmented back across the warmup source.
+known reuse batch consumes the copied KV. The fixed replica quota covers half
+of forecast demand and an explicit source quota covers the other half, keeping
+both ranks active without leaving the replica unused.
 The transfer diagnostics report `spill` for direct owner-to-partner routing,
 plus candidate-level `place q` / `place cand` / `place done` and transaction-level
 `plan run` / `plan done` for proactive placement lifecycle.
@@ -232,7 +263,7 @@ routing no longer keeps a request on an overloaded owner while waiting for a
 future copy. Actual replica completion remains visible through
 `background_copy_success` and transferred block counts.
 
-Routing cost-model defaults are set in `MODEL_CONFIG` inside `shared_prefix_benchmark.py`:
+Routing cost-model defaults are set in `MODEL_CONFIG` inside `benchmark_e2e.py`:
 
 - `route_load_weight`: multiplier for token-aware load in the route score.
 - `route_waiting_token_weight`: weight for queued prefill tokens.
@@ -317,9 +348,13 @@ CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benc
   --block-size 256 \
   --num-kv-heads 8 \
   --head-dim 128 \
-  --num-transfer-blocks 2 \
-  --iterations 5 \
-  --warmup 1
+  --block-counts 1,2,4,8 \
+  --iterations 100 \
+  --warmup 20 \
+  --output-json benchmarks/results/kv_transfer.json \
+  --output-figure benchmarks/results/kv_transfer.png
 ```
 
-It reports mean / p95 transfer latency, transferred bytes per iteration, effective GiB/s, and data validation status. This benchmark isolates transfer from routing and model execution.
+It reports mean / p95 transfer latency, transferred bytes per iteration,
+effective GiB/s, and data validation status for every payload size. This
+benchmark isolates transfer from routing and model execution.

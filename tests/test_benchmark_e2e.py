@@ -3,13 +3,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.shared_prefix_benchmark import (
+from benchmarks.benchmark_e2e import (
+    MODEL_CONFIG,
     build_prompts,
     compute_sequence_prefix_hashes,
     measure_single_gpu_prefix_hit_rate,
     prepare_benchmark_rendezvous,
     resolve_memory_skew_prefix_groups,
     resolve_handoff_prefix_groups,
+    resolve_handoff_warmup_prompts,
     resolve_memory_skew_source_ranks,
     resolve_memory_skew_target_by_source,
     resolve_kv_block_budget,
@@ -134,13 +136,39 @@ def test_session_handoff_repeats_the_same_groups_in_two_equal_phases():
     assert groups[6:] == expected
 
 
+def test_session_handoff_supports_short_warmup_and_long_reuse_phase():
+    prompts = build_prompts(
+        IdentityChatTokenizer(),
+        num_prompts=12,
+        prompt_repeat=2,
+        workload="session-handoff",
+        handoff_prefix_groups=3,
+        handoff_warmup_prompts=3,
+    )
+
+    groups = [_prefix_group(prompt) for prompt in prompts]
+    expected = [f"handoff-{group:04d}" for group in range(3)]
+    assert groups[:3] == expected
+    assert groups[3:] == expected * 3
+
+
 def test_handoff_prefix_groups_fit_one_phase():
     assert resolve_handoff_prefix_groups(128, 0) == 32
     assert resolve_handoff_prefix_groups(128, 64) == 64
+    assert resolve_handoff_prefix_groups(128, 32, 32) == 32
     with pytest.raises(ValueError):
         resolve_handoff_prefix_groups(128, 65)
     with pytest.raises(ValueError):
+        resolve_handoff_prefix_groups(128, 33, 32)
+    with pytest.raises(ValueError):
         resolve_handoff_prefix_groups(127, 32)
+
+
+def test_handoff_warmup_prompts_default_to_half_or_accept_explicit_ratio():
+    assert resolve_handoff_warmup_prompts(128, 0) == 64
+    assert resolve_handoff_warmup_prompts(128, 32) == 32
+    with pytest.raises(ValueError):
+        resolve_handoff_warmup_prompts(128, 128)
 
 
 def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
@@ -208,22 +236,20 @@ def test_theoretical_prefix_measurement_is_not_limited_by_runtime_budget():
     assert hit_rate == 0.5
 
 
-def test_kv_block_budget_accepts_equal_legacy_values():
-    args = SimpleNamespace(
-        kv_block_budget=64,
-        routing_max_cached_blocks=64,
-        eviction_max_cached_blocks=64,
-    )
+def test_kv_block_budget_accepts_explicit_value():
+    args = SimpleNamespace(kv_block_budget=64)
 
     assert resolve_kv_block_budget(args) == 64
 
 
-def test_kv_block_budget_rejects_unfair_scenario_limits():
-    args = SimpleNamespace(
-        kv_block_budget=None,
-        routing_max_cached_blocks=1024,
-        eviction_max_cached_blocks=64,
-    )
+def test_kv_block_budget_uses_common_default():
+    args = SimpleNamespace(kv_block_budget=None)
 
-    with pytest.raises(ValueError, match="must be equal"):
+    assert resolve_kv_block_budget(args) == MODEL_CONFIG["max_cached_blocks"]
+
+
+def test_kv_block_budget_rejects_non_positive_value():
+    args = SimpleNamespace(kv_block_budget=0)
+
+    with pytest.raises(ValueError, match="must be >= 1"):
         resolve_kv_block_budget(args)

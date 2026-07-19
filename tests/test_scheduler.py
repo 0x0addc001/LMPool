@@ -21,6 +21,42 @@ class DummyGlobalScheduler:
         return self.rebalance_result
 
 
+class ReportingGlobalScheduler:
+    def __init__(self):
+        self.gbm = None
+        self.block_manager = None
+        self.snapshots = []
+
+    def report_block_state(self, *args):
+        self.snapshots.append(args)
+
+
+def test_data_plane_can_defer_per_sequence_global_state_sync():
+    reporter = ReportingGlobalScheduler()
+    scheduler = Scheduler(
+        max_num_sequences=4,
+        max_num_batched_tokens=16,
+        max_cached_blocks=4,
+        block_size=2,
+        eos=999,
+        global_scheduler=reporter,
+    )
+    scheduler.auto_sync_global_state = False
+    scheduler.add_sequence(Sequence([1, 2, 3, 4], block_size=2))
+
+    scheduled, is_prefill = scheduler.schedule()
+
+    assert is_prefill is True
+    assert len(scheduled) == 1
+    assert scheduler.local_state_dirty is True
+    assert reporter.snapshots == []
+
+    scheduler.auto_sync_global_state = True
+    scheduler._sync_local_state_to_global()
+    assert len(reporter.snapshots) == 1
+    assert scheduler.local_state_dirty is False
+
+
 def test_prefill_routes_remote_sequences_without_local_allocation():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     dummy = DummyGlobalScheduler(gbm)

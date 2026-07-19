@@ -74,6 +74,11 @@ class FakeScheduler:
             self.block_manager.deallocate(seq)
 
 
+class NoEmptyQueue(queue.Queue):
+    def empty(self):
+        raise AssertionError("data plane must not use multiprocessing.Queue.empty()")
+
+
 def _run_data_plane(result_queue, config, rank, recv_queue, send_queue):
     data_plane_module.ModelRunner = FakeModelRunner
     data_plane_module.Scheduler = FakeScheduler
@@ -90,7 +95,7 @@ def _run_data_plane(result_queue, config, rank, recv_queue, send_queue):
 
 
 def test_data_plane_process_handles_sequence_and_exit():
-    recv_queue = queue.Queue()
+    recv_queue = NoEmptyQueue()
     send_queue = queue.Queue()
     result_queue = queue.Queue()
     config = {

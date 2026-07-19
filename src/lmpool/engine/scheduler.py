@@ -42,6 +42,11 @@ class Scheduler:
         self.preserve_cache_via_transfer = False
         self.foreground_transfer_min_blocks = 1
         self.preemption_count = 0
+        # Standalone schedulers publish mutations directly. DataPlaneProcess
+        # disables this and owns one authoritative snapshot per model batch,
+        # avoiding one full page-table message per sequence/token mutation.
+        self.auto_sync_global_state = True
+        self.local_state_dirty = False
 
         # --------------------------------------------- #
         # 全局调度器接口
@@ -106,6 +111,9 @@ class Scheduler:
     def _sync_local_state_to_global(self):
         if self.global_scheduler is None:
             return
+        self.local_state_dirty = True
+        if not self.auto_sync_global_state:
+            return
         if hasattr(self.global_scheduler, "report_block_state"):
             self.global_scheduler.report_block_state(
                 len(self.block_manager.free_block_ids),
@@ -119,6 +127,7 @@ class Scheduler:
                 self.block_manager.get_local_block_parent_hashes(),
                 self.block_manager.get_local_block_access_stats(),
             )
+            self.local_state_dirty = False
             return
         gbm = self.global_scheduler.gbm
         if gbm is None or not gbm.is_master:
@@ -129,6 +138,7 @@ class Scheduler:
             self.block_manager.get_local_block_hashes(),
             block_access_stats=self.block_manager.get_local_block_access_stats(),
         )
+        self.local_state_dirty = False
 
 
     def schedule(self) -> tuple[list[Sequence], bool]:

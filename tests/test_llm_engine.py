@@ -83,3 +83,4 @@ def test_llm_engine_add_prompt_and_drain_messages(monkeypatch):
     assert forwarded["type"] == "sequence"
 
     engine.exit()
+    engine.exit()

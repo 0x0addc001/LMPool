@@ -734,11 +734,24 @@ class GlobalScheduler:
 
     def _candidate_gpus(self, my_rank: int) -> List[int]:
         if my_rank < 0:
-            return list(range(self.gbm.world_size))
-        candidates = [my_rank]
+            candidates = [
+                gpu_id
+                for gpu_id in range(self.gbm.world_size)
+                if self.gbm.is_gpu_available(gpu_id)
+            ]
+            if not candidates:
+                raise RuntimeError("no healthy GPU is available for routing")
+            return candidates
+        candidates = [my_rank] if self.gbm.is_gpu_available(my_rank) else []
         partner = self.gbm._get_nvlink_partner(my_rank)
-        if partner is not None and partner != my_rank:
+        if (
+            partner is not None
+            and partner != my_rank
+            and self.gbm.is_gpu_available(partner)
+        ):
             candidates.append(partner)
+        if not candidates:
+            raise RuntimeError("no healthy GPU is available for routing")
         return candidates
 
     def _select_best_candidate(
@@ -849,11 +862,13 @@ class GlobalScheduler:
             hashes = []
             parent_hashes = []
             access_counts = []
+            generations = []
             for block_id in blocks:
                 block_hash = self.gbm.get_block_hash(gpu_id, block_id)
                 hashes.append(block_hash if block_hash is not None else -1)
                 parent_hashes.append(self.gbm.get_block_parent_hash(gpu_id, block_id))
                 access_counts.append(self.gbm.block_access_count[gpu_id].get(block_id, 1))
+                generations.append(self.gbm.get_block_generation(gpu_id, block_id))
             transfers.append({
                 "src_gpu": gpu_id,
                 "dst_gpu": target_gpu,
@@ -861,9 +876,24 @@ class GlobalScheduler:
                 "hashes": hashes,
                 "parent_hashes": parent_hashes,
                 "access_counts": access_counts,
+                "generations": generations,
                 "mode": "chain_move" if mode == "move" else mode,
                 "release_source_blocks": (
                     list(release_blocks) if target_gpu == release_target else []
+                ),
+                "release_source_hashes": (
+                    [
+                        self.gbm.get_block_hash(gpu_id, block_id)
+                        for block_id in release_blocks
+                    ]
+                    if target_gpu == release_target else []
+                ),
+                "release_source_generations": (
+                    [
+                        self.gbm.get_block_generation(gpu_id, block_id)
+                        for block_id in release_blocks
+                    ]
+                    if target_gpu == release_target else []
                 ),
             })
 

@@ -62,7 +62,9 @@ Each worker owns a local `Scheduler`, `BlockManager`, and `ModelRunner`. The con
 4. `LLMEngine` forwards the `Sequence` to the chosen worker.
 5. The worker runs prefill / decode locally through `Scheduler` and `ModelRunner`.
 6. If memory pressure appears, the worker requests rebalance from the control plane.
-7. The control plane dispatches a transfer plan and workers execute NCCL transfer.
+7. The control plane dispatches a
+   `prepare -> execute -> publish -> finalize` transfer plan; workers retain
+   the source until every destination has published valid KV.
 
 ---
 
@@ -76,7 +78,7 @@ Each worker owns a local `Scheduler`, `BlockManager`, and `ModelRunner`. The con
 - `src/lmpool/engine/global_scheduler.py`
 - `src/lmpool/engine/global_block_manager.py`
 
-The control plane receives route and rebalance requests, updates the global page table, tracks worker heartbeats, and returns decisions to the launcher and workers.
+The control plane receives route and rebalance requests, updates the global page table, tracks worker heartbeats, and returns decisions to the launcher and workers. A control epoch rejects replies from an obsolete control process, while per-worker epochs and monotonic snapshot versions reject stale worker state. A timed-out worker is removed from routing and page-table lookup until it publishes a fresh full snapshot.
 
 ### 4.2 Data Plane
 
@@ -140,9 +142,13 @@ Topology weights in the current routing policy are:
 - per-sequence optimistic block reservations for routed but uncommitted requests
 - per-block access frequency and recency for LFU-first, LRU-second selection
 - `block_hash`: per-GPU block hash snapshot
+- `block_generation`: physical block reuse generation used to reject stale
+  transfer plans that refer to a recycled block id
 - `block_parent_hash`: parent links used to preserve valid prefix chains during eviction
 
-The authoritative state lives in the control plane process. Workers report local snapshots back through block-state messages.
+The authoritative state lives in the control plane process. Workers report
+versioned local snapshots back through block-state messages. Control restart
+requests a full snapshot from every worker before that rank becomes routable.
 
 ### 4.6 Local Scheduler
 
@@ -187,6 +193,17 @@ leaves first and recency breaks ties.
 Implements block migration with NCCL `send` / `recv`. Blocks remain the placement
 unit, while every layer and all K/V blocks in one plan are packed into one
 contiguous P2P payload and sent with one blocking P2P operation.
+
+Transfer uses an idempotent four-stage protocol. `prepare` validates the
+source hash and physical-block generation, locks the source against local
+reclamation, and reserves target blocks. `execute` copies KV into target blocks
+that remain hidden from local/global prefix lookup. `publish` exposes every
+valid target while all sources remain locked. Only after all publish ACKs does
+`finalize` release source blocks for move-style plans and report the new page
+table; `abort` unlocks the source and drops hidden reservations. These locks
+cover transfer state transitions only and are not acquired by model forward or
+decode. A control-process epoch change aborts unfinished local plans before the
+worker publishes its recovery snapshot.
 
 ### 4.10 Sequence
 
@@ -257,7 +274,16 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 ## 8. [Benchmarks](./benchmarks/)
 
-The `benchmarks/` directory includes a shared-prefix workload benchmark with the following scenarios:
+The `benchmarks/` directory exposes three paper-oriented executable entries:
+
+- `benchmark_kv_routing.py`: locality/routing-only ablation
+- `benchmark_kv_transfer.py`: isolated NCCL/NVLink KV data path
+- `benchmark_e2e.py`: five-configuration session-handoff comparison
+
+Use the reproducible command matrix in
+[`benchmarks/PAPER_RUNBOOK.md`](./benchmarks/PAPER_RUNBOOK.md) for paper runs.
+
+The end-to-end script reports the following scenarios:
 
 - `single-gpu`
 - `multi-gpu`
@@ -290,18 +316,19 @@ transfer plans, hot-prefix transfer ratio, and reuse-phase request/token hits. T
 attempted foreground transfer from one that actually relieves capacity and
 preserves reusable KV. It also reports actual bytes, source-side transfer time,
 effective GiB/s, predicted transfer cost, and predicted saved prefill time.
-For an isolated transfer result, `session-handoff` uses equal warm-up and reuse
-phases: prefixes are built only on the source side and the same sessions then
-continue on its NVLink partner. `--handoff-prefix-groups` controls how many
-independent sessions cross the pair, preventing the baseline from self-warming
-the destination before the measured handoff.
+For an isolated transfer result, `session-handoff` builds prefixes only on the
+source side and then continues the same sessions across the NVLink pair.
+`--handoff-prefix-groups` controls how many independent sessions cross the pair.
+`--handoff-warmup-prompts` controls the cache-building phase length; setting it
+to the prefix-group count leaves the remaining requests for repeated reuse,
+instead of allowing a 50/50 warm-up phase to dilute the measured benefit.
 Workers report per-block access frequency and recency to the control plane.
 The control plane derives maximal hot prefix chains from these snapshots and
 keeps a persistent candidate queue per NVLink pair. Ingress supplies counts of
 not-yet-submitted prefix demand at a workload phase boundary; candidates are
 coalesced by directed NVLink pair into bounded batches and dispatched only
-while both ranks have low queue pressure. One batch uses one prepare/execute
-transaction and one contiguous KV payload. The phase waits for accepted
+while both ranks have low queue pressure. One batch uses one
+prepare/execute/publish/finalize transaction and one contiguous KV payload. The phase waits for accepted
 placement plans, and that wait remains
 inside serving elapsed time. This makes background transfer proactive rather
 than waiting for a reuse request to trigger a late copy.
@@ -314,9 +341,11 @@ dispatch-to-commit latency into the pair-specific transfer cost model.
 Workers additionally feed completed uncached-prefill time into a per-rank EWMA,
 so placement admission compares observed recomputation cost against the same
 all-layer transport protocol used during startup calibration. A completed
-replica creates a forecast-bound placement lease. Because the source already
-served the drained warm-up phase, all forecast reuse requests remain on the
-replica unless it lacks KV capacity; this preserves a target-side decode batch.
+replica creates a forecast-bound placement lease. The lease assigns half of
+the forecast reuse demand to each valid copy; odd remainders alternate between
+source and replica across adjacent prefixes. Matching requests consume these
+explicit quotas. This preserves prefix reuse while allowing both GPUs in each
+NVLink pair to execute the reuse phase instead of serializing it on either side.
 Admission counts only the first avoidable target cold miss when no eviction is
 predicted, rather than multiplying the same saving by every future reuse.
 Each configured NVLink pair uses a dedicated NCCL process group, and a prepared

@@ -84,6 +84,7 @@ class ModelRunner:
             world_size=config['world_size'],
             rank=rank,
             timeout=timedelta(seconds=float(config.get("distributed_timeout_s", 1800.0))),
+            device_id=torch.device(f"cuda:{rank}"),
         )
 
         # ----------------------------------------------- #

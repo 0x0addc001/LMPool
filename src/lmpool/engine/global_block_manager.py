@@ -156,6 +156,7 @@ class GlobalBlockManager:
         self.block_access_count: List[Dict[int, int]] = [{} for _ in range(world_size)]
         # 每 GPU 的块 hash 记录：gpu_id -> {block_id: hash}
         self.block_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
+        self.block_generation: List[Dict[int, int]] = [{} for _ in range(world_size)]
         self.block_parent_hash: List[Dict[int, int]] = [{} for _ in range(world_size)]
         self.pinned_block_ids: List[set[int]] = [set() for _ in range(world_size)]
         self.transfer_inflight_block_ids: List[set[int]] = [set() for _ in range(world_size)]
@@ -174,6 +175,7 @@ class GlobalBlockManager:
         self.pending_route_protected_blocks: List[Dict[int, set[int]]] = [
             {} for _ in range(world_size)
         ]
+        self.available_gpus: set[int] = set(range(world_size))
 
     @property
     def is_master(self) -> bool:
@@ -192,6 +194,7 @@ class GlobalBlockManager:
         running_tokens: int = 0,
         block_parent_hashes: Optional[Dict[int, int]] = None,
         block_access_stats: Optional[Dict[int, dict]] = None,
+        block_generations: Optional[Dict[int, int]] = None,
     ):
         """
         Master-only state ingestion boundary.
@@ -221,6 +224,10 @@ class GlobalBlockManager:
                     del self.global_page_table[old_hash]
 
         self.block_hash[gpu_id] = dict(block_hashes)
+        self.block_generation[gpu_id] = {
+            block_id: int((block_generations or {}).get(block_id, 0))
+            for block_id in block_hashes
+        }
         self.block_parent_hash[gpu_id] = dict(block_parent_hashes or {})
         self.pinned_block_ids[gpu_id] = set((pinned_block_hashes or {}).keys())
         evictable = block_hashes if evictable_block_hashes is None else evictable_block_hashes
@@ -353,9 +360,42 @@ class GlobalBlockManager:
         1. NVLink 直连伙伴（如果有的话）
         """
         partner = self._get_nvlink_partner(gpu_id)
-        if partner is None:
+        if partner is None or partner not in self.available_gpus:
             return []
         return [partner]
+
+    def is_gpu_available(self, gpu_id: int) -> bool:
+        return gpu_id in self.available_gpus
+
+    def mark_gpu_available(self, gpu_id: int) -> None:
+        self.available_gpus.add(gpu_id)
+
+    def mark_gpu_unavailable(self, gpu_id: int) -> None:
+        """Remove a failed worker and all stale locations from routing state."""
+        self.available_gpus.discard(gpu_id)
+        for block_hash, locations in list(self.global_page_table.items()):
+            remaining = [loc for loc in locations if loc.gpu_id != gpu_id]
+            if remaining:
+                self.global_page_table[block_hash] = remaining
+            else:
+                del self.global_page_table[block_hash]
+        self.free_blocks_per_gpu[gpu_id] = 0
+        self.block_hash[gpu_id] = {}
+        self.block_generation[gpu_id] = {}
+        self.block_parent_hash[gpu_id] = {}
+        self.block_access_time[gpu_id] = {}
+        self.block_access_count[gpu_id] = {}
+        self.pinned_block_ids[gpu_id] = set()
+        self.transfer_inflight_block_ids[gpu_id] = set()
+        self.waiting_sequences_per_gpu[gpu_id] = 0
+        self.running_sequences_per_gpu[gpu_id] = 0
+        self.waiting_tokens_per_gpu[gpu_id] = 0
+        self.running_tokens_per_gpu[gpu_id] = 0
+        self.pending_sequences_per_gpu[gpu_id] = 0
+        self.pending_tokens_per_gpu[gpu_id] = 0
+        self.pending_route_tokens[gpu_id] = {}
+        self.pending_route_blocks[gpu_id] = {}
+        self.pending_route_protected_blocks[gpu_id] = {}
 
     # ------------------------------------------------------------------
     # 前缀查找
@@ -380,7 +420,10 @@ class GlobalBlockManager:
         locations = [
             loc
             for loc in self.global_page_table[prefix_hash]
-            if loc.block_id not in self.transfer_inflight_block_ids[loc.gpu_id]
+            if (
+                loc.gpu_id in self.available_gpus
+                and loc.block_id not in self.transfer_inflight_block_ids[loc.gpu_id]
+            )
         ]
         rank = self.rank if requester_rank is None else requester_rank
 
@@ -870,7 +913,14 @@ class GlobalBlockManager:
 
     def get_block_location(self, hash_val: int) -> List[BlockLocation]:
         """通过 hash 查找块的所有位置"""
-        return self.global_page_table.get(hash_val, [])
+        return [
+            location
+            for location in self.global_page_table.get(hash_val, [])
+            if location.gpu_id in self.available_gpus
+        ]
+
+    def get_block_generation(self, gpu_id: int, block_id: int) -> int:
+        return int(self.block_generation[gpu_id].get(block_id, 0))
 
     def touch_block(self, gpu_id: int, block_id: int):
         """更新块的访问时间（用于 LRU）"""

@@ -203,6 +203,11 @@ cython_debug/
 .cursorindexingignore
 .claude
 
+# Generated benchmark artifacts. Keep the runbook and directory description,
+# but do not add machine-specific JSON/PNG/log output to new commits.
+benchmarks/results/*
+!benchmarks/results/README.md
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

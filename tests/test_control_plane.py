@@ -1,6 +1,9 @@
 import threading
 import time
 import queue
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 from lmpool.engine.block_manager import BlockManager
 from lmpool.engine.control_plane import ControlPlaneClient, control_plane_process
@@ -17,7 +20,7 @@ def _start_control_plane(world_size=2, max_cached_blocks=8, pairs=((0, 1),), ext
         "max_cached_blocks": max_cached_blocks,
         "nvlink_topo": {"pairs": list(pairs)},
         "log_level": "ERROR",
-        # Most control-plane tests validate two-phase transfer protocol rather
+        # Most control-plane tests validate the transfer state machine rather
         # than admission economics; dedicated scheduler tests cover the
         # production benefit threshold.
         "foreground_transfer_min_benefit_ratio": 0.0,
@@ -47,6 +50,279 @@ def _get_message_type(response_queue, message_type, timeout=5):
         message = response_queue.get(timeout=remaining)
         if message.get("type") == message_type:
             return message
+
+
+def test_control_plane_client_demultiplexes_concurrent_route_responses():
+    config, request_queue, response_queues, thread = _start_control_plane(
+        max_cached_blocks=64
+    )
+    try:
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 64,
+            "block_hashes": {},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 64,
+            "block_hashes": {},
+        })
+        time.sleep(0.1)
+        client = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        barrier = threading.Barrier(8)
+
+        def route_one(index):
+            barrier.wait(timeout=5)
+            return client.route_sequence(
+                Sequence([index + 1], block_size=2)
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(route_one, index) for index in range(8)]
+            targets = [future.result(timeout=5) for future in futures]
+
+        assert set(targets) <= {0, 1}
+        assert len(targets) == 8
+    finally:
+        _stop_control_plane(request_queue, thread)
+
+
+def test_control_plane_client_deduplicates_transfer_plan_phase():
+    request_queue = queue.Queue()
+    response_queue = queue.Queue()
+    client = ControlPlaneClient(0, request_queue, response_queue)
+    calls = []
+    client.set_rebalance_executor(
+        lambda plan: calls.append((plan["plan_id"], plan["_phase"])) or {"success": True}
+    )
+    message = {
+        "type": "rebalance_execute",
+        "plan_id": "plan-1",
+        "role": "source",
+        "plan": {"plan_id": "plan-1", "transfers": []},
+    }
+    response_queue.put(dict(message))
+    response_queue.put(dict(message))
+
+    client.pump_async_messages()
+
+    assert calls == [("plan-1", "execute")]
+    done = [request_queue.get(timeout=1), request_queue.get(timeout=1)]
+    assert all(item["type"] == "rebalance_done" for item in done)
+    assert all(item["result"]["success"] for item in done)
+
+
+def test_full_state_request_updates_epoch_and_invokes_reporter():
+    request_queue = queue.Queue()
+    response_queue = queue.Queue()
+    client = ControlPlaneClient(
+        0,
+        request_queue,
+        response_queue,
+        control_epoch="old-epoch",
+    )
+    reports = []
+    reset_phases = []
+    client.set_rebalance_executor(
+        lambda plan: reset_phases.append(plan["_phase"]) or {"success": True}
+    )
+    client.set_state_reporter(lambda: reports.append(client.control_epoch))
+    response_queue.put({
+        "type": "full_state_request",
+        "control_epoch": "new-epoch",
+        "ts": time.time(),
+    })
+
+    client.pump_async_messages()
+
+    assert client.control_epoch == "new-epoch"
+    assert reports == ["new-epoch"]
+    assert reset_phases == ["control_reset"]
+
+
+def test_stale_block_state_version_cannot_overwrite_newer_snapshot():
+    config, request_queue, response_queues, thread = _start_control_plane()
+    try:
+        bm = BlockManager(num_blocks=8, block_size=2)
+        client = ControlPlaneClient(-1, request_queue, response_queues[-1])
+        client.block_manager = bm
+        seq = Sequence([11, 22, 33], block_size=2)
+        prefix_hash = client._compute_prefix_hashes(seq)[0]
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "worker_epoch": "worker-a",
+            "state_version": 2,
+            "free_blocks": 7,
+            "block_hashes": {0: prefix_hash},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "worker_epoch": "worker-a",
+            "state_version": 1,
+            "free_blocks": 8,
+            "block_hashes": {},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "worker_epoch": "worker-b",
+            "state_version": 1,
+            "free_blocks": 8,
+            "block_hashes": {},
+        })
+        time.sleep(0.1)
+
+        result = client.route_sequence(seq, return_meta=True)
+
+        assert result["target_rank"] == 0
+        assert result["route_info"]["prefix_hit"] is True
+        assert result["route_info"]["matched_prefix_blocks"] == 1
+    finally:
+        _stop_control_plane(request_queue, thread)
+
+
+def test_rebalance_publishes_target_before_finalizing_source():
+    config, request_queue, response_queues, thread = _start_control_plane()
+    try:
+        request_queue.put({
+            "type": "block_state",
+            "rank": 0,
+            "free_blocks": 0,
+            "block_hashes": {0: 101},
+            "block_generations": {0: 3},
+            "evictable_block_hashes": {0: 101},
+        })
+        request_queue.put({
+            "type": "block_state",
+            "rank": 1,
+            "free_blocks": 4,
+            "block_hashes": {},
+        })
+        time.sleep(0.1)
+        request_queue.put({
+            "type": "rebalance_request",
+            "request_id": "rebalance-1",
+            "reply_rank": -1,
+            "gpu_id": 0,
+            "needed_blocks": 1,
+            "allow_copy": False,
+        })
+
+        prepare_messages = {
+            rank: _get_message_type(response_queues[rank], "rebalance_prepare")
+            for rank in (0, 1)
+        }
+        plan_id = prepare_messages[0]["plan_id"]
+        for rank, message in prepare_messages.items():
+            request_queue.put({
+                "type": "rebalance_done",
+                "plan_id": plan_id,
+                "rank": rank,
+                "role": message["role"],
+                "phase": "prepare",
+                "result": {"success": True},
+            })
+
+        execute_messages = {
+            rank: _get_message_type(response_queues[rank], "rebalance_execute")
+            for rank in (0, 1)
+        }
+        for rank, message in execute_messages.items():
+            request_queue.put({
+                "type": "rebalance_done",
+                "plan_id": plan_id,
+                "rank": rank,
+                "role": message["role"],
+                "phase": "execute",
+                "result": {"success": True},
+            })
+
+        publish_messages = {
+            rank: _get_message_type(response_queues[rank], "rebalance_publish")
+            for rank in (0, 1)
+        }
+        with pytest.raises(queue.Empty):
+            response_queues[-1].get(timeout=0.05)
+
+        first_rank = 0
+        request_queue.put({
+            "type": "rebalance_done",
+            "plan_id": plan_id,
+            "rank": first_rank,
+            "role": publish_messages[first_rank]["role"],
+            "phase": "publish",
+            "result": {"success": True},
+        })
+        with pytest.raises(queue.Empty):
+            response_queues[-1].get(timeout=0.05)
+
+        request_queue.put({
+            "type": "rebalance_done",
+            "plan_id": plan_id,
+            "rank": 1,
+            "role": publish_messages[1]["role"],
+            "phase": "publish",
+            "result": {"success": True},
+        })
+        finalize_messages = {
+            rank: _get_message_type(response_queues[rank], "rebalance_finalize")
+            for rank in (0, 1)
+        }
+        with pytest.raises(queue.Empty):
+            response_queues[-1].get(timeout=0.05)
+
+        request_queue.put({
+            "type": "rebalance_done",
+            "plan_id": plan_id,
+            "rank": 0,
+            "role": finalize_messages[0]["role"],
+            "phase": "finalize",
+            "result": {"success": True},
+        })
+        with pytest.raises(queue.Empty):
+            response_queues[-1].get(timeout=0.05)
+
+        request_queue.put({
+            "type": "rebalance_done",
+            "plan_id": plan_id,
+            "rank": 1,
+            "role": finalize_messages[1]["role"],
+            "phase": "finalize",
+            "result": {"success": True},
+        })
+        response = _get_message_type(response_queues[-1], "rebalance_response")
+        assert response["success"] is True
+    finally:
+        _stop_control_plane(request_queue, thread)
+
+
+def test_rebalance_returns_failure_when_control_epoch_changes():
+    request_queue = queue.Queue()
+    response_queue = queue.Queue()
+    client = ControlPlaneClient(
+        0,
+        request_queue,
+        response_queue,
+        control_epoch="control-a",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(client.rebalance, 0, 1)
+        request = request_queue.get(timeout=1)
+        response_queue.put({
+            "type": "heartbeat",
+            "control_epoch": "control-b",
+            "ts": time.time(),
+        })
+        assert future.result(timeout=1) is False
+
+    assert request["control_epoch"] == "control-a"
+    assert client.last_rebalance_fail_reason == "control_restarted"
+    assert client.rebalance_fail_reasons["control_restarted"] == 1
 
 
 def test_route_falls_back_when_nvlink_prefix_owner_has_no_capacity():
@@ -767,7 +1043,7 @@ def test_ingress_forecast_flushes_hot_prefix_copy_before_future_requests():
         _stop_control_plane(request_queue, control_thread)
 
 
-def test_completed_forecast_copy_leases_future_routes_to_replica():
+def test_completed_forecast_copy_stripes_future_routes_across_pair():
     config, request_queue, response_queues, control_thread = _start_control_plane(
         extra_config={
             "enable_background_copy": True,
@@ -834,14 +1110,23 @@ def test_completed_forecast_copy_leases_future_routes_to_replica():
         })
         time.sleep(0.1)
 
+        targets = []
+        reasons = []
         for _ in range(4):
             routed = ingress.route_sequence(
                 Sequence(token_ids=[1, 2, 3, 4], block_size=2),
                 return_meta=True,
             )
-            assert routed["target_rank"] == 1
-            assert routed["route_info"]["reason"] == "placement_lease"
+            targets.append(routed["target_rank"])
+            reasons.append(routed["route_info"]["reason"])
             assert routed["route_info"]["matched_prefix_blocks"] == 2
+        assert targets == [1, 0, 1, 0]
+        assert reasons == [
+            "placement_lease",
+            "placement_stripe_source",
+            "placement_lease",
+            "placement_stripe_source",
+        ]
     finally:
         _stop_control_plane(request_queue, control_thread)
 
@@ -918,6 +1203,7 @@ def test_ingress_forecast_batches_prefixes_for_same_directed_pair():
         source_plans = [plan for rank, plan in executed if rank == 0]
         assert len(source_plans) == 1
         assert set(source_plans[0]["transfers"][0]["hashes"]) == {h0, h1, h2, h3}
+        assert source_plans[0]["transfers"][0]["generations"] == [0, 0, 0, 0]
         assert len(source_plans[0]["background_candidate_keys"]) == 2
         assert result["placement_stats"]["dispatched"] == 2
         assert result["placement_stats"]["completed"] == 2

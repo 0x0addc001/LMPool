@@ -46,6 +46,9 @@ class DummyContext:
 
 
 class FakeControlPlaneClient:
+    def reset_control_epoch(self, control_epoch):
+        self.control_epoch = control_epoch
+
     def route_sequence(self, seq, return_meta=False):
         if return_meta:
             return {

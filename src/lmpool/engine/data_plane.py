@@ -3,6 +3,7 @@ import os
 import random
 import sys
 import time
+from collections import deque
 from multiprocessing import Queue
 from multiprocessing.connection import wait as wait_for_connections
 from queue import Empty
@@ -89,6 +90,7 @@ def data_plane_process(
             global_response_queue,
             heartbeat_interval=float(config.get("heartbeat_interval", 1.0)),
             heartbeat_timeout=float(config.get("heartbeat_timeout", 3.0)),
+            control_epoch=config.get("control_epoch"),
         )
         for observation in prewarm_observations:
             control_plane_client.report_transfer_observation(**observation)
@@ -100,6 +102,9 @@ def data_plane_process(
         eos=config.get("eos", 50256),
         global_scheduler=control_plane_client,
     )
+    # This process already publishes an authoritative snapshot after each
+    # received/model/transfer batch. Suppress Scheduler's per-sequence syncs.
+    scheduler.auto_sync_global_state = False
     scheduler.enable_foreground_rebalance = bool(config.get("enable_foreground_rebalance", True))
     scheduler.preserve_cache_via_transfer = bool(config.get("preserve_cache_via_transfer", False))
     scheduler.foreground_transfer_min_blocks = max(
@@ -117,7 +122,24 @@ def data_plane_process(
             getattr(scheduler, "_rebalance_cooldown_max_s", 30.0),
         )),
     )
-    prepared_rebalance_blocks: dict[str, dict[tuple[int, tuple[int, ...]], list[int]]] = {}
+    rebalance_plan_states: dict[str, dict] = {}
+    terminal_rebalance_plans: deque[str] = deque()
+    max_terminal_rebalance_plans = max(
+        32, int(config.get("terminal_rebalance_plan_cache_size", 1024))
+    )
+
+    def cache_phase_result(plan_id: str | None, phase: str, result: dict) -> dict:
+        if plan_id is None:
+            return result
+        state = rebalance_plan_states.setdefault(plan_id, {"phase_results": {}})
+        state.setdefault("phase_results", {})[phase] = dict(result)
+        if phase in {"finalize", "abort"} and not state.get("terminal"):
+            state["terminal"] = True
+            terminal_rebalance_plans.append(plan_id)
+            while len(terminal_rebalance_plans) > max_terminal_rebalance_plans:
+                expired = terminal_rebalance_plans.popleft()
+                rebalance_plan_states.pop(expired, None)
+        return result
 
     def execute_rebalance_plan(plan: dict):
         if plan is None:
@@ -125,40 +147,104 @@ def data_plane_process(
         phase = plan.get("_phase", "execute")
         plan_id = plan.get("plan_id")
         transfers = plan.get("transfers", [])
+        if phase == "control_reset":
+            for reset_state in list(rebalance_plan_states.values()):
+                if reset_state.get("terminal"):
+                    continue
+                scheduler.block_manager.unlock_transfer_blocks(
+                    reset_state.get("locked_source_blocks", [])
+                )
+                for local_target_blocks in reset_state.get("prepared", {}).values():
+                    scheduler.block_manager.release_reserved_blocks(local_target_blocks)
+            rebalance_plan_states.clear()
+            terminal_rebalance_plans.clear()
+            return {"success": True, "rank": rank}
+        state = rebalance_plan_states.get(plan_id) if plan_id is not None else None
+        if state is not None and phase in state.get("phase_results", {}):
+            return dict(state["phase_results"][phase])
+        if state is not None and state.get("terminal"):
+            return {
+                "success": phase == "abort",
+                "rank": rank,
+                "reason": "plan_terminal",
+                "error": f"plan {plan_id} is already terminal",
+            }
 
         if phase == "abort":
-            prepared = prepared_rebalance_blocks.pop(plan_id, {})
-            for local_target_blocks in prepared.values():
+            state = state or {}
+            scheduler.block_manager.unlock_transfer_blocks(
+                state.get("locked_source_blocks", [])
+            )
+            for local_target_blocks in state.get("prepared", {}).values():
                 scheduler.block_manager.release_reserved_blocks(local_target_blocks)
             send_block_state()
-            return {"success": True, "rank": rank}
+            return cache_phase_result(
+                plan_id, phase, {"success": True, "rank": rank}
+            )
 
         if phase == "prepare":
             prepared: dict[tuple[int, tuple[int, ...]], list[int]] = {}
             is_background = bool(plan.get("background"))
-            all_source_blocks = [
+            source_transfers = [
+                transfer for transfer in transfers if rank == transfer["src_gpu"]
+            ]
+            all_source_blocks = list(dict.fromkeys(
                 block_id
-                for transfer in transfers
-                if rank == transfer["src_gpu"]
+                for transfer in source_transfers
                 for block_id in (
                     list(transfer["src_blocks"])
                     + list(transfer.get("release_source_blocks", []))
                 )
-            ]
-            all_source_blocks = list(dict.fromkeys(all_source_blocks))
-            stale_source_blocks = [
-                block_id
-                for block_id in all_source_blocks
-                if block_id not in scheduler.block_manager.used_block_ids
-            ]
-            if stale_source_blocks:
-                send_block_state()
-                return {
-                    "success": False,
-                    "rank": rank,
-                    "reason": "stale_source",
-                    "error": f"source blocks are no longer allocated: {stale_source_blocks}",
-                }
+            ))
+            for transfer in source_transfers:
+                generations = transfer.get("generations")
+                if generations is None:
+                    generations = [
+                        scheduler.block_manager.blocks[block_id].generation
+                        if block_id in scheduler.block_manager.used_block_ids else -1
+                        for block_id in transfer["src_blocks"]
+                    ]
+                valid, error = scheduler.block_manager.validate_transfer_blocks(
+                    list(transfer["src_blocks"]),
+                    list(transfer.get("hashes", [])),
+                    list(generations),
+                )
+                if not valid:
+                    send_block_state()
+                    return cache_phase_result(plan_id, phase, {
+                        "success": False,
+                        "rank": rank,
+                        "reason": "stale_source",
+                        "error": error,
+                    })
+                release_blocks = list(transfer.get("release_source_blocks", []))
+                release_hashes = transfer.get("release_source_hashes")
+                if release_hashes is None:
+                    release_hashes = [
+                        scheduler.block_manager.blocks[block_id].hash
+                        if block_id in scheduler.block_manager.used_block_ids else -1
+                        for block_id in release_blocks
+                    ]
+                release_generations = transfer.get("release_source_generations")
+                if release_generations is None:
+                    release_generations = [
+                        scheduler.block_manager.blocks[block_id].generation
+                        if block_id in scheduler.block_manager.used_block_ids else -1
+                        for block_id in release_blocks
+                    ]
+                valid, error = scheduler.block_manager.validate_transfer_blocks(
+                    release_blocks,
+                    list(release_hashes),
+                    list(release_generations),
+                )
+                if not valid:
+                    send_block_state()
+                    return cache_phase_result(plan_id, phase, {
+                        "success": False,
+                        "rank": rank,
+                        "reason": "stale_source",
+                        "error": error,
+                    })
             source_blocks = [
                 block_id
                 for transfer in transfers
@@ -184,12 +270,12 @@ def data_plane_process(
                         },
                     })
                 send_block_state()
-                return {
+                return cache_phase_result(plan_id, phase, {
                     "success": False,
                     "rank": rank,
                     "reason": "pinned_source",
                     "error": f"source blocks still referenced: {pinned_blocks}",
-                }
+                })
 
             needed = sum(
                 len(transfer["src_blocks"])
@@ -207,7 +293,7 @@ def data_plane_process(
                         },
                     })
                 send_block_state()
-                return {
+                return cache_phase_result(plan_id, phase, {
                     "success": False,
                     "rank": rank,
                     "reason": "no_target_space",
@@ -215,20 +301,96 @@ def data_plane_process(
                         f"not enough free blocks to reserve: need {needed}, "
                         f"have {len(scheduler.block_manager.free_block_ids)}"
                     ),
-                }
+                })
 
-            for transfer in transfers:
-                if rank != transfer["dst_gpu"]:
-                    continue
-                src_gpu = transfer["src_gpu"]
-                src_blocks = transfer["src_blocks"]
-                local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
-                prepared[(src_gpu, tuple(src_blocks))] = local_target_blocks
+            if all_source_blocks:
+                scheduler.block_manager.lock_transfer_blocks(all_source_blocks)
+
+            try:
+                for transfer in transfers:
+                    if rank != transfer["dst_gpu"]:
+                        continue
+                    src_gpu = transfer["src_gpu"]
+                    src_blocks = transfer["src_blocks"]
+                    local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
+                    scheduler.block_manager.lock_transfer_blocks(local_target_blocks)
+                    prepared[(src_gpu, tuple(src_blocks))] = local_target_blocks
+            except Exception:
+                scheduler.block_manager.unlock_transfer_blocks(all_source_blocks)
+                for local_target_blocks in prepared.values():
+                    scheduler.block_manager.release_reserved_blocks(local_target_blocks)
+                raise
 
             if plan_id is not None:
-                prepared_rebalance_blocks[plan_id] = prepared
+                state = rebalance_plan_states.setdefault(plan_id, {"phase_results": {}})
+                state.update({
+                    "prepared": prepared,
+                    "locked_source_blocks": all_source_blocks,
+                    "received_blocks": [],
+                })
             send_block_state()
-            return {"success": True, "rank": rank}
+            return cache_phase_result(
+                plan_id, phase, {"success": True, "rank": rank}
+            )
+
+        if phase == "publish":
+            if state is None or "prepare" not in state.get("phase_results", {}):
+                return cache_phase_result(plan_id, phase, {
+                    "success": False,
+                    "rank": rank,
+                    "reason": "missing_prepare",
+                    "error": "transfer publish received before prepare",
+                })
+            received_blocks = state.get("received_blocks", [])
+            if received_blocks:
+                scheduler.block_manager.publish_transfer_blocks(received_blocks)
+            return cache_phase_result(
+                plan_id, phase, {"success": True, "rank": rank}
+            )
+
+        if phase == "finalize":
+            if state is None or "publish" not in state.get("phase_results", {}):
+                return cache_phase_result(plan_id, phase, {
+                    "success": False,
+                    "rank": rank,
+                    "reason": "missing_publish",
+                    "error": "transfer finalize received before publish",
+                })
+            release_source_blocks = list(dict.fromkeys(
+                block_id
+                for transfer in transfers
+                if rank == transfer["src_gpu"]
+                for block_id in transfer.get(
+                    "release_source_blocks",
+                    [] if transfer.get("mode", plan.get("mode", "move")) == "copy"
+                    else transfer["src_blocks"],
+                )
+            ))
+            if release_source_blocks:
+                scheduler.block_manager.release_blocks(release_source_blocks)
+            scheduler.block_manager.unlock_transfer_blocks([
+                block_id
+                for block_id in state.get("locked_source_blocks", [])
+                if block_id not in release_source_blocks
+            ])
+            if release_source_blocks:
+                send_queue.put({
+                    "type": "runtime_stats",
+                    "rank": rank,
+                    "data": {"transfer_release_count": len(release_source_blocks)},
+                })
+            send_block_state()
+            return cache_phase_result(
+                plan_id, phase, {"success": True, "rank": rank}
+            )
+
+        if state is None or "prepare" not in state.get("phase_results", {}):
+            return cache_phase_result(plan_id, phase, {
+                "success": False,
+                "rank": rank,
+                "reason": "missing_prepare",
+                "error": "transfer execute received before prepare",
+            })
 
         source_transfers = [
             transfer for transfer in transfers if rank == transfer["src_gpu"]
@@ -267,8 +429,6 @@ def data_plane_process(
                     else transfer["src_blocks"],
                 )
             ))
-            if release_source_blocks:
-                scheduler.block_manager.release_blocks(release_source_blocks)
             stats = {
                 "transfer_count": len(sent_blocks),
                 "swap_count": len(sent_blocks),
@@ -279,7 +439,7 @@ def data_plane_process(
                     if block_hash != -1
                 )),
                 "transfer_copy_count": len(sent_blocks - set(release_source_blocks)),
-                "transfer_release_count": len(release_source_blocks),
+                "transfer_release_count": 0,
                 "chain_transfer_count": sum(
                     transfer.get("mode", plan.get("mode", "move")) == "chain_move"
                     for transfer in source_transfers
@@ -322,10 +482,15 @@ def data_plane_process(
             access_counts = transfer.get("access_counts")
             mode = transfer.get("mode", plan.get("mode", "move"))
             if rank == dst_gpu:
-                prepared = prepared_rebalance_blocks.get(plan_id, {})
+                prepared = state.get("prepared", {})
                 local_target_blocks = prepared.get((src_gpu, tuple(src_blocks)))
                 if local_target_blocks is None:
-                    local_target_blocks = scheduler.block_manager.reserve_free_blocks(len(src_blocks))
+                    return cache_phase_result(plan_id, phase, {
+                        "success": False,
+                        "rank": rank,
+                        "reason": "missing_prepare",
+                        "error": "destination blocks were not reserved during prepare",
+                    })
                 target_started = time.perf_counter()
                 model_runner.execute_swap_in(
                     src_gpu,
@@ -337,7 +502,9 @@ def data_plane_process(
                     hashes,
                     parent_hashes=parent_hashes,
                     access_counts=access_counts,
+                    publish=False,
                 )
+                state.setdefault("received_blocks", []).extend(local_target_blocks)
                 send_queue.put({
                     "type": "runtime_stats",
                     "rank": rank,
@@ -346,10 +513,12 @@ def data_plane_process(
                     },
                 })
 
-        if plan_id is not None:
-            prepared_rebalance_blocks.pop(plan_id, None)
         send_block_state()
-        return {"success": True, "rank": rank, **execution_stats}
+        return cache_phase_result(
+            plan_id,
+            phase,
+            {"success": True, "rank": rank, **execution_stats},
+        )
 
     if control_plane_client is not None:
         control_plane_client.set_rebalance_executor(execute_rebalance_plan)
@@ -388,8 +557,12 @@ def data_plane_process(
             sum(estimated_work_tokens(seq) for seq in scheduler.running),
             scheduler.block_manager.get_local_block_parent_hashes(),
             scheduler.block_manager.get_local_block_access_stats(),
+            scheduler.block_manager.get_local_block_generations(),
         )
+        scheduler.local_state_dirty = False
 
+    if control_plane_client is not None:
+        control_plane_client.set_state_reporter(send_block_state)
     send_block_state()
     send_queue.put({
         "type": "runtime_stats",
@@ -422,6 +595,7 @@ def data_plane_process(
 
     while True:
         received_sequences = []
+        ingress_quiescent = False
         try:
             if control_plane_client is not None:
                 control_plane_client.pump_async_messages()
@@ -434,6 +608,7 @@ def data_plane_process(
             ingress_ready = True
             if events is not None:
                 ingress_ready, control_ready = events
+                ingress_quiescent = not ingress_ready
                 if control_ready:
                     control_plane_client.pump_async_messages()
             if ingress_ready:
@@ -451,7 +626,7 @@ def data_plane_process(
                         received_sequences.append(msg["seq"])
         except Exception as e:
             if isinstance(e, Empty):
-                pass
+                ingress_quiescent = True
             else:
                 logger.warning("rank %s recv error: %s", rank, e)
 
@@ -507,7 +682,9 @@ def data_plane_process(
                 last_rebalance_fail_count = control_plane_client.rebalance_fail_count
                 last_rebalance_fail_reasons = dict(control_plane_client.rebalance_fail_reasons)
         if not scheduled:
-            if scheduler.is_finished() and recv_queue.empty() and not idle_sent:
+            if scheduler.local_state_dirty:
+                send_block_state()
+            if scheduler.is_finished() and ingress_quiescent and not idle_sent:
                 try:
                     send_queue.put_nowait({"type": "idle", "rank": rank})
                     idle_sent = True

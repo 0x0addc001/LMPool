@@ -40,6 +40,34 @@ def test_lookup_prefix_hides_inflight_transfer_locations():
     assert [(loc.gpu_id, loc.block_id) for loc in hits] == [(1, 3)]
 
 
+def test_unavailable_gpu_is_removed_from_page_table_and_transfer_targets():
+    gbm = GlobalBlockManager(
+        rank=0,
+        world_size=2,
+        num_blocks_per_gpu=4,
+        nvlink_pairs=[(0, 1)],
+    )
+    gbm.update_gpu_state(1, 3, {0: 99}, block_generations={0: 7})
+
+    gbm.mark_gpu_unavailable(1)
+
+    assert gbm.lookup_prefix(99, requester_rank=0) == []
+    assert gbm.get_block_location(99) == []
+    assert gbm._get_target_gpu_order(0) == []
+    assert gbm.get_free_blocks_count(1) == 0
+
+
+def test_global_snapshot_preserves_block_generation():
+    gbm = GlobalBlockManager(
+        rank=0,
+        world_size=1,
+        num_blocks_per_gpu=4,
+        nvlink_pairs=[],
+    )
+    gbm.update_gpu_state(0, 3, {0: 99}, block_generations={0: 12})
+    assert gbm.get_block_generation(0, 0) == 12
+
+
 def test_update_allocate_and_free_global_state():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.update_gpu_state(0, 3, {0: 111, 1: 222})

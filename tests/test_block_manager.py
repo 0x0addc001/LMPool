@@ -286,6 +286,59 @@ def test_non_contiguous_cache_hit_does_not_count_as_prefix_hit():
     assert seq.num_cached_tokens == 0
 
 
+def test_block_generation_rejects_reused_physical_block_aba():
+    bm = BlockManager(num_blocks=1, block_size=2)
+    first = Sequence([1, 2], block_size=2)
+    bm.allocate(first)
+    bm.mark_kv_ready([first])
+    block_id = first.block_table[0]
+    old_hash = bm.blocks[block_id].hash
+    old_generation = bm.blocks[block_id].generation
+    bm.deallocate(first)
+    bm.release_blocks([block_id])
+
+    second = Sequence([3, 4], block_size=2)
+    bm.allocate(second)
+    bm.mark_kv_ready([second])
+
+    valid, reason = bm.validate_transfer_blocks(
+        [block_id], [old_hash], [old_generation]
+    )
+    assert valid is False
+    assert "generation changed" in reason
+
+
+def test_transfer_lock_prevents_local_reuse_and_reclamation():
+    bm = BlockManager(num_blocks=1, block_size=2)
+    cached = Sequence([1, 2], block_size=2)
+    bm.allocate(cached)
+    bm.mark_kv_ready([cached])
+    block_id = cached.block_table[0]
+    bm.deallocate(cached)
+
+    bm.lock_transfer_blocks([block_id])
+    assert bm.num_required_new_blocks(Sequence([1, 2], block_size=2)) == 1
+    assert bm.reclaim_cached_blocks(1) == 0
+
+    bm.unlock_transfer_blocks([block_id])
+    assert bm.num_required_new_blocks(Sequence([1, 2], block_size=2)) == 0
+
+
+def test_received_transfer_block_is_hidden_until_publish():
+    bm = BlockManager(num_blocks=1, block_size=2)
+    block_hash = bm.compute_hash([1, 2], -1)
+    reserved = bm.reserve_free_blocks(1)
+    bm.lock_transfer_blocks(reserved)
+
+    bm.register_swap_in_blocks(reserved, [block_hash], publish=False)
+    assert bm.get_local_block_hashes() == {}
+    assert block_hash not in bm.hash_to_block_id
+
+    bm.publish_transfer_blocks(reserved)
+    assert bm.get_local_block_hashes() == {reserved[0]: block_hash}
+    assert bm.hash_to_block_id[block_hash] == reserved[0]
+
+
 def test_can_allocate_counts_only_blocks_that_need_new_storage():
     bm = BlockManager(num_blocks=2, block_size=2)
     cached = Sequence([1, 2], block_size=2)
