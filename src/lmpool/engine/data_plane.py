@@ -81,6 +81,7 @@ def data_plane_process(
             num_kv_heads=int(config.get("num_kv_heads", 1)),
             head_dim=int(config.get("head_dim", config.get("hidden_size", 1) // config.get("num_heads", 1))),
             num_blocks=max(1, int(config.get("kv_transfer_prewarm_blocks", 2))),
+            dtype=getattr(model_runner, "default_dtype", torch.get_default_dtype()),
         )
     control_plane_client = None
     if config.get("enable_global_pool", False) and config.get("use_control_plane_process", True):

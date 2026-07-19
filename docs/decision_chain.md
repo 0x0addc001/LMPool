@@ -1662,3 +1662,65 @@ decision demand, decision plan, decision implementation, and decision result.
   repository-wide suite passes (`162 passed, 1 skipped`). The skipped case is
   the opt-in NCCL hardware round-trip that the paper runbook executes explicitly
   on one visible NVLink pair.
+
+## 2026-07-19: Make Benchmark Titles Workload-Specific
+
+- Decision demand: The shared E2E plotting helper labeled every experiment as
+  `Shared Prefix Benchmark Summary`, even when the result measured routing,
+  memory-skew transfer, load skew, or session handoff. This made distinct paper
+  artifacts appear to represent the same workload.
+- Decision plan: Keep metrics and scenario execution unchanged, but pass an
+  explicit publication-facing title through terminal summaries and all figures.
+  Resolve E2E titles from a strict workload mapping and give routing-only its
+  own title.
+- Decision implementation: `benchmark_e2e.py` now maps each supported workload
+  to a specific title and applies it to the terminal table, overview figure,
+  reuse-phase figure, and per-rank diagnostics. `benchmark_kv_routing.py` uses
+  `KV-Aware Routing Benchmark Summary`, and the E2E CLI description no longer
+  claims every workload is a shared-prefix benchmark. Parameterized tests cover
+  every title and reject unknown workloads.
+- Decision result: Paper outputs now identify the experiment they actually
+  measure without changing configurations, scheduling behavior, or metric
+  values.
+
+## 2026-07-19: Rebuild the Paper Suite for Dual Qwen3 Model Scales
+
+- Decision demand: The original benchmark configuration embedded the
+  Qwen3-0.6B dimensions even when `--model-name-or-path` changed, so a nominal
+  Qwen3-1.7B run would either fail weight loading or measure the wrong model.
+  Model execution and KV allocation also inherited process-default float32,
+  while transfer prewarm and cost accounting assumed two-byte values. Existing
+  JSON retained only aggregate means, making run variance and the exact model
+  contract impossible to audit.
+- Decision plan: Resolve every structural model field and dtype from the local
+  immutable snapshot before workers start, use that same dtype for weights, KV
+  storage, prewarm payloads, and transfer-byte accounting, and fail on a
+  conflicting microbenchmark geometry. Preserve exact invocation metadata,
+  every repeated trial, sample standard deviation, and 95% Student-t confidence
+  intervals. Provide one offline runner that executes the complete claim matrix
+  for both 0.6B and 1.7B and calibrates E2E transfer bandwidth from every
+  configured physical NVLink pair.
+- Decision implementation: `benchmark_utils.py` now maps Qwen3/Llama
+  `config.json` fields into the custom runtime config, normalizes
+  float16/bfloat16/float32, computes model-specific KV bytes, assigns readable
+  model labels, and records command, environment, Git state, arguments, model
+  metadata, and resolved configuration. E2E and routing benchmarks construct
+  every scenario from that resolved config. `ModelRunner` creates model weights
+  and KV tensors in the selected dtype; NCCL prewarm uses the same dtype.
+  `benchmark_kv_transfer.py` derives layers, KV heads, head dimension, and dtype
+  from the model and rejects explicit conflicts. Repeated E2E artifacts retain
+  raw trials, sample standard deviations, and 95% CI half-widths; overview and
+  reuse-phase figures draw those intervals as error bars. JSON schema v2
+  separates `metadata` from `results`. `run_paper_suite.sh` preflights two local
+  snapshots, runs all three physical pairs for both models, uses the median
+  4-block bandwidth in each model's cost model, and stores outputs under
+  model-specific directories.
+- Decision result: The actual local Qwen3-0.6B snapshot resolves to 28 layers,
+  8 KV heads, head dimension 128, and bfloat16 consistently. Simulated 0.6B and
+  1.7B snapshot configurations, metadata/JSON contracts, confidence intervals,
+  model-runner dtype selection, figure export, and benchmark parsers pass the
+  focused test suite; the repository-wide suite passes (`179 passed, 1
+  skipped`), with only the opt-in NCCL hardware integration skipped.
+  Qwen3-1.7B is not currently present in the local Hugging
+  Face cache, so the runner fails before GPU work until `MODEL_17B` points to a
+  complete local snapshot; it never substitutes 0.6B or downloads implicitly.

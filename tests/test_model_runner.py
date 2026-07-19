@@ -7,6 +7,21 @@ from lmpool.engine import model_runner as model_runner_module
 from lmpool.engine.sequence import Sequence
 
 
+def test_resolve_torch_dtype_supports_model_config_names():
+    assert model_runner_module._resolve_torch_dtype("float16") is torch.float16
+    assert model_runner_module._resolve_torch_dtype("torch.bfloat16") is torch.bfloat16
+    assert model_runner_module._resolve_torch_dtype("fp32") is torch.float32
+
+
+def test_resolve_torch_dtype_rejects_unsupported_values():
+    try:
+        model_runner_module._resolve_torch_dtype("int8")
+    except ValueError as exc:
+        assert "Unsupported torch_dtype" in str(exc)
+    else:
+        raise AssertionError("unsupported dtype should fail")
+
+
 def test_resolve_model_family_from_repository_id():
     assert model_runner_module._resolve_model_family({
         "model_name_or_path": "Qwen/Qwen3-0.6B",

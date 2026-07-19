@@ -271,6 +271,11 @@ from lmpool.engine.llm_engine import LLMEngine
 from lmpool.engine.sequence import Sequence
 from lmpool.sampling_parameters import SamplingParams
 
+try:
+    from .benchmark_utils import build_run_metadata, resolve_model_runtime_config
+except ImportError:
+    from benchmark_utils import build_run_metadata, resolve_model_runtime_config
+
 
 def prepare_benchmark_rendezvous(config: dict) -> tuple[dict, Path | None]:
     """Give each local benchmark trial an independent rendezvous store."""
@@ -369,6 +374,22 @@ MODEL_CONFIG = {
 }
 
 
+WORKLOAD_SUMMARY_TITLES = {
+    "locality": "KV Locality End-to-End Benchmark Summary",
+    "load-skew": "Load-Skew End-to-End Benchmark Summary",
+    "memory-skew": "Memory-Skew KV Transfer Benchmark Summary",
+    "session-handoff": "Session-Handoff End-to-End Benchmark Summary",
+}
+
+
+def workload_summary_title(workload: str) -> str:
+    """Return the publication-facing title for one end-to-end workload."""
+    try:
+        return WORKLOAD_SUMMARY_TITLES[workload]
+    except KeyError as exc:
+        raise ValueError(f"unknown workload: {workload}") from exc
+
+
 SUFFIXES = [
     # 共享前缀固定，后缀变化，用来模拟真实业务里“前半段高度重复、后半段各不相同”的请求分布
     "introduce yourself",
@@ -452,7 +473,16 @@ class ScenarioResult:
     throughput_tok_s_std: float = 0.0
     goodput_tok_s_std: float = 0.0
     mean_ttft_s_std: float = 0.0
+    mean_ttpt_s_std: float = 0.0
     mean_e2e_s_std: float = 0.0
+    p90_e2e_s_std: float = 0.0
+    throughput_tok_s_ci95: float = 0.0
+    goodput_tok_s_ci95: float = 0.0
+    mean_ttft_s_ci95: float = 0.0
+    mean_ttpt_s_ci95: float = 0.0
+    mean_e2e_s_ci95: float = 0.0
+    p90_e2e_s_ci95: float = 0.0
+    trial_results: list[dict] | None = None
     phase_latency_stats: dict[str, dict[str, float]] | None = None
     pair_spill_count: int = 0
     replica_copy_route_count: int = 0
@@ -1643,9 +1673,14 @@ def run_engine_scenario(
     )
 
 
-def make_config(world_size: int, enable_global_pool: bool, nvlink_pairs: list[tuple[int, int]] | None) -> dict:
+def make_config(
+    world_size: int,
+    enable_global_pool: bool,
+    nvlink_pairs: list[tuple[int, int]] | None,
+    base_config: dict | None = None,
+) -> dict:
     # benchmark 里统一通过这层构造 config，避免每个场景单独拼参数时漏掉关键项
-    config = dict(MODEL_CONFIG)
+    config = dict(base_config or MODEL_CONFIG)
     config["world_size"] = world_size
     config["enable_global_pool"] = enable_global_pool
     if nvlink_pairs is not None:
@@ -1654,11 +1689,62 @@ def make_config(world_size: int, enable_global_pool: bool, nvlink_pairs: list[tu
     return config
 
 
+_STUDENT_T_975 = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+    11: 2.201,
+    12: 2.179,
+    13: 2.160,
+    14: 2.145,
+    15: 2.131,
+    16: 2.120,
+    17: 2.110,
+    18: 2.101,
+    19: 2.093,
+    20: 2.086,
+    21: 2.080,
+    22: 2.074,
+    23: 2.069,
+    24: 2.064,
+    25: 2.060,
+    26: 2.056,
+    27: 2.052,
+    28: 2.048,
+    29: 2.045,
+    30: 2.042,
+}
+
+
+def confidence_interval_95(values: Iterable[float]) -> float:
+    """Return the two-sided 95% Student-t half-width for repeated runs."""
+    samples = [float(value) for value in values]
+    if len(samples) < 2:
+        return 0.0
+    critical = _STUDENT_T_975.get(len(samples) - 1, 1.96)
+    return critical * statistics.stdev(samples) / (len(samples) ** 0.5)
+
+
+def _trial_payload(result: ScenarioResult) -> dict:
+    payload = asdict(result)
+    payload.pop("trial_results", None)
+    return payload
+
+
 def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
     """Return per-scenario means and key run-to-run standard deviations."""
     if not trials:
         raise ValueError("at least one scenario trial is required")
     if len(trials) == 1:
+        trials[0].repetitions = 1
+        trials[0].trial_results = [_trial_payload(trials[0])]
         return trials[0]
 
     def mean_attr(name: str) -> float:
@@ -1707,18 +1793,28 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         for result in trials
     )))
     phase_latency_stats = {}
+    phase_uncertainty_metrics = {
+        "throughput_tok_s",
+        "mean_ttft_s",
+        "p90_ttft_s",
+        "mean_e2e_s",
+        "p90_e2e_s",
+    }
     for phase in phase_names:
         metric_names = set().union(*(
             set((result.phase_latency_stats or {}).get(phase, {}).keys())
             for result in trials
         ))
-        phase_latency_stats[phase] = {
-            metric: statistics.fmean(
+        phase_latency_stats[phase] = {}
+        for metric in metric_names:
+            values = [
                 float((result.phase_latency_stats or {}).get(phase, {}).get(metric, 0.0))
                 for result in trials
-            )
-            for metric in metric_names
-        }
+            ]
+            phase_latency_stats[phase][metric] = statistics.fmean(values)
+            if metric in phase_uncertainty_metrics:
+                phase_latency_stats[phase][f"{metric}_std"] = statistics.stdev(values)
+                phase_latency_stats[phase][f"{metric}_ci95"] = confidence_interval_95(values)
 
     return ScenarioResult(
         name=trials[0].name,
@@ -1777,10 +1873,31 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         reuse_phase_request_hit_rate=mean_attr("reuse_phase_request_hit_rate"),
         reuse_phase_token_ratio=mean_attr("reuse_phase_token_ratio"),
         repetitions=len(trials),
-        throughput_tok_s_std=statistics.pstdev(result.throughput_tok_s for result in trials),
-        goodput_tok_s_std=statistics.pstdev(result.goodput_tok_s for result in trials),
-        mean_ttft_s_std=statistics.pstdev(result.mean_ttft_s for result in trials),
-        mean_e2e_s_std=statistics.pstdev(result.mean_e2e_s for result in trials),
+        throughput_tok_s_std=statistics.stdev(result.throughput_tok_s for result in trials),
+        goodput_tok_s_std=statistics.stdev(result.goodput_tok_s for result in trials),
+        mean_ttft_s_std=statistics.stdev(result.mean_ttft_s for result in trials),
+        mean_ttpt_s_std=statistics.stdev(result.mean_ttpt_s for result in trials),
+        mean_e2e_s_std=statistics.stdev(result.mean_e2e_s for result in trials),
+        p90_e2e_s_std=statistics.stdev(result.p90_e2e_s for result in trials),
+        throughput_tok_s_ci95=confidence_interval_95(
+            result.throughput_tok_s for result in trials
+        ),
+        goodput_tok_s_ci95=confidence_interval_95(
+            result.goodput_tok_s for result in trials
+        ),
+        mean_ttft_s_ci95=confidence_interval_95(
+            result.mean_ttft_s for result in trials
+        ),
+        mean_ttpt_s_ci95=confidence_interval_95(
+            result.mean_ttpt_s for result in trials
+        ),
+        mean_e2e_s_ci95=confidence_interval_95(
+            result.mean_e2e_s for result in trials
+        ),
+        p90_e2e_s_ci95=confidence_interval_95(
+            result.p90_e2e_s for result in trials
+        ),
+        trial_results=[_trial_payload(result) for result in trials],
         phase_latency_stats=phase_latency_stats,
         pair_spill_count=round(mean_attr("pair_spill_count")),
         replica_copy_route_count=round(mean_attr("replica_copy_route_count")),
@@ -1816,10 +1933,13 @@ def fmt_pct(value: float) -> str:
     return f"{value * 100:.2f}%"
 
 
-def print_summary_table(results: list[ScenarioResult | None]):
+def print_summary_table(
+    results: list[ScenarioResult | None],
+    title: str = "Benchmark Summary",
+):
     # 横向总表：把所有场景放在同一张表里，便于直接看五种配置的整体差异。
     valid_results = [result for result in results if result is not None]
-    print("\nBenchmark Summary")
+    print(f"\n{title}")
     print("=" * 225)
     print(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
@@ -2004,19 +2124,23 @@ def print_summary_table(results: list[ScenarioResult | None]):
                 )
 
     if any(result.repetitions > 1 for result in valid_results):
-        print("\nRepeated-run variability (mean +/- population stddev)")
+        print("\nRepeated-run variability (mean +/- 95% CI; sample stddev is in JSON)")
         print(f"{'scenario':<22} {'throughput(tok/s)':>24} {'goodput(tok/s)':>24} {'TTFT(ms)':>24} {'E2E(ms)':>24}")
         for result in valid_results:
             print(
                 f"{result.name:<22} "
-                f"{result.throughput_tok_s:>10.2f} +/- {result.throughput_tok_s_std:<8.2f} "
-                f"{result.goodput_tok_s:>10.2f} +/- {result.goodput_tok_s_std:<8.2f} "
-                f"{result.mean_ttft_s * 1000:>10.2f} +/- {result.mean_ttft_s_std * 1000:<8.2f} "
-                f"{result.mean_e2e_s * 1000:>10.2f} +/- {result.mean_e2e_s_std * 1000:<8.2f}"
+                f"{result.throughput_tok_s:>10.2f} +/- {result.throughput_tok_s_ci95:<8.2f} "
+                f"{result.goodput_tok_s:>10.2f} +/- {result.goodput_tok_s_ci95:<8.2f} "
+                f"{result.mean_ttft_s * 1000:>10.2f} +/- {result.mean_ttft_s_ci95 * 1000:<8.2f} "
+                f"{result.mean_e2e_s * 1000:>10.2f} +/- {result.mean_e2e_s_ci95 * 1000:<8.2f}"
             )
 
 
-def save_summary_figure(results: list[ScenarioResult | None], output_path: str) -> None:
+def save_summary_figure(
+    results: list[ScenarioResult | None],
+    output_path: str,
+    title: str = "Benchmark Summary",
+) -> None:
     # 生成一张总览图：吞吐 / goodput、延迟、prefix hit、GPU 利用率分别放在不同子图。
     valid_results = [result for result in results if result is not None]
     if not valid_results:
@@ -2035,10 +2159,16 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
 
     throughput = [result.throughput_tok_s for result in valid_results]
     goodput = [result.goodput_tok_s for result in valid_results]
+    throughput_ci = [result.throughput_tok_s_ci95 for result in valid_results]
+    goodput_ci = [result.goodput_tok_s_ci95 for result in valid_results]
     ttft_ms = [result.mean_ttft_s * 1000.0 for result in valid_results]
     ttpt_ms = [result.mean_ttpt_s * 1000.0 for result in valid_results]
     e2e_ms = [result.mean_e2e_s * 1000.0 for result in valid_results]
     p90_e2e_ms = [result.p90_e2e_s * 1000.0 for result in valid_results]
+    ttft_ci_ms = [result.mean_ttft_s_ci95 * 1000.0 for result in valid_results]
+    ttpt_ci_ms = [result.mean_ttpt_s_ci95 * 1000.0 for result in valid_results]
+    e2e_ci_ms = [result.mean_e2e_s_ci95 * 1000.0 for result in valid_results]
+    p90_e2e_ci_ms = [result.p90_e2e_s_ci95 * 1000.0 for result in valid_results]
     route_hit_pct = [result.route_hit_rate * 100.0 for result in valid_results]
     owner_hit_pct = [result.routed_to_prefix_owner_rate * 100.0 for result in valid_results]
     local_hit_pct = [result.prefix_hit_rate * 100.0 for result in valid_results]
@@ -2047,7 +2177,7 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     gpu_mem_util = [result.gpu_mem_util_mean if result.gpu_mem_util_mean is not None else 0.0 for result in valid_results]
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    fig.suptitle("Shared Prefix Benchmark Summary", fontsize=16)
+    fig.suptitle(title, fontsize=16)
     palettes = {
         "throughput": ["#0072B2", "#E69F00"],
         "latency": ["#009E73", "#D55E00", "#CC79A7", "#56B4E9"],
@@ -2055,6 +2185,7 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
         "util": ["#882255", "#44AA99"],
     }
     bar_style = {"edgecolor": "#333333", "linewidth": 0.45}
+    error_style = {"elinewidth": 0.8, "ecolor": "#222222", "capthick": 0.8}
 
     def annotate_bars(ax, bars, suffix: str = "", decimals: int = 1):
         max_height = 0.0
@@ -2080,6 +2211,9 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     bars = axes[0, 0].bar(
         [i - width / 2 for i in x],
         throughput,
+        yerr=throughput_ci,
+        capsize=3,
+        error_kw=error_style,
         width=width,
         label="throughput",
         color=palettes["throughput"][0],
@@ -2089,6 +2223,9 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     bars = axes[0, 0].bar(
         [i + width / 2 for i in x],
         goodput,
+        yerr=goodput_ci,
+        capsize=3,
+        error_kw=error_style,
         width=width,
         label="goodput",
         color=palettes["throughput"][1],
@@ -2105,6 +2242,9 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     bars = axes[0, 1].bar(
         [i - 1.5 * latency_width for i in x],
         ttft_ms,
+        yerr=ttft_ci_ms,
+        capsize=3,
+        error_kw=error_style,
         width=latency_width,
         label="TTFT mean",
         color=palettes["latency"][0],
@@ -2114,6 +2254,9 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     bars = axes[0, 1].bar(
         [i - 0.5 * latency_width for i in x],
         ttpt_ms,
+        yerr=ttpt_ci_ms,
+        capsize=3,
+        error_kw=error_style,
         width=latency_width,
         label="TTPT mean",
         color=palettes["latency"][1],
@@ -2123,6 +2266,9 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     bars = axes[0, 1].bar(
         [i + 0.5 * latency_width for i in x],
         e2e_ms,
+        yerr=e2e_ci_ms,
+        capsize=3,
+        error_kw=error_style,
         width=latency_width,
         label="E2E mean",
         color=palettes["latency"][2],
@@ -2132,6 +2278,9 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
     bars = axes[0, 1].bar(
         [i + 1.5 * latency_width for i in x],
         p90_e2e_ms,
+        yerr=p90_e2e_ci_ms,
+        capsize=3,
+        error_kw=error_style,
         width=latency_width,
         label="E2E p90",
         color=palettes["latency"][3],
@@ -2220,6 +2369,7 @@ def save_summary_figure(results: list[ScenarioResult | None], output_path: str) 
 def save_reuse_phase_figure(
     results: list[ScenarioResult | None],
     output_path: str,
+    title: str = "Benchmark",
 ) -> None:
     """Plot the handoff/reuse phase separately from cold warmup traffic."""
     valid_results = [
@@ -2250,12 +2400,23 @@ def save_reuse_phase_figure(
         ("Reuse P90 E2E", "ms", "p90_e2e_s", 1000.0, "#CC79A7"),
     ]
     fig, axes = plt.subplots(2, 2, figsize=(16, 9))
-    fig.suptitle("Reuse Phase Performance", fontsize=16)
+    fig.suptitle(f"{title}: Reuse Phase", fontsize=16)
     for ax, (title, ylabel, key, scale, color) in zip(axes.flat, metrics):
         values = [float(stats.get(key, 0.0)) * scale for stats in reuse_stats]
+        errors = [
+            float(stats.get(f"{key}_ci95", 0.0)) * scale
+            for stats in reuse_stats
+        ]
         bars = ax.bar(
             x,
             values,
+            yerr=errors,
+            capsize=3,
+            error_kw={
+                "elinewidth": 0.8,
+                "ecolor": "#222222",
+                "capthick": 0.8,
+            },
             color=color,
             edgecolor="#333333",
             linewidth=0.45,
@@ -2283,7 +2444,11 @@ def save_reuse_phase_figure(
     print(f"saved reuse phase figure: {output}")
 
 
-def save_rank_stats_figure(results: list[ScenarioResult | None], output_path: str) -> None:
+def save_rank_stats_figure(
+    results: list[ScenarioResult | None],
+    output_path: str,
+    title: str = "Benchmark",
+) -> None:
     valid_results = [
         result for result in results
         if result is not None and result.rank_stats
@@ -2313,7 +2478,7 @@ def save_rank_stats_figure(results: list[ScenarioResult | None], output_path: st
         figsize=(18, max(4, 3.5 * len(valid_results))),
         squeeze=False,
     )
-    fig.suptitle("Per-Rank Benchmark Diagnostics", fontsize=16)
+    fig.suptitle(f"{title}: Per-Rank Diagnostics", fontsize=16)
     rank_colors = ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377"]
 
     def rank_value(result: ScenarioResult, rank: int, key: str, default: float = 0.0) -> float:
@@ -2363,16 +2528,25 @@ def save_rank_stats_figure(results: list[ScenarioResult | None], output_path: st
     print(f"saved rank stats figure: {output}")
 
 
-def save_summary_json(results: dict, output_path: str) -> None:
+def save_summary_json(
+    results: dict,
+    output_path: str,
+    *,
+    metadata: dict | None = None,
+) -> None:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    payload = {
+        "metadata": metadata or {},
+        "results": results,
+    }
+    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"saved json: {output}")
 
 
 def parse_args():
     # benchmark 入口参数尽量保持简单：只暴露场景规模、模型、拓扑和 SLA
-    parser = argparse.ArgumentParser(description="Shared-prefix high-concurrency benchmark")
+    parser = argparse.ArgumentParser(description="LMPool end-to-end workload benchmark")
     parser.add_argument("--num-prompts", type=int, default=32)
     parser.add_argument("--prompt-repeat", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=1)
@@ -2391,6 +2565,12 @@ def parse_args():
     parser.add_argument("--handoff-warmup-prompts", type=int, default=0)
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--model-name-or-path", type=str, default=MODEL_CONFIG["model_name_or_path"])
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Model and KV-cache dtype; auto reads torch_dtype from config.json.",
+    )
     parser.add_argument("--nvlink-pairs", type=str, default="0,1")
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--kv-block-budget", type=int, default=None)
@@ -2580,6 +2760,14 @@ def main():
         )
 
     model_name = args.model_name_or_path
+    try:
+        runtime_model_config, model_metadata = resolve_model_runtime_config(
+            model_name,
+            MODEL_CONFIG,
+            dtype_override=args.dtype,
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot resolve model config for {model_name}: {exc}") from exc
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     prompts = build_prompts(
         tokenizer,
@@ -2597,7 +2785,7 @@ def main():
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
-        max_model_length=MODEL_CONFIG["max_model_length"],
+        max_model_length=runtime_model_config["max_model_length"],
     )
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
     nvlink_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else []
@@ -2627,7 +2815,7 @@ def main():
         config["require_exact_kv_block_budget"] = args.kv_block_budget is not None
 
     # single-gpu baseline：单卡独立执行，不启用全局池
-    baseline_config = make_config(1, False, None)
+    baseline_config = make_config(1, False, None, runtime_model_config)
     baseline_config["model_name_or_path"] = model_name
     baseline_config["max_cached_blocks"] = kv_block_budget
     baseline_config["random_seed"] = args.seed
@@ -2652,7 +2840,7 @@ def main():
     baseline.theoretical_prefix_hit_rate = theoretical_prefix_hit_rate
 
     # multi-gpu baseline：不共享 KV、不走控制面路由，但请求通过 round-robin 分发到多张卡
-    multi_gpu_config = make_config(args.world_size, False, None)
+    multi_gpu_config = make_config(args.world_size, False, None, runtime_model_config)
     multi_gpu_config["model_name_or_path"] = model_name
     multi_gpu_config["max_cached_blocks"] = kv_block_budget
     multi_gpu_config["random_seed"] = args.seed
@@ -2671,7 +2859,12 @@ def main():
     )
 
     # multi-gpu-kv-routing：走控制面路由，用来测 prefix 命中带来的收益
-    routing_config = make_config(args.world_size, True, nvlink_pairs or None)
+    routing_config = make_config(
+        args.world_size,
+        True,
+        nvlink_pairs or None,
+        runtime_model_config,
+    )
     routing_config["model_name_or_path"] = model_name
     routing_config["max_cached_blocks"] = kv_block_budget
     routing_config["enable_foreground_rebalance"] = False
@@ -2693,7 +2886,12 @@ def main():
     )
 
     # multi-gpu-kv-transfer：用 round-robin 分发，尽量隔离出 transfer / rebalance 的开销
-    eviction_config = make_config(args.world_size, True, nvlink_pairs or None)
+    eviction_config = make_config(
+        args.world_size,
+        True,
+        nvlink_pairs or None,
+        runtime_model_config,
+    )
     eviction_config["model_name_or_path"] = model_name
     eviction_config["max_cached_blocks"] = kv_block_budget
     eviction_config["random_seed"] = args.seed
@@ -2724,7 +2922,12 @@ def main():
         else:
             # multi-gpu-lmpool：真实全局池化路径，控制面路由 + 数据面执行一起跑。
             pool_pairs = nvlink_pairs or None
-            pool_config = make_config(args.world_size, True, pool_pairs)
+            pool_config = make_config(
+                args.world_size,
+                True,
+                pool_pairs,
+                runtime_model_config,
+            )
             pool_config["model_name_or_path"] = model_name
             pool_config["max_cached_blocks"] = kv_block_budget
             pool_config["random_seed"] = args.seed
@@ -2757,11 +2960,14 @@ def main():
     for result in all_results:
         if result is not None:
             result.theoretical_prefix_hit_rate = theoretical_prefix_hit_rate
-    print_summary_table(all_results)
+    summary_title = (
+        f"{workload_summary_title(args.workload)} ({model_metadata['label']})"
+    )
+    print_summary_table(all_results, title=summary_title)
     if args.output_figure:
-        save_summary_figure(all_results, args.output_figure)
-        save_reuse_phase_figure(all_results, args.output_figure)
-        save_rank_stats_figure(all_results, args.output_figure)
+        save_summary_figure(all_results, args.output_figure, title=summary_title)
+        save_reuse_phase_figure(all_results, args.output_figure, title=summary_title)
+        save_rank_stats_figure(all_results, args.output_figure, title=summary_title)
     if args.output_json:
         payload = {
             "single-gpu": asdict(baseline),
@@ -2770,7 +2976,20 @@ def main():
             "multi-gpu-kv-transfer": asdict(kv_eviction) if kv_eviction is not None else None,
             "multi-gpu-lmpool": asdict(pool_result) if pool_result is not None else None,
         }
-        save_summary_json(payload, args.output_json)
+        run_metadata = build_run_metadata(
+            "benchmark_e2e",
+            args,
+            model=model_metadata,
+            resolved_config={
+                **runtime_model_config,
+                "resolved_kv_block_budget": kv_block_budget,
+                "resolved_memory_skew_prefix_groups": memory_skew_prefix_groups,
+                "resolved_handoff_prefix_groups": handoff_prefix_groups,
+                "resolved_handoff_warmup_prompts": handoff_warmup_prompts,
+                "resolved_nvlink_pairs": nvlink_pairs,
+            },
+        )
+        save_summary_json(payload, args.output_json, metadata=run_metadata)
 
 
 if __name__ == "__main__":

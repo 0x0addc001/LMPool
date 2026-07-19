@@ -287,6 +287,9 @@ The `benchmarks/` directory exposes three paper-oriented executable entries:
 
 Use the reproducible command matrix in
 [`benchmarks/PAPER_RUNBOOK.md`](./benchmarks/PAPER_RUNBOOK.md) for paper runs.
+The accompanying `benchmarks/run_paper_suite.sh` runs every experiment with
+both Qwen3-0.6B and Qwen3-1.7B, resolving model structure and dtype from each
+local snapshot and preserving raw trials plus 95% confidence intervals.
 
 The end-to-end script reports the following scenarios:
 

@@ -1,3 +1,4 @@
+import json
 import re
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import pytest
 from benchmarks.benchmark_e2e import (
     MODEL_CONFIG,
     build_prompts,
+    confidence_interval_95,
     compute_sequence_prefix_hashes,
     measure_single_gpu_prefix_hit_rate,
     prepare_benchmark_rendezvous,
@@ -15,6 +17,10 @@ from benchmarks.benchmark_e2e import (
     resolve_memory_skew_source_ranks,
     resolve_memory_skew_target_by_source,
     resolve_kv_block_budget,
+    save_reuse_phase_figure,
+    save_summary_figure,
+    save_summary_json,
+    workload_summary_title,
 )
 
 
@@ -253,3 +259,84 @@ def test_kv_block_budget_rejects_non_positive_value():
 
     with pytest.raises(ValueError, match="must be >= 1"):
         resolve_kv_block_budget(args)
+
+
+@pytest.mark.parametrize(
+    ("workload", "expected"),
+    [
+        ("locality", "KV Locality End-to-End Benchmark Summary"),
+        ("load-skew", "Load-Skew End-to-End Benchmark Summary"),
+        ("memory-skew", "Memory-Skew KV Transfer Benchmark Summary"),
+        ("session-handoff", "Session-Handoff End-to-End Benchmark Summary"),
+    ],
+)
+def test_workload_summary_title_is_specific(workload, expected):
+    assert workload_summary_title(workload) == expected
+
+
+def test_workload_summary_title_rejects_unknown_workload():
+    with pytest.raises(ValueError, match="unknown workload"):
+        workload_summary_title("unknown")
+
+
+def test_confidence_interval_uses_repeated_samples():
+    assert confidence_interval_95([1.0]) == 0.0
+    assert confidence_interval_95([2.0, 2.0, 2.0]) == 0.0
+    assert confidence_interval_95([1.0, 2.0, 4.0]) > 0.0
+
+
+def test_summary_json_keeps_metadata_separate_from_results(tmp_path):
+    output = tmp_path / "summary.json"
+
+    save_summary_json(
+        {"multi-gpu": {"throughput_tok_s": 12.0}},
+        str(output),
+        metadata={"schema_version": 2, "model": {"hidden_size": 2048}},
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["metadata"]["model"]["hidden_size"] == 2048
+    assert payload["results"]["multi-gpu"]["throughput_tok_s"] == 12.0
+
+
+def test_summary_figures_accept_confidence_intervals(tmp_path):
+    result = SimpleNamespace(
+        name="multi-gpu-lmpool",
+        throughput_tok_s=100.0,
+        goodput_tok_s=90.0,
+        throughput_tok_s_ci95=4.0,
+        goodput_tok_s_ci95=3.0,
+        mean_ttft_s=0.2,
+        mean_ttpt_s=0.03,
+        mean_e2e_s=1.0,
+        p90_e2e_s=1.4,
+        mean_ttft_s_ci95=0.01,
+        mean_ttpt_s_ci95=0.002,
+        mean_e2e_s_ci95=0.05,
+        p90_e2e_s_ci95=0.08,
+        route_hit_rate=0.8,
+        routed_to_prefix_owner_rate=0.75,
+        prefix_hit_rate=0.7,
+        initial_cached_token_ratio=0.65,
+        gpu_util_mean=60.0,
+        gpu_mem_util_mean=30.0,
+        phase_latency_stats={
+            "reuse": {
+                "throughput_tok_s": 120.0,
+                "throughput_tok_s_ci95": 5.0,
+                "mean_ttft_s": 0.1,
+                "mean_ttft_s_ci95": 0.01,
+                "mean_e2e_s": 0.8,
+                "mean_e2e_s_ci95": 0.04,
+                "p90_e2e_s": 1.1,
+                "p90_e2e_s_ci95": 0.07,
+            }
+        },
+    )
+    output = tmp_path / "summary.png"
+
+    save_summary_figure([result], str(output), title="Test Model")
+    save_reuse_phase_figure([result], str(output), title="Test Model")
+
+    assert output.stat().st_size > 0
+    assert (tmp_path / "summary_reuse_phase.png").stat().st_size > 0

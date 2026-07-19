@@ -43,9 +43,11 @@ try:
         parse_pairs,
         print_summary_table,
         run_repeated_engine_scenario,
+        save_rank_stats_figure,
         save_summary_figure,
         save_summary_json,
     )
+    from .benchmark_utils import build_run_metadata, resolve_model_runtime_config
 except ImportError:
     from benchmark_e2e import (
         MODEL_CONFIG,
@@ -56,9 +58,11 @@ except ImportError:
         parse_pairs,
         print_summary_table,
         run_repeated_engine_scenario,
+        save_rank_stats_figure,
         save_summary_figure,
         save_summary_json,
     )
+    from benchmark_utils import build_run_metadata, resolve_model_runtime_config
 
 
 def parse_args():
@@ -78,6 +82,12 @@ def parse_args():
     parser.add_argument(
         "--model-name-or-path",
         default=MODEL_CONFIG["model_name_or_path"],
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Model and KV-cache dtype; auto reads torch_dtype from config.json.",
     )
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--nvlink-pairs", default="0,1")
@@ -191,6 +201,16 @@ def main():
     args = parse_args()
     _validate_args(args)
 
+    try:
+        runtime_model_config, model_metadata = resolve_model_runtime_config(
+            args.model_name_or_path,
+            MODEL_CONFIG,
+            dtype_override=args.dtype,
+        )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(
+            f"cannot resolve model config for {args.model_name_or_path}: {exc}"
+        ) from exc
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     prompts = build_prompts(
         tokenizer,
@@ -204,7 +224,7 @@ def main():
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
-        max_model_length=MODEL_CONFIG["max_model_length"],
+        max_model_length=runtime_model_config["max_model_length"],
     )
     common = {
         "prompts": prompts,
@@ -215,7 +235,9 @@ def main():
         "workload": "locality",
     }
 
-    single_config = _configure(make_config(1, False, None), args)
+    single_config = _configure(
+        make_config(1, False, None, runtime_model_config), args
+    )
     single = run_repeated_engine_scenario(
         args.repetitions,
         name="single-gpu",
@@ -224,7 +246,9 @@ def main():
         **common,
     )
 
-    multi_config = _configure(make_config(args.world_size, False, None), args)
+    multi_config = _configure(
+        make_config(args.world_size, False, None, runtime_model_config), args
+    )
     multi = run_repeated_engine_scenario(
         args.repetitions,
         name="multi-gpu",
@@ -235,7 +259,7 @@ def main():
 
     pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else None
     routing_config = _configure_routing(
-        make_config(args.world_size, True, pairs), args
+        make_config(args.world_size, True, pairs, runtime_model_config), args
     )
     routing = run_repeated_engine_scenario(
         args.repetitions,
@@ -255,13 +279,28 @@ def main():
     for result in results:
         result.theoretical_prefix_hit_rate = theoretical_hit
 
-    print_summary_table(results)
+    summary_title = (
+        f"KV-Aware Routing Benchmark Summary ({model_metadata['label']})"
+    )
+    print_summary_table(results, title=summary_title)
     if args.output_figure:
-        save_summary_figure(results, args.output_figure)
+        save_summary_figure(results, args.output_figure, title=summary_title)
+        save_rank_stats_figure(results, args.output_figure, title=summary_title)
     if args.output_json:
+        metadata = build_run_metadata(
+            "benchmark_kv_routing",
+            args,
+            model=model_metadata,
+            resolved_config={
+                **runtime_model_config,
+                "resolved_kv_block_budget": args.kv_block_budget,
+                "resolved_nvlink_pairs": pairs or [],
+            },
+        )
         save_summary_json(
             {result.name: asdict(result) for result in results},
             args.output_json,
+            metadata=metadata,
         )
 
 

@@ -45,6 +45,7 @@ def prewarm_p2p_pairs(
     num_kv_heads: int = 1,
     head_dim: int = 1,
     num_blocks: int = 1,
+    dtype: torch.dtype | None = None,
 ) -> list[dict]:
     """Warm each NVLink pair with a representative packed KV payload.
 
@@ -76,7 +77,11 @@ def prewarm_p2p_pairs(
         max(1, int(num_kv_heads)),
         max(1, int(head_dim)),
     )
-    payload = torch.empty(payload_shape, dtype=torch.float16, device=device)
+    payload = torch.empty(
+        payload_shape,
+        dtype=dtype or torch.get_default_dtype(),
+        device=device,
+    )
     observations = []
     for pair_index, (src, dst) in enumerate(normalized_pairs):
         group = _pair_group(src, dst)

@@ -21,6 +21,30 @@ from lmpool.utils import *
 logger = logging.getLogger(__name__)
 
 
+def _resolve_torch_dtype(value) -> torch.dtype:
+    if isinstance(value, torch.dtype):
+        return value
+    name = str(value or "float32").lower().replace("torch.", "")
+    aliases = {
+        "fp16": "float16",
+        "half": "float16",
+        "bf16": "bfloat16",
+        "fp32": "float32",
+        "float": "float32",
+    }
+    name = aliases.get(name, name)
+    dtypes = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    if name not in dtypes:
+        raise ValueError(
+            f"Unsupported torch_dtype {value!r}; expected float16, bfloat16, or float32"
+        )
+    return dtypes[name]
+
+
 def _resolve_model_family(config: dict) -> str:
     """Resolve the custom model implementation from metadata, not cache path names."""
     model_path = Path(config["model_name_or_path"]).expanduser()
@@ -75,6 +99,8 @@ class ModelRunner:
         self._decode_log_counter = 0
         self._decode_log_tokens = 0
         self._decode_log_seconds = 0.0
+        self.default_dtype = _resolve_torch_dtype(config.get("torch_dtype", "float32"))
+        torch.set_default_dtype(self.default_dtype)
 
         self.rank = rank
         torch.cuda.set_device(rank)
@@ -173,9 +199,6 @@ class ModelRunner:
         # self.model = self.model.cuda(rank)
 
         self.sampler = SamplerLayer()
-
-        # Store default dtype before it's needed in allocate_kv_cache
-        self.default_dtype = torch.get_default_dtype()
 
         # Debug flag for first decode step
         # self._first_decode = False

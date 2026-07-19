@@ -280,6 +280,9 @@ CUDA_VISIBLE_DEVICES=0 uv run python main.py
 
 论文实验请使用
 [`benchmarks/PAPER_RUNBOOK.md`](./benchmarks/PAPER_RUNBOOK.md) 中固定的环境记录、测试和命令矩阵。
+配套的 `benchmarks/run_paper_suite.sh` 会对 Qwen3-0.6B 和 Qwen3-1.7B
+分别执行完整实验，从各自本地 snapshot 解析模型结构和 dtype，并保留原始重复结果与
+95% 置信区间。
 
 端到端脚本报告以下场景：
 

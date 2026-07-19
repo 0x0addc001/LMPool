@@ -28,6 +28,12 @@ The coverage is organized around the runtime structure:
   - deterministic seeded request ordering
   - memory-skew and two-phase session-handoff trace construction
   - common KV-budget and transfer-placement validation
+  - schema-v2 JSON output and repeated-run confidence intervals
+
+- `tests/test_benchmark_utils.py`
+  - Qwen3-0.6B / Qwen3-1.7B dynamic runtime-config resolution
+  - model/KV dtype byte consistency
+  - exact benchmark metadata capture
 
 - `tests/test_benchmark_kv_routing.py`
   - routing benchmark's independent argument surface
@@ -36,7 +42,8 @@ The coverage is organized around the runtime structure:
 
 - `tests/test_benchmark_kv_transfer.py`
   - transfer block-count sweep parsing and validation
-  - machine-readable JSON export contract
+  - model-shaped transfer-contract resolution
+  - machine-readable schema-v2 JSON export contract
 
 - `tests/test_control_plane.py`
   - control-plane routing
@@ -87,6 +94,7 @@ The coverage is organized around the runtime structure:
   - prefill / decode input preparation
   - transfer forwarding
   - KV cache lookup helpers
+  - model-config dtype resolution
 
 - `tests/test_scheduler.py`
   - local waiting / running queue transitions

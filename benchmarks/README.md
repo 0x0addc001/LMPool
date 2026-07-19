@@ -1,8 +1,7 @@
 # Benchmarks
 
 The directory contains three publishable benchmark entries. Each answers one
-specific evaluation question and is a complete executable script rather than a
-compatibility wrapper:
+specific evaluation question and is a complete executable script:
 
 - `benchmark_kv_routing.py`: does global KV-aware routing improve locality,
   throughput, and request latency over topology-blind multi-GPU dispatch? It
@@ -16,12 +15,12 @@ compatibility wrapper:
   all five system configurations and reports warm-up and reuse phases
   separately.
 
-The old `shared_prefix_benchmark.py` and `kv_transfer_benchmark.py` names were
-removed. Keeping duplicate entry names made the artifact ambiguous without
-adding an independent experimental claim.
-
 The complete six-GPU paper command matrix, environment capture, acceptance
 criteria, and test commands are in [`PAPER_RUNBOOK.md`](./PAPER_RUNBOOK.md).
+[`run_paper_suite.sh`](./run_paper_suite.sh) executes that matrix for both
+Qwen3-0.6B and Qwen3-1.7B. It resolves each model's architecture, KV geometry,
+and dtype from `config.json`, so changing `--model-name-or-path` does not reuse
+the 0.6B structure accidentally.
 
 ## Scenarios
 
@@ -161,9 +160,10 @@ export. Parent directories are created automatically.
   system comparisons with equal decode work.
 - `--seed`: base random seed. Data-plane rank `r` uses `seed + r`.
 - `--repetitions`: number of complete runs per scenario. Results are reported as
-  means; JSON and the console variability table include throughput, goodput,
-  TTFT, and E2E population standard deviations. Use at least `3` for paper
-  results; the default `1` is intended for development runs.
+  means; JSON retains every raw trial, sample standard deviations, and 95%
+  Student-t confidence intervals. Overview figures use the 95% intervals as
+  error bars. Use at least `3` for paper results; the default `1` is intended
+  for development runs.
 - `--workload`: `locality`, `load-skew`, `memory-skew`, or `session-handoff`.
   `memory-skew` is a
   deterministic three-phase trace: hot-prefix warm-up on source ranks,
@@ -199,8 +199,16 @@ export. Parent directories are created automatically.
   handoff. `0` preserves the original 50/50 split. Set it to the prefix-group
   count to measure several reuse rounds after one cache-building round, e.g.
   `32` warm-up and `96` reuse requests for `--num-prompts 128`.
-- `--output-json`: write raw scenario results to JSON. Parent directories are created automatically, and the script prints `saved json: ...` on success.
-- `--model-name-or-path`: model name or local model path. The default config targets `Qwen/Qwen3-0.6B`.
+- `--output-json`: write a schema-v2 artifact with top-level `metadata` and
+  `results`. Metadata records the exact command, Git state, model structure,
+  dtype, and resolved runtime config; repeated scenario results include all raw
+  `trial_results`. Parent directories are created automatically.
+- `--model-name-or-path`: model name or local model path. Qwen3-0.6B and
+  Qwen3-1.7B are both resolved dynamically; paper runs should use immutable
+  local snapshot paths rather than mutable repository names.
+- `--dtype`: model and KV-cache dtype. `auto` (default) reads the model config;
+  explicit `float16`, `bfloat16`, or `float32` overrides it consistently in
+  model execution, KV allocation, prewarm payloads, and transfer cost bytes.
 - `--nvlink-pairs`: logical NVLink pairs after `CUDA_VISIBLE_DEVICES` remapping, e.g. `0,1` or `0,1;2,3`. Quote values containing semicolons, e.g. `--nvlink-pairs "0,2;1,3;4,5;6,7"`. Pass an empty string to let the engine try `nvidia-smi topo -m` detection.
 - `--world-size`: number of data-plane worker ranks for multi-GPU scenarios. The default is `2`; use `--world-size 8` for eight visible GPUs.
 - `--kv-block-budget`: requested per-rank KV block count used by all five
@@ -301,8 +309,7 @@ Routing cost-model defaults are set in `MODEL_CONFIG` inside `benchmark_e2e.py`:
   loop of failed control-plane transactions.
 - For publishable comparisons, keep `--ignore-eos`, set an explicit `--seed`,
   and use `--repetitions 3` or more. A repeated JSON result includes
-  `repetitions`, `throughput_tok_s_std`, `goodput_tok_s_std`,
-  `mean_ttft_s_std`, and `mean_e2e_s_std`.
+  raw `trial_results`, sample standard deviations, and `*_ci95` half-widths.
 - `multi-gpu` is an online round-robin baseline except for memory-skew's
   explicitly defined cross-pair reuse phase; it is not static offline sharding.
 - `multi-gpu-kv-transfer` uses the same ingress placement as `multi-gpu` and
@@ -344,10 +351,9 @@ Use `benchmark_kv_transfer.py` to validate the data-plane transfer primitive dir
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_kv_transfer.py \
-  --num-layers 28 \
+  --model-name-or-path /path/to/Qwen3-1.7B \
+  --dtype auto \
   --block-size 256 \
-  --num-kv-heads 8 \
-  --head-dim 128 \
   --block-counts 1,2,4,8 \
   --iterations 100 \
   --warmup 20 \
@@ -358,3 +364,6 @@ CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benc
 It reports mean / p95 transfer latency, transferred bytes per iteration,
 effective GiB/s, and data validation status for every payload size. This
 benchmark isolates transfer from routing and model execution.
+When `--model-name-or-path` is supplied, `--num-layers`, `--num-kv-heads`, and
+`--head-dim` are inferred. Conflicting explicit values fail fast instead of
+silently measuring a payload that does not match the serving model.

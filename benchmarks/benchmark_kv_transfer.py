@@ -7,10 +7,8 @@ Purpose:
 
 Example:
   CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_kv_transfer.py \
-    --num-layers 28 \
+    --model-name-or-path /path/to/Qwen3-0.6B \
     --block-size 256 \
-    --num-kv-heads 8 \
-    --head-dim 128 \
     --block-counts 1,2,4,8 \
     --iterations 100 \
     --warmup 20 \
@@ -44,6 +42,26 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lmpool.engine.kv_transfer import prewarm_p2p_pairs, swap_in
+
+try:
+    from .benchmark_utils import (
+        build_run_metadata,
+        normalize_dtype_name,
+        resolve_model_runtime_config,
+    )
+except ImportError:
+    from benchmark_utils import (
+        build_run_metadata,
+        normalize_dtype_name,
+        resolve_model_runtime_config,
+    )
+
+
+_TORCH_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
 
 
 def _find_free_port() -> int:
@@ -84,6 +102,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
     src_blocks = list(range(args.num_transfer_blocks))
     dst_blocks = list(range(args.num_transfer_blocks, args.num_transfer_blocks * 2))
     num_blocks = args.num_transfer_blocks * 2
+    transfer_dtype = _TORCH_DTYPES[args.resolved_dtype]
     kv_cache = torch.zeros(
         2,
         args.num_layers,
@@ -91,7 +110,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
         args.block_size,
         args.num_kv_heads,
         args.head_dim,
-        dtype=torch.float16,
+        dtype=transfer_dtype,
         device=f"cuda:{rank}",
     )
     if rank == 0:
@@ -104,6 +123,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
         num_kv_heads=args.num_kv_heads,
         head_dim=args.head_dim,
         num_blocks=args.num_transfer_blocks,
+        dtype=transfer_dtype,
     )
     dist.barrier()
     total_iters = args.warmup + args.iterations
@@ -154,8 +174,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
         * args.num_kv_heads
         * args.head_dim
         * 2  # K and V
-        * torch.finfo(torch.float16).bits
-        // 8
+        * kv_cache.element_size()
     )
     result_queue.put({
         "rank": rank,
@@ -177,10 +196,21 @@ def parse_block_counts(raw: str, fallback: int) -> list[int]:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="KV transfer microbenchmark")
-    parser.add_argument("--num-layers", type=int, default=28)
+    parser.add_argument(
+        "--model-name-or-path",
+        default="",
+        help="Optional local/Hugging Face model whose KV geometry and dtype are measured.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Transfer payload dtype; auto uses model config or float16 without a model.",
+    )
+    parser.add_argument("--num-layers", type=int, default=None)
     parser.add_argument("--block-size", type=int, default=256)
-    parser.add_argument("--num-kv-heads", type=int, default=8)
-    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--num-kv-heads", type=int, default=None)
+    parser.add_argument("--head-dim", type=int, default=None)
     parser.add_argument("--num-transfer-blocks", type=int, default=2)
     parser.add_argument(
         "--block-counts",
@@ -192,6 +222,54 @@ def parse_args(argv=None):
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-figure", default="")
     return parser.parse_args(argv)
+
+
+def resolve_transfer_contract(args) -> tuple[argparse.Namespace, dict | None, dict]:
+    """Resolve one model-consistent KV payload contract before spawning workers."""
+    model_metadata = None
+    resolved_config: dict = {}
+    model_geometry = {}
+    if args.model_name_or_path:
+        resolved_config, model_metadata = resolve_model_runtime_config(
+            args.model_name_or_path,
+            {"max_model_length": 2048},
+            dtype_override=args.dtype,
+        )
+        model_geometry = {
+            "num_layers": resolved_config["num_layers"],
+            "num_kv_heads": resolved_config["num_kv_heads"],
+            "head_dim": resolved_config["head_dim"],
+        }
+
+    fallbacks = {
+        "num_layers": 28,
+        "num_kv_heads": 8,
+        "head_dim": 128,
+    }
+    for name, fallback in fallbacks.items():
+        explicit = getattr(args, name)
+        model_value = model_geometry.get(name)
+        if explicit is not None and model_value is not None and explicit != model_value:
+            option = name.replace("_", "-")
+            raise ValueError(
+                f"--{option}={explicit} conflicts with model config value {model_value}"
+            )
+        setattr(args, name, explicit if explicit is not None else model_value or fallback)
+
+    args.resolved_dtype = (
+        resolved_config["torch_dtype"]
+        if resolved_config
+        else normalize_dtype_name(args.dtype, auto_fallback="float16")
+    )
+    resolved_config = {
+        **resolved_config,
+        "block_size": args.block_size,
+        "num_layers": args.num_layers,
+        "num_kv_heads": args.num_kv_heads,
+        "head_dim": args.head_dim,
+        "torch_dtype": args.resolved_dtype,
+    }
+    return args, model_metadata, resolved_config
 
 
 def run_transfer_case(args, num_transfer_blocks: int) -> dict:
@@ -247,22 +325,27 @@ def run_transfer_case(args, num_transfer_blocks: int) -> dict:
     }
 
 
-def save_results_json(args, results: list[dict], output_path: str) -> None:
+def save_results_json(
+    results: list[dict],
+    output_path: str,
+    *,
+    metadata: dict,
+) -> None:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    config = {
-        key: value
-        for key, value in vars(args).items()
-        if key not in {"output_json", "output_figure"}
-    }
     output.write_text(
-        json.dumps({"config": config, "results": results}, indent=2),
+        json.dumps({"metadata": metadata, "results": results}, indent=2),
         encoding="utf-8",
     )
     print(f"saved json: {output}")
 
 
-def save_results_figure(results: list[dict], output_path: str) -> None:
+def save_results_figure(
+    results: list[dict],
+    output_path: str,
+    *,
+    title: str = "KV Transfer Microbenchmark",
+) -> None:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -275,6 +358,7 @@ def save_results_figure(results: list[dict], output_path: str) -> None:
     x = list(range(len(results)))
     width = 0.36
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    fig.suptitle(title, fontsize=13)
 
     mean_bars = axes[0].bar(
         [value - width / 2 for value in x],
@@ -319,6 +403,10 @@ def save_results_figure(results: list[dict], output_path: str) -> None:
 
 def main() -> None:
     args = parse_args()
+    try:
+        args, model_metadata, resolved_config = resolve_transfer_contract(args)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot resolve transfer benchmark config: {exc}") from exc
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise SystemExit("requires at least 2 visible CUDA devices")
     if args.iterations < 1:
@@ -338,6 +426,13 @@ def main() -> None:
 
     results = [run_transfer_case(args, block_count) for block_count in block_counts]
 
+    metadata = build_run_metadata(
+        "benchmark_kv_transfer",
+        args,
+        model=model_metadata,
+        resolved_config=resolved_config,
+    )
+
     print("KV Transfer Benchmark")
     print("=" * 80)
     print(
@@ -354,9 +449,18 @@ def main() -> None:
             f"{result['data_validation']:>12}"
         )
     if args.output_figure:
-        save_results_figure(results, args.output_figure)
+        model_label = (
+            model_metadata["label"]
+            if model_metadata is not None
+            else f"custom-{args.resolved_dtype}"
+        )
+        save_results_figure(
+            results,
+            args.output_figure,
+            title=f"KV Transfer Microbenchmark: {model_label}",
+        )
     if args.output_json:
-        save_results_json(args, results, args.output_json)
+        save_results_json(results, args.output_json, metadata=metadata)
 
 
 if __name__ == "__main__":

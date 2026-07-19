@@ -15,12 +15,7 @@ def test_parse_block_counts_rejects_non_positive_values():
         benchmark.parse_block_counts("1,0,4", 2)
 
 
-def test_transfer_benchmark_json_contains_config_and_results(tmp_path):
-    args = benchmark.parse_args([
-        "--block-counts", "1,2",
-        "--iterations", "20",
-        "--warmup", "5",
-    ])
+def test_transfer_benchmark_json_contains_metadata_and_results(tmp_path):
     results = [{
         "num_transfer_blocks": 1,
         "bytes_per_iteration": 1024,
@@ -32,13 +27,29 @@ def test_transfer_benchmark_json_contains_config_and_results(tmp_path):
     }]
     output = tmp_path / "transfer.json"
 
-    benchmark.save_results_json(args, results, str(output))
+    metadata = {
+        "schema_version": 2,
+        "arguments": {"block_counts": "1,2", "iterations": 20},
+    }
+    benchmark.save_results_json(results, str(output), metadata=metadata)
 
     payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["config"]["block_counts"] == "1,2"
-    assert payload["config"]["iterations"] == 20
+    assert payload["metadata"] == metadata
     assert payload["results"] == results
 
     figure = tmp_path / "transfer.png"
     benchmark.save_results_figure(results, str(figure))
     assert figure.stat().st_size > 0
+
+
+def test_transfer_contract_defaults_to_qwen_geometry_without_model():
+    args = benchmark.parse_args([])
+
+    resolved, model_metadata, config = benchmark.resolve_transfer_contract(args)
+
+    assert model_metadata is None
+    assert resolved.num_layers == 28
+    assert resolved.num_kv_heads == 8
+    assert resolved.head_dim == 128
+    assert resolved.resolved_dtype == "float16"
+    assert config["torch_dtype"] == "float16"
