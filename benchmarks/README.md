@@ -55,8 +55,15 @@ the 0.6B structure accidentally.
   already cached on the initial prefill. Unlike binary `DP req hit`, this
   measures how much prefill work is
   actually avoided.
-- `trace upper` (`theoretical_prefix_hit_rate`): capacity-unbounded prefix-hit upper bound implied by the
-  workload trace; it is a reference, not an observed runtime hit rate.
+- `trace req share` (`trace_request_share_rate`): fraction of trace requests
+  whose longest prefix contains at least one complete block already observed
+  in an earlier request. This is an unlimited-capacity, perfect-placement
+  dataset property, not an observed runtime hit rate.
+- `trace tok share` (`trace_token_share_ratio`): fraction of all prompt tokens
+  covered by each request's longest block-aligned prefix seen earlier in the
+  ordered trace. It measures the amount of theoretically reusable work and
+  excludes partial tail blocks. The legacy `theoretical_prefix_hit_rate` field
+  remains as an alias for `trace_request_share_rate`.
 - `CP blk match` (`route_matched_block_ratio`): fraction of complete prompt blocks that the control plane
   believed reusable on the selected worker at routing time.
 - `CP reclaim` (`reclaimable_capacity_route_rate`): fraction of control-plane
@@ -148,6 +155,25 @@ the result supports the individual mechanisms but not their composition.
 
 All scripts print `saved json: ...` and `saved figure: ...` after successful
 export. Parent directories are created automatically.
+
+## Dataset Profiling
+
+`benchmark_kv_routing.py` and `benchmark_e2e.py` profile the generated prompt
+trace before launching workers. The complete profile is stored at
+`metadata.dataset_profile` in schema-v2 JSON artifacts. With the paper
+configuration, Qwen3 tokenization, and 256-token KV blocks, the deterministic
+traces have the following intrinsic reuse potential:
+
+| Workload | Requests | Prefix groups | Prompt tokens | Request prefix share | Token prefix share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Locality/routing | 192 | 16 | 365,880 | 91.67% | 86.20% |
+| Load skew | 192 | hot + 4 cold | 320,232 | 97.40% | 90.57% |
+| Memory skew | 128 | 15 hot + pressure | 214,064 | 63.28% | 67.81% |
+| Session handoff | 128 | 32 | 244,048 | 75.00% | 70.49% |
+
+These are trace-level upper bounds under ordered replay, unlimited cache, and
+perfect placement. Compare them with runtime `DP req hit` and `DP tok reuse` to
+quantify losses from finite capacity, dispatch, eviction, and transfer policy.
 
 ## Parameters
 

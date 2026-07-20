@@ -10,6 +10,7 @@ from benchmarks.benchmark_e2e import (
     confidence_interval_95,
     compute_sequence_prefix_hashes,
     measure_single_gpu_prefix_hit_rate,
+    profile_trace_prefix_sharing,
     prepare_benchmark_rendezvous,
     resolve_memory_skew_prefix_groups,
     resolve_handoff_prefix_groups,
@@ -216,7 +217,7 @@ def test_sequence_prefix_hashes_are_cumulative_and_ignore_partial_block():
     assert hashes[0] != hashes[1]
 
 
-def test_single_gpu_prefix_measurement_publishes_ready_kv_blocks():
+def test_legacy_prefix_measurement_matches_trace_request_share_rate():
     tokenizer = IdentityChatTokenizer()
 
     hit_rate = measure_single_gpu_prefix_hit_rate(
@@ -240,6 +241,34 @@ def test_theoretical_prefix_measurement_is_not_limited_by_runtime_budget():
     )
 
     assert hit_rate == 0.5
+
+
+def test_trace_prefix_profile_reports_request_and_token_sharing():
+    profile = profile_trace_prefix_sharing(
+        IdentityChatTokenizer(),
+        prompts=["abcd", "wxyz", "abcd", "wxyz"],
+        block_size=2,
+    )
+
+    assert profile["total_requests"] == 4
+    assert profile["total_prompt_tokens"] == 16
+    assert profile["shareable_requests"] == 2
+    assert profile["shareable_prefix_blocks"] == 4
+    assert profile["shareable_prefix_tokens"] == 8
+    assert profile["request_prefix_share_rate"] == 0.5
+    assert profile["token_prefix_share_ratio"] == 0.5
+
+
+def test_trace_token_sharing_excludes_partial_tail_blocks():
+    profile = profile_trace_prefix_sharing(
+        IdentityChatTokenizer(),
+        prompts=["abcde", "abcde"],
+        block_size=2,
+    )
+
+    assert profile["request_prefix_share_rate"] == 0.5
+    assert profile["shareable_prefix_tokens"] == 4
+    assert profile["token_prefix_share_ratio"] == 0.4
 
 
 def test_kv_block_budget_accepts_explicit_value():

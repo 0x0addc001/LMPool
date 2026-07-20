@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "description": "Block-aligned prefix-sharing profiles for the deterministic paper traces.",
+  "method": {
+    "implementation": "benchmarks.benchmark_e2e.profile_trace_prefix_sharing",
+    "assumptions": [
+      "ordered trace replay",
+      "unlimited logical KV capacity",
+      "perfect placement",
+      "only complete 256-token KV blocks are reusable"
+    ],
+    "tokenizers": [
+      "Qwen/Qwen3-0.6B",
+      "Qwen/Qwen3-1.7B"
+    ],
+    "tokenizer_profiles_identical": true
+  },
+  "profiles": {
+    "locality": {
+      "block_size_tokens": 256,
+      "total_requests": 192,
+      "total_prompt_tokens": 365880,
+      "total_complete_blocks": 1344,
+      "unique_complete_prefix_hashes": 112,
+      "shareable_requests": 176,
+      "shareable_prefix_blocks": 1232,
+      "shareable_prefix_tokens": 315392,
+      "request_prefix_share_rate": 0.9166666666666666,
+      "token_prefix_share_ratio": 0.8620094019897234
+    },
+    "load-skew": {
+      "block_size_tokens": 256,
+      "total_requests": 192,
+      "total_prompt_tokens": 320232,
+      "total_complete_blocks": 1152,
+      "unique_complete_prefix_hashes": 19,
+      "shareable_requests": 187,
+      "shareable_prefix_blocks": 1133,
+      "shareable_prefix_tokens": 290048,
+      "request_prefix_share_rate": 0.9739583333333334,
+      "token_prefix_share_ratio": 0.905743336081341
+    },
+    "memory-skew": {
+      "block_size_tokens": 256,
+      "total_requests": 128,
+      "total_prompt_tokens": 214064,
+      "total_complete_blocks": 768,
+      "unique_complete_prefix_hashes": 201,
+      "shareable_requests": 81,
+      "shareable_prefix_blocks": 567,
+      "shareable_prefix_tokens": 145152,
+      "request_prefix_share_rate": 0.6328125,
+      "token_prefix_share_ratio": 0.678077584273862
+    },
+    "session-handoff": {
+      "block_size_tokens": 256,
+      "total_requests": 128,
+      "total_prompt_tokens": 244048,
+      "total_complete_blocks": 896,
+      "unique_complete_prefix_hashes": 224,
+      "shareable_requests": 96,
+      "shareable_prefix_blocks": 672,
+      "shareable_prefix_tokens": 172032,
+      "request_prefix_share_rate": 0.75,
+      "token_prefix_share_ratio": 0.7049105094079853
+    }
+  }
+}

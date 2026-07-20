@@ -39,8 +39,8 @@ try:
         SamplingParams,
         build_prompts,
         make_config,
-        measure_single_gpu_prefix_hit_rate,
         parse_pairs,
+        profile_trace_prefix_sharing,
         print_summary_table,
         run_repeated_engine_scenario,
         save_rank_stats_figure,
@@ -54,8 +54,8 @@ except ImportError:
         SamplingParams,
         build_prompts,
         make_config,
-        measure_single_gpu_prefix_hit_rate,
         parse_pairs,
+        profile_trace_prefix_sharing,
         print_summary_table,
         run_repeated_engine_scenario,
         save_rank_stats_figure,
@@ -269,15 +269,22 @@ def main():
         **common,
     )
 
-    theoretical_hit = measure_single_gpu_prefix_hit_rate(
+    dataset_profile = profile_trace_prefix_sharing(
         tokenizer,
         prompts,
         block_size=single_config["block_size"],
-        max_cached_blocks=single_config["max_cached_blocks"],
     )
+    trace_request_share_rate = float(dataset_profile["request_prefix_share_rate"])
+    trace_token_share_ratio = float(dataset_profile["token_prefix_share_ratio"])
     results = [single, multi, routing]
     for result in results:
-        result.theoretical_prefix_hit_rate = theoretical_hit
+        result.trace_request_share_rate = trace_request_share_rate
+        result.trace_token_share_ratio = trace_token_share_ratio
+        result.theoretical_prefix_hit_rate = trace_request_share_rate
+        for trial in result.trial_results or []:
+            trial["trace_request_share_rate"] = trace_request_share_rate
+            trial["trace_token_share_ratio"] = trace_token_share_ratio
+            trial["theoretical_prefix_hit_rate"] = trace_request_share_rate
 
     summary_title = (
         f"KV-Aware Routing Benchmark Summary ({model_metadata['label']})"
@@ -297,6 +304,7 @@ def main():
                 "resolved_nvlink_pairs": pairs or [],
             },
         )
+        metadata["dataset_profile"] = dataset_profile
         save_summary_json(
             {result.name: asdict(result) for result in results},
             args.output_json,

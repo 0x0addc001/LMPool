@@ -265,8 +265,6 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from lmpool.engine.block_manager import BlockManager
-from lmpool.engine.global_block_manager import GlobalBlockManager
-from lmpool.engine.global_scheduler import GlobalScheduler
 from lmpool.engine.llm_engine import LLMEngine
 from lmpool.engine.sequence import Sequence
 from lmpool.sampling_parameters import SamplingParams
@@ -463,6 +461,8 @@ class ScenarioResult:
     gpu_mem_util_mean: float | None
     gpu_mem_util_p95: float | None
     rank_stats: dict[int, dict]
+    trace_request_share_rate: float = 0.0
+    trace_token_share_ratio: float = 0.0
     theoretical_prefix_hit_rate: float = 0.0
     route_matched_block_ratio: float = 0.0
     reclaimable_capacity_route_rate: float = 0.0
@@ -616,6 +616,58 @@ def compute_sequence_prefix_hashes(seq: Sequence) -> list[int]:
         prefix_hash = block_manager.compute_hash(seq.block(block_index), prefix_hash)
         hashes.append(prefix_hash)
     return hashes
+
+
+def profile_trace_prefix_sharing(
+    tokenizer,
+    prompts: list[str],
+    block_size: int,
+) -> dict[str, int | float]:
+    """Profile block-aligned prefix reuse intrinsic to an ordered prompt trace.
+
+    The profile assumes an unlimited logical cache and perfect placement. A
+    request is shareable when at least one complete prefix block appeared in an
+    earlier request. Token sharing counts the longest contiguous sequence of
+    previously observed complete blocks from block zero; partial tail blocks
+    are excluded because the runtime cannot publish them as reusable KV.
+    """
+    seqs = compute_prefix_hashes(tokenizer, prompts, block_size)
+    seen_prefix_hashes: set[int] = set()
+    shareable_requests = 0
+    shareable_prefix_blocks = 0
+    total_prompt_tokens = 0
+    total_complete_blocks = 0
+
+    for seq in seqs:
+        prefix_hashes = compute_sequence_prefix_hashes(seq)
+        matched_blocks = 0
+        for prefix_hash in prefix_hashes:
+            if prefix_hash not in seen_prefix_hashes:
+                break
+            matched_blocks += 1
+
+        if matched_blocks:
+            shareable_requests += 1
+        shareable_prefix_blocks += matched_blocks
+        total_prompt_tokens += seq.num_tokens
+        total_complete_blocks += len(prefix_hashes)
+        seen_prefix_hashes.update(prefix_hashes)
+
+    shareable_prefix_tokens = shareable_prefix_blocks * block_size
+    return {
+        "block_size_tokens": block_size,
+        "total_requests": len(seqs),
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_complete_blocks": total_complete_blocks,
+        "unique_complete_prefix_hashes": len(seen_prefix_hashes),
+        "shareable_requests": shareable_requests,
+        "shareable_prefix_blocks": shareable_prefix_blocks,
+        "shareable_prefix_tokens": shareable_prefix_tokens,
+        "request_prefix_share_rate": shareable_requests / max(len(seqs), 1),
+        "token_prefix_share_ratio": (
+            shareable_prefix_tokens / max(total_prompt_tokens, 1)
+        ),
+    }
 
 
 def _percentile(values: list[float], p: float) -> float:
@@ -1048,39 +1100,16 @@ def run_independent_multi_gpu_benchmark(
         result_queue.join_thread()
 
 
-def measure_single_gpu_prefix_hit_rate(tokenizer, prompts: list[str], block_size: int, max_cached_blocks: int) -> float:
-    # 使用足够大的离线页表计算 workload 自身的理论命中上界；该值不受运行时 KV budget 影响。
-    seqs = compute_prefix_hashes(tokenizer, prompts, block_size)
-    simulation_blocks = max(max_cached_blocks, sum(seq.num_blocks for seq in seqs), 1)
-    gbm = GlobalBlockManager(
-        rank=0,
-        world_size=1,
-        num_blocks_per_gpu=simulation_blocks,
-        nvlink_pairs=[],
-    )
-    bm = BlockManager(num_blocks=simulation_blocks, block_size=block_size, gbm=gbm)
-    scheduler = GlobalScheduler(gbm=gbm, block_manager=bm)
-
-    hits = 0
-    for seq in seqs:
-        prefix_hash = scheduler._compute_prefix_hash(seq)
-        _, route_info = scheduler.route_sequence_meta(
-            requester_rank=0,
-            seq_id=seq.seq_id,
-            num_tokens=seq.num_tokens,
-            num_blocks=seq.num_blocks,
-            prefix_hash=prefix_hash,
-            return_info=True,
-        )
-        if route_info.get("prefix_hit"):
-            hits += 1
-        bm.allocate(seq)
-        # The real data plane publishes a block only after prefill has written
-        # valid KV. Mirror that lifecycle in this synthetic baseline, then
-        # release the request reference while retaining its reusable cache.
-        bm.mark_kv_ready([seq])
-        bm.deallocate(seq)
-    return hits / max(len(seqs), 1)
+def measure_single_gpu_prefix_hit_rate(
+    tokenizer,
+    prompts: list[str],
+    block_size: int,
+    max_cached_blocks: int,
+) -> float:
+    """Compatibility wrapper for the capacity-unbounded trace request rate."""
+    del max_cached_blocks
+    profile = profile_trace_prefix_sharing(tokenizer, prompts, block_size)
+    return float(profile["request_prefix_share_rate"])
 
 
 def run_engine_scenario(
@@ -1866,6 +1895,8 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         gpu_mem_util_mean=mean_attr("gpu_mem_util_mean"),
         gpu_mem_util_p95=mean_attr("gpu_mem_util_p95"),
         rank_stats=rank_stats,
+        trace_request_share_rate=mean_attr("trace_request_share_rate"),
+        trace_token_share_ratio=mean_attr("trace_token_share_ratio"),
         theoretical_prefix_hit_rate=mean_attr("theoretical_prefix_hit_rate"),
         route_matched_block_ratio=mean_attr("route_matched_block_ratio"),
         reclaimable_capacity_route_rate=mean_attr("reclaimable_capacity_route_rate"),
@@ -1982,9 +2013,9 @@ def print_summary_table(
         )
 
     print("\nPrefix Diagnostics")
-    print("=" * 140)
+    print("=" * 158)
     print(
-        f"{'scenario':<22} {'trace upper':>12} {'CP blk match':>13} "
+        f"{'scenario':<22} {'trace req share':>15} {'trace tok share':>15} {'CP blk match':>13} "
         f"{'CP req hit':>11} {'CP reclaim':>12} {'CP stale':>12} {'DP req hit':>11} "
         f"{'DP tok reuse':>12} {'actual blocks/rank':>20}"
     )
@@ -1995,7 +2026,8 @@ def print_summary_table(
         ) or "n/a"
         print(
             f"{result.name:<22} "
-            f"{fmt_pct(result.theoretical_prefix_hit_rate):>12} "
+            f"{fmt_pct(result.trace_request_share_rate):>15} "
+            f"{fmt_pct(result.trace_token_share_ratio):>15} "
             f"{fmt_pct(result.route_matched_block_ratio):>13} "
             f"{fmt_pct(result.route_hit_rate):>11} "
             f"{fmt_pct(result.reclaimable_capacity_route_rate):>12} "
@@ -2831,13 +2863,13 @@ def main():
         submit_window=args.submit_window,
         workload=args.workload,
     )
-    theoretical_prefix_hit_rate = measure_single_gpu_prefix_hit_rate(
+    dataset_profile = profile_trace_prefix_sharing(
         tokenizer,
         prompts,
         block_size=baseline_config["block_size"],
-        max_cached_blocks=baseline_config["max_cached_blocks"],
     )
-    baseline.theoretical_prefix_hit_rate = theoretical_prefix_hit_rate
+    trace_request_share_rate = float(dataset_profile["request_prefix_share_rate"])
+    trace_token_share_ratio = float(dataset_profile["token_prefix_share_ratio"])
 
     # multi-gpu baseline：不共享 KV、不走控制面路由，但请求通过 round-robin 分发到多张卡
     multi_gpu_config = make_config(args.world_size, False, None, runtime_model_config)
@@ -2959,7 +2991,14 @@ def main():
     ]
     for result in all_results:
         if result is not None:
-            result.theoretical_prefix_hit_rate = theoretical_prefix_hit_rate
+            result.trace_request_share_rate = trace_request_share_rate
+            result.trace_token_share_ratio = trace_token_share_ratio
+            # Retain the old JSON field as a compatibility alias.
+            result.theoretical_prefix_hit_rate = trace_request_share_rate
+            for trial in result.trial_results or []:
+                trial["trace_request_share_rate"] = trace_request_share_rate
+                trial["trace_token_share_ratio"] = trace_token_share_ratio
+                trial["theoretical_prefix_hit_rate"] = trace_request_share_rate
     summary_title = (
         f"{workload_summary_title(args.workload)} ({model_metadata['label']})"
     )
@@ -2989,6 +3028,7 @@ def main():
                 "resolved_nvlink_pairs": nvlink_pairs,
             },
         )
+        run_metadata["dataset_profile"] = dataset_profile
         save_summary_json(payload, args.output_json, metadata=run_metadata)
 
 

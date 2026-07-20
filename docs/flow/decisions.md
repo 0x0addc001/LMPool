@@ -1870,3 +1870,30 @@ decision demand, decision plan, decision implementation, and decision result.
 - Decision result: Documentation now distinguishes unchanged data-parallel
   execution from load-skew control, and it presents locality routing and KV
   movement admission as two explicit, independently auditable cost models.
+
+## 2026-07-20: Add Dataset-Level Prefix-Sharing Profiles
+
+- Decision demand: Runtime request-hit and cached-token metrics could not show
+  whether a weak result came from the trace itself or from finite capacity,
+  placement, eviction, and transfer policy. The existing theoretical metric
+  only reported whether a request shared at least one block and hid the amount
+  of reusable prompt work.
+- Decision plan: Profile every ordered prompt trace before worker launch using
+  both request and token denominators, keep the calculation independent of the
+  runtime KV budget, and expose the full counts in benchmark artifacts and the
+  paper dataset table.
+- Decision implementation: Added `profile_trace_prefix_sharing()` to compute
+  the longest previously observed contiguous chain of complete cumulative
+  prefix hashes for every request. It reports shareable requests, blocks and
+  tokens, total prompt tokens, unique complete hashes, request prefix share,
+  and token prefix share under unlimited-cache perfect placement. E2E and
+  routing benchmarks now store the profile in `metadata.dataset_profile`, add
+  explicit `trace_request_share_rate` and `trace_token_share_ratio` result
+  fields, preserve `theoretical_prefix_hit_rate` as a compatibility alias, and
+  print both rates next to runtime control/data-plane metrics. Added exact and
+  partial-tail tests and synchronized the benchmark guide, paper, report, and
+  both README languages with the four paper-workload profiles.
+- Decision result: Dataset reuse potential can now be separated quantitatively
+  from achieved `DP req hit` and `DP tok reuse`. The paper traces range from
+  63.28--97.40% request sharing and 67.81--90.57% token sharing, with the
+  locality trace at 91.67% and 86.20%, respectively.
