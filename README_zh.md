@@ -176,10 +176,10 @@ CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache uv run python main.py
 
 该批次使用 5 次重复实验、6 张组成 3 对 NV4 直连的 RTX 3090、BF16 Qwen3-0.6B/Qwen3-1.7B、256-token KV block，并为每个 worker 配置相同 block budget。
 
-- **Transfer microbenchmark：**4-block batch 达到 19.0-23.2 GiB/s，8-block batch 达到 26.1-30.1 GiB/s；所有 payload 数据校验均通过。
-- **Routing workload：**两个模型的 prompt token reuse 从约 44% 提高到 72%，uncached prefill token 减少约 50%；吞吐提升 2.2-2.7%，mean TTFT 降低 10.6-20.2%。
-- **Session handoff：**相比 round-robin multi-GPU，完整 LMPool 在 Qwen3-0.6B/Qwen3-1.7B 上分别将吞吐提升 4.2%/7.1%，mean TTFT 降低 33.2%/42.6%，mean E2E latency 降低 9.9%/13.7%。
-- **边界结果：**稳定 load skew 没有触发 transfer，性能接近 multi-GPU baseline；当前 memory-skew trace 只触发少量 foreground plan，未提升吞吐。这是负结果/适用边界，不能作为 transfer 普遍有效的证据。
+- **Transfer microbenchmark：** 4-block batch 达到 19.0-23.2 GiB/s，8-block batch 达到 26.1-30.1 GiB/s；所有 payload 数据校验均通过。
+- **Routing workload：** 两个模型的 prompt token reuse 从约 44% 提高到 72%，uncached prefill token 减少约 50%；吞吐提升 2.2-2.7%，mean TTFT 降低 10.6-20.2%。
+- **Session handoff：** 相比 round-robin multi-GPU，完整 LMPool 在 Qwen3-0.6B/Qwen3-1.7B 上分别将吞吐提升 4.2%/7.1%，mean TTFT 降低 33.2%/42.6%，mean E2E latency 降低 9.9%/13.7%。
+- **边界结果：** 稳定 load skew 没有触发 transfer，性能接近 multi-GPU baseline；当前 memory-skew trace 只触发少量 foreground plan，未提升吞吐。这是负结果/适用边界，不能作为 transfer 普遍有效的证据。
 
 论文会同时报告以上四项观察。Session handoff 是当前主要端到端 transfer 结果，memory/load skew 不会被选择性省略。
 
