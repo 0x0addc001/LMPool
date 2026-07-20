@@ -65,7 +65,7 @@ On six RTX 3090 GPUs arranged as three direct NVLink pairs, the block-transfer m
 
 PagedAttention~\citep{vLLM} and RadixAttention~\citep{SGLang} make prefix reuse practical inside one inference engine. Multi-GPU deployments, however, commonly run one data-parallel model replica and one cache allocator per GPU. The physical KV blocks remain local to each replica, but requests arrive at a cluster-level ingress. This creates a placement problem: an incoming prompt may match a prefix already resident on one GPU while a conventional round-robin dispatcher sends it elsewhere. The target then recomputes and stores the same prefix.
 
-A naive global cache policy has two opposite failure modes. Always route to the prefix owner and a hot prefix concentrates requests on one replica, reducing batching parallelism. Always redistribute KV blocks and the system pays communication, synchronization, and memory-interference costs even when local recomputation is cheaper. The useful operating point requires the request router and KV-cache placement mechanism to share one view of locality, load, capacity, and topology.
+A naive global cache policy has two opposite failure modes. Always route to the prefix owner and a hot prefix concentrates requests on one replica, leaving other replicas underutilized and reducing aggregate batching efficiency. Always redistribute KV blocks and the system pays communication, synchronization, and memory-interference costs even when local recomputation is cheaper. The useful operating point requires the request router and KV-cache placement mechanism to share one view of locality, load, capacity, and topology.
 
 \sys{} follows two first principles:
 
@@ -179,14 +179,32 @@ For a request initially assigned to rank $s$, candidate ranks are $s$ and its di
 \end{equation}
 The zero case is filtered rather than carried into later scoring.
 
-For each candidate, GlobalScheduler finds the longest contiguous ready prefix chain and estimates
+For candidate rank $g$, let $N$ be prompt tokens, $R$ request blocks, $h_g$ the longest contiguous ready-prefix match, $S$ the block size, and $F_g$ the current free blocks. The required new blocks, uncached prefill work, and reclaim pressure are
+\begin{align}
+ n_g &= \max(0,R-h_g), \\
+ M_g &= \min(N,n_gS), \\
+ A_g &= \max(0,n_g-F_g).
+\end{align}
+A rank is feasible only when its free plus dependency-safe reclaimable capacity covers $n_g$. Its token-equivalent queue work is
 \begin{equation}
- C(g) = C_{\mathrm{prefill}}(g) + C_{\mathrm{queue}}(g)
-       + C_{\mathrm{reclaim}}(g) - C_{\mathrm{locality}}(g).
+ Q_g = w_w(T_g^{\mathrm{wait}}+T_g^{\mathrm{pending}})
+     + w_rT_g^{\mathrm{running}}
+     + w_s(N_g^{\mathrm{running}}+N_g^{\mathrm{pending}}),
 \end{equation}
-$C_{\mathrm{prefill}}$ grows with unmatched prompt tokens, $C_{\mathrm{queue}}$ includes waiting tokens and decode-weighted running work, and $C_{\mathrm{reclaim}}$ prices a real block shortage. $C_{\mathrm{locality}}$ rewards matched blocks using the topology affinity. Free capacity is a tie breaker rather than a substitute for load. Effective capacity includes dependency-safe reclaimable cached leaves, not pinned live decode blocks.
+with current defaults $w_w=1$, $w_r=0.25$, and $w_s=32$. GlobalScheduler then minimizes
+\begin{equation}
+ C_{\mathrm{route}}(g) = Q_g + w_pM_g + w_eA_gS,
+\end{equation}
+where $w_p=1$ and $w_e=0.5$ by default. Thus locality enters through $h_g$ and directly removes missing prefill work; it is not an independent hit-rate reward subtracted from cost. Prefix/topology score breaks equivalent-cost ties.
 
-The lowest-cost feasible candidate wins. A prefix owner may be bypassed when its sequence pressure exceeds its NVLink partner by a configured ratio and the extra prefill cost remains bounded. On a miss, the router chooses the candidate with the lowest projected load and sufficient effective capacity. This policy keeps cache locality from overwhelming data-parallel utilization.
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.96\textwidth]{fig_routing_cost_model.png}
+  \caption{Routing cost model. Each capacity-feasible rank is priced by token-aware queued work, uncached prefill implied by its contiguous prefix match, and dependency-safe reclaim pressure. A bounded spill is allowed only when the prefix owner is sufficiently more loaded and the additional recomputation cost remains within the configured bound.}
+  \label{fig:routing-cost-model}
+\end{figure*}
+
+The lowest-cost feasible candidate wins. A prefix owner may be bypassed when its sequence pressure exceeds that of a lower-pressure rank by a configured threshold and the extra recomputation cost remains bounded. On a miss, the router chooses the lowest projected-cost rank with sufficient effective capacity. This policy controls request/load skew and replica underutilization; it does not change the underlying data-parallel execution strategy.
 
 \subsection{Local Allocation and Reclamation}
 
@@ -206,12 +224,29 @@ The separation between ``received'' and ``published'' is the visibility boundary
 
 Foreground transfer is demand-driven. If a local prefill or decode append has a shortage of $k$ blocks, the worker asks the control plane for exactly $k$, not for the request's full block count. GlobalScheduler selects a complete source chain and determines whether the operation is a \emph{move} or \emph{copy}. A move may release a dependency-safe source suffix after publication; a copy retains the source and creates another replica. Pinned prefixes can be copied but never released.
 
-Admission compares estimated transfer cost with estimated saved prefill work:
+For $B$ blocks, $L$ layers, block size $S$, $H_{kv}$ KV heads, head dimension $D$, and $d$ bytes per element, the packed payload and static estimate are
 \begin{align}
- T_{\mathrm{xfer}} &= T_{\mathrm{fixed}} + \frac{B}{\widehat{BW}}\,I,\\
- T_{\mathrm{save}} &= N_{\mathrm{reuse}}\,N_{\mathrm{cached}}\,t_{\mathrm{prefill}}.
+ X &= 2BLSH_{kv}Dd, \\
+ T_{\mathrm{wire}} &= \frac{1000X}{\widehat{BW}\,2^{30}}, \\
+ T_{\mathrm{static}} &= (T_{\mathrm{fixed}}+I T_{\mathrm{wire}})w_x.
 \end{align}
-Here $B$ is payload bytes, $\widehat{BW}$ is an EWMA initialized from the transfer microbenchmark, and $I$ prices memory-system interference. A plan is admitted only if it has a real shortage, executable source and destination capacity, a minimum block batch, and $T_{\mathrm{save}}/T_{\mathrm{xfer}}$ exceeds a configured threshold. Repeated failures are cooled down by reason.
+The effective pair bandwidth $\widehat{BW}$ is initialized from the microbenchmark. Completed source operations update a pair-local transfer-extra-time EWMA, and dispatch-to-publication observations update a placement EWMA. Admission remains conservative:
+\begin{equation}
+ T_{\mathrm{xfer}}=\max(T_{\mathrm{static}},T_{\mathrm{pair}},T_{\mathrm{placement}}).
+\end{equation}
+Foreground saved work uses discounted historical chain reuse $\widehat{R}$, whereas background admission counts only the first avoidable cold prefill because the destination self-warms after a miss:
+\begin{align}
+ T_{\mathrm{save}}^{fg} &= \widehat{R}BS t_{\mathrm{prefill}}, \\
+ T_{\mathrm{save}}^{bg} &= BS t_{\mathrm{prefill}}(g_{dst}).
+\end{align}
+A plan is admitted only if source generations and target capacity are valid and $T_{\mathrm{save}} \ge \rho T_{\mathrm{xfer}}$ for the configured safety ratio $\rho$. Repeated identical low-benefit or no-space background candidates enter the negative cache until their signature changes.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.96\textwidth]{fig_transfer_cost_model.png}
+  \caption{Transfer cost and benefit model. Payload geometry and measured pair bandwidth initialize a static estimate; pair-local transfer and dispatch-to-publication EWMAs can only raise the admitted cost above that prior. Foreground and background paths use different saved-work estimates but share validity, capacity, and benefit-ratio gates.}
+  \label{fig:transfer-cost-model}
+\end{figure*}
 
 \subsection{Background Placement}
 \label{sec:bg-transfer}

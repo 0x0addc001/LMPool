@@ -22,7 +22,7 @@ In short: route to avoid transfer; use fast transfer only when movement is unavo
 
 ![LMPool architecture](./assets/fig_architecture_dark.png)
 
-For `N` GPUs, the runtime contains one user/launcher process, one independent control-plane process, and `N` identical data-plane processes, including a separate worker for rank 0.
+For `N` GPUs, the runtime contains one user/launcher process, one independent control-plane process, and `N` identical data-plane processes.
 
 | Component | Role |
 | --- | --- |
@@ -67,6 +67,12 @@ The data payload contains only K/V values. For `L` layers and `B` selected block
 
 Topology affinity is `2` for the same GPU, `1` for a direct NVLink partner, and `0` otherwise. Selection combines missing prefill work, waiting/running load, decode-weighted work, effective free capacity, and reclaim cost. A prefix owner can be bypassed when it is sufficiently overloaded and the extra recomputation cost is bounded. Route reservations prevent concurrent requests from consuming the same stale capacity estimate.
 
+#### Routing Cost Model
+
+![LMPool routing cost model](./assets/fig_routing_cost_model_dark.png)
+
+For each capacity-feasible rank, routing estimates token-equivalent queue work, missing prefill, and reclaim pressure. Prefix locality reduces `missing prefill` directly instead of contributing an independent hit-rate objective. The minimum projected-cost rank wins unless the prefix owner is sufficiently more loaded and a bounded spill to a lower-pressure rank is cheaper. This controls request/load skew and GPU underutilization; it does not change the system's data-parallel execution strategy.
+
 ### Global and Local Block State
 
 The control process owns an authoritative global page table:
@@ -90,6 +96,12 @@ Cross-GPU transfer is transactional. `prepare` locks a source generation and res
 ### NVLink KV Transfer
 
 Foreground transfer requests only the actual shortage, not an entire sequence. Background placement limits each candidate chain with `background_copy_max_blocks` (default 8), then deduplicates and coalesces candidates for one directed pair up to `background_copy_batch_max_blocks` (default 128). Thus four blocks are a microbenchmark calibration point, not a fixed runtime batch. Both paths are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.
+
+#### Transfer Cost and Benefit Model
+
+![LMPool transfer cost and benefit model](./assets/fig_transfer_cost_model_dark.png)
+
+The static estimate uses payload geometry, measured effective pair bandwidth, fixed coordination latency, and an interference multiplier. Runtime source-transfer and dispatch-to-publish observations update pair-local EWMAs; admission takes the maximum of static and observed estimates. Foreground benefit uses discounted chain reuse, while background benefit counts at most one avoidable cold prefill because the destination self-warms after its first miss. A plan is admitted only when saved prefill time clears the configured safety ratio and all source-validity and target-capacity gates.
 
 Each plan follows an idempotent transaction:
 
@@ -129,8 +141,6 @@ benchmarks/                 publishable microbenchmarks and E2E workloads
 tests/                      module, protocol, benchmark, and integration tests
 docs/paper/                 paper source and bibliography
 ```
-
-Legacy internal functions named `swap_out`/`swap_in` remain in `kv_transfer.py`; public documentation uses **transfer** because the operation can be either a copy or a move and does not imply a CPU swap tier.
 
 ## Installation and Basic Run
 

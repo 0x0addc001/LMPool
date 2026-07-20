@@ -1847,3 +1847,26 @@ decision demand, decision plan, decision implementation, and decision result.
 - Decision result: Block metadata ownership, physical tensor movement,
   visibility, cache retention, reclamation, and rollback are now represented by
   one implementation-aligned lifecycle rather than independent prose fragments.
+
+## 2026-07-20: Separate and Visualize the Two Online Cost Models
+
+- Decision demand: The report described routing as preserving "parallelism,"
+  which could be confused with DP/TP/PP strategy rather than the actual problem
+  of request skew and replica underutilization. Routing and transfer costs were
+  also compressed into prose despite using different units and observations.
+- Decision plan: Correct the terminology, derive both models directly from the
+  current scheduler, and render routing and transfer as independent figures so
+  each formula, gate, and online signal can be read without conflation.
+- Decision implementation: Added `generate_cost_models.py`, producing light
+  paper and dark README variants of two separate diagrams. The routing figure
+  shows effective-capacity feasibility, token-aware queue work, missing prefill
+  derived from contiguous prefix hits, reclaim pressure, minimum projected cost,
+  and bounded spill. The transfer figure shows exact payload bytes, calibrated
+  wire cost, pair/placement EWMAs, distinct foreground/background saved-work
+  estimates, the benefit-ratio gate, and negative-cache rejection. Paper
+  equations and both README languages now match these implementations. The
+  report now describes request/load concentration instead of an ambiguous loss
+  of parallelism.
+- Decision result: Documentation now distinguishes unchanged data-parallel
+  execution from load-skew control, and it presents locality routing and KV
+  movement admission as two explicit, independently auditable cost models.

@@ -15,11 +15,14 @@ benchmarks/results/paper/20260719T072508Z/
 - `figures/fig_hot_prefix_decision.png`: hot-prefix candidate and placement gates.
 - `figures/fig_transfer_decision.png`: transfer admission, transaction, and rollback path.
 - `figures/fig_kv_block_lifecycle.png`: local and transactional cross-GPU KV-block lifecycle.
+- `figures/fig_routing_cost_model.png`: token-equivalent routing cost and bounded-spill model.
+- `figures/fig_transfer_cost_model.png`: measured transfer cost, saved-work, and admission model.
 - `figures/fig_results_summary.png`: color summary of routing, transfer, and session-handoff results.
 - `figures/fig_absolute_metrics.png`: absolute throughput and TTFT aggregates in original units.
 - `figures/generate_architecture.py`: reproducible source for the light paper figure and dark root README figure.
 - `figures/generate_decision_flow.py`: synchronized light paper/report and dark README decision-flow figures.
 - `figures/generate_block_lifecycle.py`: synchronized light paper and dark README lifecycle figures.
+- `figures/generate_cost_models.py`: separate synchronized routing and transfer cost-model figures.
 - `mlsys2025.sty` / `mlsys2025.bst`: retained paper template files.
 
 ## Build
@@ -43,6 +46,13 @@ Regenerate the synchronized KV-block lifecycle figures:
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib UV_CACHE_DIR=/tmp/uvcache \
   uv run python docs/paper/figures/generate_block_lifecycle.py
+```
+
+Regenerate the separate synchronized cost-model figures:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib UV_CACHE_DIR=/tmp/uvcache \
+  uv run python docs/paper/figures/generate_cost_models.py
 ```
 
 Regenerate the color results figure directly from the archived paper JSON:
