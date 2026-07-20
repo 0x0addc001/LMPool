@@ -79,6 +79,14 @@ It also tracks per-GPU free/reclaimable capacity, parent dependencies, recency/f
 
 Cached complete blocks are reclaimed with dependency-safe LFU-first/LRU-second ordering. Live blocks are not move-eviction victims. They may be copied when replication has sufficient expected value.
 
+#### KV Block Lifecycle
+
+![LMPool KV block lifecycle](./assets/fig_kv_block_lifecycle_dark.png)
+
+A local block ID moves from `Free` to `Allocated / Writing`, then becomes reusable only after ModelRunner has completed the K/V tensor and BlockManager publishes it as `Ready`. Releasing the last request reference retains a complete block as a reclaimable prefix-cache entry; a prefix hit returns it to active use, while dependency-safe reclamation returns it to `Free`.
+
+Cross-GPU transfer is transactional. `prepare` locks a source generation and reserves free destination IDs; ModelRunner moves the packed tensor; the destination remains hidden until `publish`. Copy finalization retains the source, move finalization reclaims only a safe unreferenced source suffix, and abort releases the target reservation while restoring the source state. Consequently, routing never observes reserved or received-but-unpublished blocks.
+
 ### NVLink KV Transfer
 
 Foreground transfer requests only the actual shortage, not an entire sequence. Background placement limits each candidate chain with `background_copy_max_blocks` (default 8), then deduplicates and coalesces candidates for one directed pair up to `background_copy_batch_max_blocks` (default 128). Thus four blocks are a microbenchmark calibration point, not a fixed runtime batch. Both paths are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.

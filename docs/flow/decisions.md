@@ -1825,3 +1825,25 @@ decision demand, decision plan, decision implementation, and decision result.
   paths are visible, the architecture distinguishes control edges from colored
   components, and benchmark calibration is no longer conflated with the actual
   transfer batch distribution.
+
+## 2026-07-19: Document the Transactional KV-Block Lifecycle
+
+- Decision demand: The documentation explained allocation, reclaim, and
+  transfer separately, but it did not show when a physical KV block becomes
+  reusable or routable, how a reference-zero cache entry differs from a free
+  block, or what abort must restore after a failed transfer.
+- Decision plan: Derive one lifecycle directly from Local Block Manager and
+  data-plane transfer phases, separate the ordinary prefix-cache path from the
+  cross-GPU transaction, and generate synchronized light and dark figures for
+  the paper and repository documentation.
+- Decision implementation: Added `generate_block_lifecycle.py`. The normal lane
+  shows `Free`, `Allocated / Writing`, `Ready / In Use`, and `Cached /
+  Reclaimable`, including partial release, prefix-hit reactivation, and
+  dependency-safe reclaim. The transfer lane shows generation lock and target
+  reservation, ModelRunner tensor movement, received-but-hidden state,
+  publication, copy/move finalization, and abort. The paper and both README
+  languages now embed the generated figure and state explicitly that routing
+  observes only published ready blocks.
+- Decision result: Block metadata ownership, physical tensor movement,
+  visibility, cache retention, reclamation, and rollback are now represented by
+  one implementation-aligned lifecycle rather than independent prose fragments.

@@ -190,7 +190,16 @@ The lowest-cost feasible candidate wins. A prefix owner may be bypassed when its
 
 \subsection{Local Allocation and Reclamation}
 
-The Local Block Manager first references a matching ready local block and increments its reference count. Otherwise, it allocates from a deque of free block identifiers and publishes a complete block only after the model has written its KV data. Completed prefixes remain cacheable at reference count zero. Reclamation operates on dependency-safe leaves so removing an ancestor cannot orphan a retained descendant. Coldness combines access frequency and recency; live blocks with positive references are not move-eviction victims, although they may be copied when replication is profitable.
+The Local Block Manager first references a matching ready local block and increments its reference count. Otherwise, it allocates from a deque of free block identifiers and publishes a complete block only after the model has written its KV data. Completed prefixes remain cacheable at reference count zero. Reclamation operates on dependency-safe leaves so removing an ancestor cannot orphan a retained descendant. Coldness combines access frequency and recency; live blocks with positive references are not move-eviction victims, although they may be copied when replication is profitable. Figure~\ref{fig:kv-block-lifecycle} summarizes both the normal local path and the transactional cross-GPU branch.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\textwidth]{fig_kv_block_lifecycle.png}
+  \caption{KV-block lifecycle. The Local Block Manager owns allocation, generation, readiness, reference, and cache state; ModelRunner writes or transfers the physical K/V tensor. A complete block with \texttt{ref\_count=0} remains cached until a hit or dependency-safe reclaim. During transfer, reserved and received-but-unpublished destination blocks remain invisible to routing. Publication precedes copy/move finalization, and abort restores the source while freeing the destination reservation.}
+  \label{fig:kv-block-lifecycle}
+\end{figure*}
+
+The separation between ``received'' and ``published'' is the visibility boundary. A successful NCCL receive alone does not create a routable replica: the destination first records the complete hash chain and readiness in its local snapshot, after which the control plane may expose that location. For copy semantics, a referenced source remains valid and is merely unlocked. For move semantics, only an unreferenced dependency-safe suffix is reclaimed. Partial or not-yet-ready local blocks bypass the cache and return directly to the free deque when released.
 
 \subsection{Foreground Transfer}
 \label{sec:fg-transfer}

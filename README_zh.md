@@ -79,6 +79,14 @@ prefix hash -> [(gpu, physical block, generation, readiness), ...]
 
 完整缓存 block 使用满足前缀依赖约束的 LFU 优先、LRU 次序策略回收。活跃 block 不能作为 move eviction 的 victim；只有复制收益足够时才可以复制。
 
+#### KV Block 生命周期
+
+![LMPool KV block 生命周期](./assets/fig_kv_block_lifecycle_dark.png)
+
+本地 block ID 从 `Free` 进入 `Allocated / Writing`；只有 ModelRunner 完成 K/V tensor 写入、BlockManager 将其发布为 `Ready` 后，它才可以被复用。最后一个请求引用释放后，完整 block 会作为可回收的 prefix-cache 条目保留；prefix hit 会使其重新进入活跃使用，而满足依赖约束的回收会使其返回 `Free`。
+
+跨 GPU transfer 使用事务式生命周期。`prepare` 锁定源 block generation 并预留空闲目标 ID；ModelRunner 搬运打包后的 tensor；目标 block 在 `publish` 前保持不可见。copy finalize 保留源副本，move finalize 只回收安全且无引用的源端后缀，abort 则释放目标预留并恢复源状态。因此，路由不会观察到已预留或已接收但尚未发布的 block。
+
 ### NVLink KV Transfer
 
 Foreground transfer 只申请实际 shortage，而不是整条 sequence 的 block 数量。Background placement 先用 `background_copy_max_blocks`（默认 8）限制每条候选链，再对同一有向 pair 的候选去重合并，总量受 `background_copy_batch_max_blocks`（默认 128）限制。因此 4 blocks 只是 microbenchmark 的校准档位，并不是固定线上 batch。两条路径都必须通过源块有效性、目标容量、最小批量，以及预计节省 prefill 时间与传输成本比值等门控条件。
