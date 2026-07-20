@@ -1897,3 +1897,26 @@ decision demand, decision plan, decision implementation, and decision result.
   from achieved `DP req hit` and `DP tok reuse`. The paper traces range from
   63.28--97.40% request sharing and 67.81--90.57% token sharing, with the
   locality trace at 91.67% and 86.20%, respectively.
+
+## 2026-07-20: Make Workload Composition and Report Figure Scope Explicit
+
+- Decision demand: Abbreviated dataset labels such as `hot+cold` and
+  `15 hot + pressure` did not reveal request counts, prefix lengths, recurrence,
+  or that every pressure prefix is unique. Report Figure 5 also appeared to be
+  an unnamed single-workload result and its overlap with the following raw
+  benchmark figures was unexplained.
+- Decision plan: Replace every abbreviated prefix-group label with exact group
+  and request counts, expose the three memory-skew phases, and document Figure
+  5 panel by panel together with the purpose of the per-model raw figures.
+- Decision implementation: Updated the benchmark guide, paper dataset table,
+  report, and archived dataset profile to state the exact locality, load-skew,
+  memory-skew, and session-handoff constructions. The paper table uses wrapping
+  columns so the complete descriptions cannot overflow adjacent metrics. The
+  report now identifies Figure 5(a--b) as locality/routing and Figure 5(c--d)
+  as session handoff, and states that its throughput/TTFT overlap with the four
+  raw benchmark figures is intentional: Figure 5 is a compact cross-model
+  comparison, while the raw figures retain the wider metric and uncertainty
+  set.
+- Decision result: Prefix sharing percentages are now auditable from exact
+  trace composition, and every report figure states both its workload and its
+  relationship to the underlying benchmark artifacts.

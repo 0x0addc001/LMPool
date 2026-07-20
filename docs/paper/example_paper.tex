@@ -349,15 +349,15 @@ We therefore report two intrinsic trace metrics before running any system policy
   \caption{Synthetic workload dataset profiles. Prompt-token counts and block-aligned sharing upper bounds are identical across the two Qwen3 tokenizers. Every request produces 64 output tokens in the paper runs.}
   \label{tab:datasets}
   \footnotesize
-  \setlength{\tabcolsep}{4pt}
-  \begin{tabular}{@{}lrrrrrrp{0.25\textwidth}@{}}
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}L{0.10\textwidth}rL{0.23\textwidth}rrrrL{0.22\textwidth}@{}}
     \toprule
-    Workload & Requests & Prefix groups & Prompt tokens & Req. share & Token share & Window & Construction and purpose \\
+    Workload & Requests & Exact prefix construction & Prompt tokens & Req. share & Token share & Window & Phase construction and purpose \\
     \midrule
-    Locality/routing & 192 & 16 & 365,880 & 91.67\% & 86.20\% & 16 & Interleaved long prefixes isolate locality-aware routing with transfer disabled. \\
-    Load skew & 192 & hot+cold & 320,232 & 97.40\% & 90.57\% & 16 & A 75\% hot family tests load pricing at a cache-owner hotspot. \\
-    Memory skew & 128 & 15 & 214,064 & 63.28\% & 67.81\% & 16 & Warmup, unique pressure, and reuse induce foreground shortage. \\
-    Session handoff & 128 & 32 & 244,048 & 75.00\% & 70.49\% & 64 & 32 warmups and 96 partner-side reuses test predictive placement. \\
+    Locality/routing & 192 & 16 recurring long-prefix groups; 12 requests per group & 365,880 & 91.67\% & 86.20\% & 16 & Seeded interleaving isolates locality-aware routing with transfer disabled. \\
+    Load skew & 192 & 1 long hot group with 144 requests; 4 shorter recurring cold groups with 12 requests each & 320,232 & 97.40\% & 90.57\% & 16 & The 75\% hot family tests load pricing at a cache-owner hotspot. \\
+    Memory skew & 128 & 15 reusable long hot groups; 32 shorter one-shot pressure prefixes & 214,064 & 63.28\% & 67.81\% & 16 & 32 warm-up, 32 pressure, and 64 reuse requests induce foreground shortage. \\
+    Session handoff & 128 & 32 session-prefix groups; 1 warm-up and 3 reuse requests per group & 244,048 & 75.00\% & 70.49\% & 64 & 32 source warm-ups and 96 partner-side reuses test predictive placement. \\
     \bottomrule
   \end{tabular}
 \end{table*}
@@ -382,7 +382,7 @@ Figure~\ref{fig:absolute-results} retains the original units for the two workloa
 \begin{figure*}[t]
   \centering
   \includegraphics[width=\textwidth]{fig_absolute_metrics.png}
-  \caption{Absolute five-trial mean results in their original units. Routing is compared with round-robin under the same KV budget; session handoff compares round-robin, transfer-only, and full \sys{}. Numeric labels report the underlying aggregate values rather than only relative deltas.}
+  \caption{Absolute five-trial mean results in their original units. Panels (a)--(b) show throughput and mean TTFT for the locality/routing workload, comparing round-robin with KV-aware routing under the same KV budget. Panels (c)--(d) show the session-handoff workload, comparing round-robin, transfer-only, and full \sys{}. Numeric labels report the cross-model aggregate values; the archived per-model benchmark figures retain the wider metric set and confidence intervals.}
   \label{fig:absolute-results}
 \end{figure*}
 

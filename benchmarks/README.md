@@ -164,16 +164,19 @@ trace before launching workers. The complete profile is stored at
 configuration, Qwen3 tokenization, and 256-token KV blocks, the deterministic
 traces have the following intrinsic reuse potential:
 
-| Workload | Requests | Prefix groups | Prompt tokens | Request prefix share | Token prefix share |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Locality/routing | 192 | 16 | 365,880 | 91.67% | 86.20% |
-| Load skew | 192 | hot + 4 cold | 320,232 | 97.40% | 90.57% |
-| Memory skew | 128 | 15 hot + pressure | 214,064 | 63.28% | 67.81% |
-| Session handoff | 128 | 32 | 244,048 | 75.00% | 70.49% |
+| Workload | Requests | Exact prefix construction | Prompt tokens | Request prefix share | Token prefix share |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Locality/routing | 192 | 16 recurring long-prefix groups, 12 requests per group | 365,880 | 91.67% | 86.20% |
+| Load skew | 192 | 1 long hot group with 144 requests, plus 4 shorter recurring cold groups with 12 requests each | 320,232 | 97.40% | 90.57% |
+| Memory skew | 128 | 15 reusable long hot groups, plus 32 shorter one-shot pressure prefixes | 214,064 | 63.28% | 67.81% |
+| Session handoff | 128 | 32 session-prefix groups, each with 1 warm-up request and 3 reuse requests | 244,048 | 75.00% | 70.49% |
 
 These are trace-level upper bounds under ordered replay, unlimited cache, and
 perfect placement. Compare them with runtime `DP req hit` and `DP tok reuse` to
 quantify losses from finite capacity, dispatch, eviction, and transfer policy.
+For memory skew, the 128 requests are explicitly split into 32 warm-up, 32
+one-shot pressure, and 64 hot-prefix reuse requests. The pressure prefixes are
+not a reusable group: each pressure request has its own distinct prefix.
 
 ## Parameters
 

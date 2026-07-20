@@ -17,6 +17,7 @@
   },
   "profiles": {
     "locality": {
+      "construction": "16 recurring long-prefix groups with 12 requests per group",
       "block_size_tokens": 256,
       "total_requests": 192,
       "total_prompt_tokens": 365880,
@@ -29,6 +30,7 @@
       "token_prefix_share_ratio": 0.8620094019897234
     },
     "load-skew": {
+      "construction": "1 long hot group with 144 requests plus 4 shorter recurring cold groups with 12 requests each",
       "block_size_tokens": 256,
       "total_requests": 192,
       "total_prompt_tokens": 320232,
@@ -41,6 +43,7 @@
       "token_prefix_share_ratio": 0.905743336081341
     },
     "memory-skew": {
+      "construction": "15 reusable long hot groups plus 32 distinct shorter one-shot pressure prefixes; phases are 32 warm-up, 32 pressure, and 64 reuse requests",
       "block_size_tokens": 256,
       "total_requests": 128,
       "total_prompt_tokens": 214064,
@@ -53,6 +56,7 @@
       "token_prefix_share_ratio": 0.678077584273862
     },
     "session-handoff": {
+      "construction": "32 session-prefix groups with 1 warm-up request and 3 partner-side reuse requests per group",
       "block_size_tokens": 256,
       "total_requests": 128,
       "total_prompt_tokens": 244048,

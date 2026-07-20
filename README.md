@@ -172,7 +172,16 @@ The exact dual-model paper matrix, fixed variables, offline model paths, accepta
 
 ### Dataset Prefix Sharing
 
-The benchmark profiles prefix sharing before launching the system. `trace req share` is the fraction of requests that can reuse at least one previously observed complete KV block; `trace tok share` is the fraction of all prompt tokens covered by the longest such block-aligned prefix. They assume ordered replay, unlimited cache, and perfect placement, so they describe the trace rather than runtime policy. The paper traces contain `91.67% / 86.20%` request/token sharing for locality, `97.40% / 90.57%` for load skew, `63.28% / 67.81%` for memory skew, and `75.00% / 70.49%` for session handoff. Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. New JSON artifacts store the full counts under `metadata.dataset_profile`; the archived paper batch also includes the derived [`dataset_profiles.json`](./benchmarks/results/paper/20260719T072508Z/dataset_profiles.json).
+The benchmark profiles prefix sharing before launching the system. `trace req share` is the fraction of requests that can reuse at least one previously observed complete KV block; `trace tok share` is the fraction of all prompt tokens covered by the longest such block-aligned prefix. They assume ordered replay, unlimited cache, and perfect placement, so they describe the trace rather than runtime policy.
+
+| Workload | Exact prefix construction | Request/token sharing |
+| --- | --- | ---: |
+| Locality/routing | 192 requests across 16 recurring long-prefix groups, 12 requests per group | 91.67% / 86.20% |
+| Load skew | 1 long hot group with 144 requests, plus 4 shorter recurring cold groups with 12 requests each | 97.40% / 90.57% |
+| Memory skew | 32 warm-up requests over 15 reusable long hot groups, 32 distinct one-shot shorter pressure prefixes, then 64 hot-prefix reuse requests | 63.28% / 67.81% |
+| Session handoff | 32 session-prefix groups, each with 1 source warm-up request and 3 partner-side reuse requests | 75.00% / 70.49% |
+
+Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. New JSON artifacts store the full counts under `metadata.dataset_profile`; the archived paper batch also includes the derived [`dataset_profiles.json`](./benchmarks/results/paper/20260719T072508Z/dataset_profiles.json).
 
 ### Current Paper Batch
 

@@ -172,7 +172,16 @@ CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache uv run python main.py
 
 ### 数据集前缀共享率
 
-Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`trace req share` 表示能够复用至少一个先前已出现完整 KV block 的请求比例；`trace tok share` 表示所有 prompt token 中，被最长连续、block-aligned 已见前缀覆盖的比例。两者假设按 trace 顺序回放、无限缓存和完美放置，因此描述的是数据集，而不是运行时策略。论文 trace 的请求级/token 级共享率分别为：locality `91.67% / 86.20%`、load skew `97.40% / 90.57%`、memory skew `63.28% / 67.81%`、session handoff `75.00% / 70.49%`。运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。新生成的 JSON 会把完整计数写入 `metadata.dataset_profile`；归档论文批次也补充了派生文件 [`dataset_profiles.json`](./benchmarks/results/paper/20260719T072508Z/dataset_profiles.json)。
+Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`trace req share` 表示能够复用至少一个先前已出现完整 KV block 的请求比例；`trace tok share` 表示所有 prompt token 中，被最长连续、block-aligned 已见前缀覆盖的比例。两者假设按 trace 顺序回放、无限缓存和完美放置，因此描述的是数据集，而不是运行时策略。
+
+| Workload | 确切前缀构造 | 请求级/Token 级共享率 |
+| --- | --- | ---: |
+| Locality/routing | 192 个请求分布在 16 个循环复用的长前缀组中，每组 12 个请求 | 91.67% / 86.20% |
+| Load skew | 1 个长热点组含 144 个请求；另有 4 个较短、循环复用的冷组，每组 12 个请求 | 97.40% / 90.57% |
+| Memory skew | 32 个 warmup 请求轮流访问 15 个可复用长热点组；随后是 32 个互不相同的一次性较短 pressure 前缀和 64 个热点 reuse 请求 | 63.28% / 67.81% |
+| Session handoff | 32 个 session 前缀组，每组包含 1 个源端 warmup 请求和 3 个伙伴端 reuse 请求 | 75.00% / 70.49% |
+
+运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。新生成的 JSON 会把完整计数写入 `metadata.dataset_profile`；归档论文批次也补充了派生文件 [`dataset_profiles.json`](./benchmarks/results/paper/20260719T072508Z/dataset_profiles.json)。
 
 ### 当前论文实验批次
 
