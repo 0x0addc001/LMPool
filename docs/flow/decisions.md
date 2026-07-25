@@ -2025,22 +2025,24 @@ decision demand, decision plan, decision implementation, and decision result.
   data-path measurement. A size-independent additive residual fits both the
   short foreground and large handoff plans better than multiplying every
   payload by the short-plan slowdown. The final cold-start prior is therefore
-  `40 ms + 1.2 * profile_P95(plan_bytes)`, calibrated from the five-trial
-  Qwen3-0.6B pilot: the old model estimated 7-block foreground plans at roughly
-  10.7 ms each, while complete target-side transactions consumed roughly
-  43--47 ms. The additive term prices scheduling, NCCL queuing, target
-  publication, and block registration outside the idle microbenchmark
-  boundary. Existing pair-and-size placement EWMAs remain a conservative
-  online correction. A scheduler regression test checks the intended decision
-  boundary: a low-reuse 7-block plan is rejected, while an amortized 64-block plan remains
-  admissible under the measured latency-curve shape.
+  `40 ms + 1.2 * profile_P95(plan_bytes)`. The 40 ms term was selected manually
+  as a conservative setting after earlier Qwen3-0.6B runs exposed a gap between
+  an approximately 10.7 ms estimate for a seven-block foreground plan and an
+  approximately 43--47 ms complete target-side transaction. It was not fitted
+  by a standalone pilot or held-out cost study. The additive term prices
+  scheduling, NCCL queuing, target publication, and block registration outside
+  the idle microbenchmark boundary. Existing pair-and-size placement EWMAs
+  remain a conservative online correction. A scheduler regression test checks
+  the intended decision boundary: a low-reuse seven-block plan is rejected,
+  while an amortized 64-block plan remains admissible under the measured
+  latency-curve shape.
 - Decision result: Resumption reuses matching transfer arrays and matching
   scenario-keyed routing/E2E artifacts, while rejecting old E2E files whose
   cost calibration differs. Cold, one-shot foreground plans are not admitted on an
   underpriced idle-link estimate, while session-handoff-scale transfers can
   still pass when their predicted prefill saving covers the loaded cost. The
-  overwritten `20260725T031840Z` Qwen3-0.6B results are retained as calibration
-  data rather than final post-fix evaluation. The complete CPU suite passes
+  overwritten `20260725T031840Z` Qwen3-0.6B results are retained as diagnostic
+  evidence rather than final post-fix evaluation. The complete CPU suite passes
   190 tests with one hardware-gated NCCL test skipped.
 
 ## 2026-07-25: Redraw Process Architecture and Decision Flows from Runtime Ownership
@@ -2299,3 +2301,181 @@ decision demand, decision plan, decision implementation, and decision result.
   whitespace, and no `git diff --check` errors. Existing natural technical
   passages and equations were retained rather than rewritten for stylistic
   variation alone.
+
+## 2026-07-25: Remove the Template Notice and Reflow Wide Equations
+
+- Decision demand: The accepted-paper template printed an obsolete MLSys 2025
+  proceedings and copyright sentence, and several routing and transfer
+  equations exceeded a two-column paper's available width.
+- Decision plan: Suppress only the template notice so author affiliations and
+  correspondence remain visible. Reflow wide displays at semantic boundaries
+  instead of shrinking their type, and introduce compact notation where a
+  long textual condition or sample set caused the overflow.
+- Decision implementation: `example_paper.tex` now clears
+  `\Notice@String` after loading the accepted template. The NVLink-neighbor
+  condition uses the defined set `\mathcal{N}_{\mathrm{NV}}(s)`, queue cost is
+  split across weighted work terms, the measured transfer profile is named
+  `\mathcal{P}_p`, and the three conservative transfer-cost candidates are
+  placed on separate aligned lines.
+- Decision result: The paper retains its affiliation footnote while omitting
+  the obsolete proceedings notice. All display equations now fit the source's
+  two-column layout without reduced math font size. Static LaTeX structure and
+  whitespace checks pass; PDF compilation remains unavailable in the current
+  environment because no TeX engine is installed.
+
+## 2026-07-25: Publication-Level Language Revision
+
+- Decision demand: The complete paper required a rigorous language revision
+  for an MLSys submission, including grammar, sentence structure, formal
+  register, article use, terminology consistency, and removal of contractions
+  and noun possessives without changing the technical claims.
+- Decision plan: Edit every prose section, caption, and explanatory table
+  entry in place. Preserve the section structure, citations, references,
+  LaTeX commands, mathematical expressions, experimental values, and explicit
+  negative results. Prefer short, direct academic sentences over decorative
+  vocabulary or list-like exposition.
+- Decision implementation: Rewrote the abstract, introduction, motivation,
+  system design, implementation, evaluation, limitations, related work,
+  conclusion, figure captions, and descriptive table cells in
+  `example_paper.tex`. The revision clarifies ownership boundaries, separates
+  routing evidence from transfer evidence, removes method-name possessives and
+  contractions, standardizes warm-up and component terminology, and preserves
+  the distinction between positive session-handoff results and boundary
+  results under memory and load skew.
+- Decision result: The paper now uses consistent formal academic prose with no
+  detected contractions, noun possessives, list environments, or newly added
+  emphasis commands. LaTeX environment counts remain balanced, experimental
+  values and citations are unchanged, and `git diff --check` passes. A visual
+  PDF proof remains unavailable because the environment has no TeX engine.
+
+## 2026-07-25: Final Systems-Paper Redline Audit
+
+- Decision demand: The final draft required a high-tolerance audit against a
+  systems-paper writing guide and the implementation. Only contradictions,
+  ambiguous core terminology, severe language defects, and unsupported claims
+  were eligible for correction.
+- Decision plan: Compare the paper structure with the external guide, trace
+  routing and transfer claims to the current engine code, verify the reported
+  numbers against the latest five-trial artifacts, and check cited metadata
+  against primary sources. Preserve established prose and negative results
+  unless a concrete inconsistency requires a change.
+- Decision implementation: Recast the abstract as five sentences within the
+  recommended length, corrected ingress routing from pair-restricted to
+  all-healthy-replica selection, and retained pair restriction for
+  worker-originated rerouting and KV transfer. The routing formula now labels
+  missing prefill work as a block-rounded estimate, the limitations state
+  explicitly that scale-out beyond six GPUs was not evaluated, and the
+  conclusion uses three sentences. The LMCache bibliography entry now matches
+  the complete author list in the primary paper record.
+- Decision result: The architecture narrative now agrees with the
+  `requester_rank=-1` ingress path and pair-local transfer implementation.
+  Routing, transfer, and session-handoff values remain consistent with
+  `benchmarks/results/paper/20260725T031840Z`. No remaining contradiction or
+  terminology defect that blocks interpretation was found by static review.
+
+## 2026-07-25: Evidence-Based Evaluation Explanations
+
+- Decision demand: The evaluation reported accurate means and improvements but
+  did not consistently explain why one policy outperformed another. Each major
+  conclusion required a compact LaTeX paragraph that connected the outcome to
+  measured mechanism and per-rank evidence without inventing causality.
+- Decision plan: Re-read the latest routing, transfer, session-handoff,
+  memory-skew, and load-skew JSON artifacts for both models. Compare cached and
+  uncached tokens, per-rank prefill and decode time, request distribution, GPU
+  utilization, transfer counts, placement-lease routes, and confidence
+  intervals before assigning any explanation.
+- Decision implementation: Reorganized Q1--Q4 into titled `\paragraph{}`
+  analyses. The routing section distinguishes token savings from latency
+  payoff using summed per-rank execution time. The transfer microbenchmark
+  explains batching through the sublinear latency increase when payload
+  doubles. The handoff section separates the effects of transfer and routing,
+  adds the omitted routing-only ablation to the results table, and identifies
+  placement-lease routing and improved rank utilization as the measured source
+  of the combined throughput gain. The boundary section explains why balanced
+  memory-skew placement and naturally replicated load-skew prefixes leave
+  little avoidable work.
+- Decision result: Evaluation claims now state both the improvement and the
+  measured reason for it. The text also records that transfer does not improve
+  every latency metric: for Qwen3-0.6B session handoff, routing-only and full
+  LMPool have overlapping mean-E2E confidence intervals. This qualification
+  prevents the ablation result from being overstated.
+
+## 2026-07-25: Figure and Table Caption Normalization
+
+- Decision demand: Figure and table captions mixed noun phrases followed by
+  periods with multi-sentence explanations, which violated the requested
+  distinction between Title Case phrases and punctuated Sentence case prose.
+- Decision plan: Classify every caption by function. Use short Title Case noun
+  phrases for self-explanatory module and test tables, and use complete
+  Sentence case statements when a figure or results table requires mechanism,
+  panel, or statistical context.
+- Decision implementation: Revised all fifteen captions in
+  `example_paper.tex`. Figure captions now begin directly with the represented
+  mechanism or metric and retain only information needed to interpret paths,
+  admission decisions, panels, ranges, or confidence intervals. The module and
+  test tables use unpunctuated Title Case phrases. Results-table captions use
+  complete Sentence case statements. The definition of `Partial` was moved
+  from the related-work table caption into the surrounding prose.
+- Decision result: Every caption now follows one consistent grammatical form:
+  an unpunctuated Title Case noun phrase or a complete, punctuated Sentence
+  case statement. LaTeX commands, mathematical notation, metric units, and
+  escaped special characters remain intact.
+
+## 2026-07-25: MLSys Review and Claim-Scope Remediation
+
+- Decision demand: The final paper required an independent MLSys-style review
+  that separated correctness flaws from evidence limitations, followed by
+  revisions for every weakness that could be repaired without fabricating new
+  experiments.
+- Decision plan: Evaluate community contribution, experimental rigor,
+  baseline fairness, ablation coverage, and consistency between the
+  introduction and evaluation. Preserve unresolved evidence gaps in the
+  review, while narrowing the paper claims and making the experimental scope
+  explicit.
+- Decision implementation: Added
+  `docs/reviews/review_20260725.md` with a 5/10 weak-reject/borderline
+  assessment. The paper now identifies session handoff as a synthetic,
+  forecast-assisted opportunity study, states that the benchmark supplies
+  exact queued-request demand, and distinguishes controlled Mini-vLLM
+  ablations from production-system comparisons. The limitations now cover the
+  absence of a production trace and production baselines, the six-GPU and
+  sub-2B-model scope, the 256-token block size, and the lack of held-out cost
+  prediction and sensitivity results. The abstract, evaluation questions,
+  dataset profile, captions, Q3 analysis, and conclusion use the same bounded
+  claim.
+- Decision result: The paper no longer implies that an online predictor was
+  evaluated or that the internal baselines establish superiority over vLLM,
+  SGLang, Mooncake, or LMCache. Missing trace, baseline, scaling, and
+  cost-model experiments remain explicit review weaknesses rather than being
+  hidden by prose.
+
+## 2026-07-25: Transfer-Prior Provenance and Oral Presentation Package
+
+- Decision demand: The paper incorrectly described the fixed 40 ms transfer
+  residual as the result of a Qwen3-0.6B pilot, and an MLSys oral presentation
+  required a concise slide deck, a timed script, and defensible answers to
+  likely technical questions.
+- Decision plan: Trace the value through benchmark defaults, retained paper
+  commands, result metadata, and runtime admission code. Replace any fitted-
+  pilot claim with the strongest statement supported by those records, expand
+  the limitations and future-work section, and prepare presentation material
+  that separates demonstrated results from synthetic assumptions and negative
+  results.
+- Decision implementation: The paper, READMEs, benchmark documentation, and
+  review now identify 40 ms as a manually selected conservative cold-start
+  prior for coordination, NCCL queuing, publication, and block registration
+  outside the idle data-path profile. The paper records the missing held-out
+  prediction and sensitivity studies and proposes online forecasting on public
+  traces, production-engine comparisons, scaling studies, policy ablations,
+  and replicated control-plane recovery. Added a 17-frame Beamer deck at
+  `docs/slide/lmpool_oral.tex`, a 15-minute slide-by-slide script at
+  `docs/script/lmpool_oral_script.md`, and a 35-question defense guide at
+  `docs/faq/lmpool_oral_faq.md`. The materials include the complete request
+  lifecycle, routing and transfer decisions, transaction safety, evidence
+  boundaries, and the exact role of the forecast-assisted handoff workload.
+- Decision result: The current-facing documentation no longer presents the
+  40 ms prior as independently fitted evidence. The oral package reports the
+  positive routing, NVLink, and handoff results together with the memory-skew
+  and load-skew boundary results. Static checks confirm balanced slide
+  environments and existing image dependencies; PDF compilation remains
+  unavailable because the workspace has no TeX engine.

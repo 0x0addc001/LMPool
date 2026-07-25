@@ -216,8 +216,9 @@
 41. `--foreground-transfer-fixed-latency-ms`：
   每个在线 transfer plan 在空载数据通路之外的固定事务残差，单位毫秒，默认 40.0。
   它覆盖调度、协调、NCCL 排队、目标端发布与 block 注册等完整 serving 路径开销；
-  应由独立 pilot 的 `目标端完整耗时 - 干扰倍率 × 同尺寸 microbenchmark P95`
-  按成功 plan 数归一化后保守校准。
+  当前 40.0 是人工选择的保守 cold-start prior，并非独立 pilot 的拟合结果。后续若有
+  独立校准实验，应使用 `目标端完整耗时 - 干扰倍率 × 同尺寸 microbenchmark P95`
+  按成功 plan 数归一化，并在 held-out 运行上报告预测误差。
 
 42. `--foreground-transfer-interference-multiplier`：
   对空载 transfer microbenchmark 的分段数据通路 P95 施加的加载态干扰倍率，

@@ -127,9 +127,10 @@ df -h /home/jialiangli/.cache/huggingface/hub
 外推；完成的 transfer 再按 pair 和 size bucket 更新 EWMA：
 
 空载 microbenchmark 只给出随 payload 变化的数据通路项，不能直接代表完整 serving
-事务。当前论文配置使用 `T_static = 40 ms + 1.2 × profile_P95(plan_bytes)`：40 ms 来自
-独立 Qwen3-0.6B serving pilot 中短 foreground plan 的目标端残差并向上取整，1.2 仅修正
-payload 相关的加载态干扰。该 pilot 只用于参数校准，不作为最终性能结果。
+事务。当前论文配置使用 `T_static = 40 ms + 1.2 × profile_P95(plan_bytes)`：40 ms 是手工
+选择的保守 cold-start prior，用于覆盖调度、协调、NCCL 排队、目标端发布与 block 注册；
+它不是由独立 pilot 或 held-out prediction study 拟合得到的参数。1.2 只修正 payload
+相关的加载态干扰，运行时观测通过 pair × size-bucket EWMA 保守提高估计。
 
 首次正式采集前先完成第 5 节测试；测试不需要在每个 trial 前重复执行。
 
@@ -168,9 +169,9 @@ export RESUME=1
 bash benchmarks/run_paper_suite.sh
 ```
 
-`20260725T031840Z` 的 Qwen3-0.6B E2E 结果使用旧的 `2 ms` 固定事务残差，只能作为
-成本校准 pilot；不要在该目录继续拼接最终论文结果。修改成本参数后应使用新的 `RUN_ID`
-对两个模型重跑，保证同一结果目录内配置一致。
+`20260725T031840Z` 当前保留的 transfer workload 结果使用 `40 ms` 固定事务先验。不要在
+修改成本参数或代码后继续向该目录拼接结果；应使用新的 `RUN_ID` 对两个模型重跑，保证同一
+结果目录内配置一致。早期使用 `2 ms` 的中间 artifact 不属于最终论文结果。
 
 KV transfer microbenchmark 为每个 payload case 使用唯一 FileStore rendezvous，不依赖临时
 TCP 端口。若某个 worker 仍异常退出，父进程会立即报告 exit code，而不会等待完整超时。

@@ -105,7 +105,7 @@ Foreground transfer 只申请实际 shortage，而不是整条 sequence 的 bloc
 
 ![LMPool transfer 成本与收益模型](./assets/fig_transfer_cost_model_dark.png)
 
-静态成本先在每个逻辑 NVLink pair 的实测 P95 延迟曲线上按 plan payload 插值，只对随 payload 变化的部分施加加载态推理干扰倍率，再加上完整在线事务的固定残差。论文配置使用 `40 ms + 1.2 × profile_P95(plan_bytes)`：加性项由独立 serving pilot 校准，覆盖空载 microbenchmark 之外的调度、NCCL 排队、目标端发布与 block 注册。论文 runner 测量 1/2/4/8/16/32/64 blocks，并校验 profile 的每 block 字节数与线上模型一致。运行时的 source-transfer 及 dispatch-to-publish 观测分别更新 pair × size-bucket EWMA，准入取静态估计和在线观测中的最大值，避免一个小 plan 的抖动污染所有大 plan。Foreground 收益使用折扣后的 prefix 链复用次数；background 收益最多只计算一次可避免的冷 prefill，因为目标 GPU 第一次 miss 后会自行预热。只有节省的 prefill 时间超过配置的安全比例，并且源块有效、目标容量等门控全部通过时，plan 才会获准执行。
+静态成本先在每个逻辑 NVLink pair 的实测 P95 延迟曲线上按 plan payload 插值，只对随 payload 变化的部分施加加载态推理干扰倍率，再加上完整在线事务的固定先验。论文配置使用 `40 ms + 1.2 × profile_P95(plan_bytes)`：40 ms 是手工选择的保守 cold-start 设置，用于覆盖空载 microbenchmark 之外的调度、NCCL 排队、目标端发布与 block 注册，不是由独立 pilot 拟合得到的参数。论文 runner 测量 1/2/4/8/16/32/64 blocks，并校验 profile 的每 block 字节数与线上模型一致。运行时的 source-transfer 及 dispatch-to-publish 观测分别更新 pair × size-bucket EWMA，准入取静态估计和在线观测中的最大值，避免一个小 plan 的抖动污染所有大 plan。Foreground 收益使用折扣后的 prefix 链复用次数；background 收益最多只计算一次可避免的冷 prefill，因为目标 GPU 第一次 miss 后会自行预热。只有节省的 prefill 时间超过配置的安全比例，并且源块有效、目标容量等门控全部通过时，plan 才会获准执行。
 
 每个计划执行幂等事务：
 
