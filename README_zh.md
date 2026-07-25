@@ -27,10 +27,14 @@ LMPool 是一个基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的研�
 | 组件 | 职责 |
 | --- | --- |
 | `LLMEngine` | 用户 API、master 侧 ingress、进程启动与监督、请求转发、结果聚合 |
-| `control_plane_process` | 持有 `GlobalScheduler` 和 `GlobalBlockManager`，负责路由、全局元数据、transfer 计划、placement lease 和 heartbeat |
-| `ControlPlaneClient` | LLMEngine 与 worker 用来和控制进程通信的队列协议端点 |
-| `data_plane_process` | 每张 GPU 一个，持有本地 `Scheduler`、`BlockManager` 和 `ModelRunner` |
-| `KV Transfer` | 将完整 KV block 打包，并在直连 NVLink pair 上执行配对的 NCCL send/receive |
+| 控制面进程 | 持有 Global Scheduler 和 Global Block Manager，串行处理路由、transfer、lease 与健康状态决策 |
+| Global Scheduler | 读取全局状态，计算容量可行的路由决策和通过成本门控的 transfer plan |
+| Global Block Manager | 保存带版本的页表、容量、预留、in-flight 和放置元数据，不保存物理 KV tensor |
+| 数据面进程 | 每张 GPU 一个，持有一个 Local Scheduler、Local Block Manager、Model Runner 和物理 KV cache |
+| Local Scheduler / Block Manager | 组织 prefill/decode batch，并管理物理 block 的分配、引用、ready 状态和回收 |
+| Model Runner / KV cache | 执行模型、读写本地 K/V，并对获准的跨 GPU payload 执行打包与解包 |
+
+LLMEngine 将 route query 发给 Global Scheduler；Global Scheduler 从 Global Block Manager 读取 prefix、负载、容量和 lease 元数据并返回目标 GPU rank，随后 LLMEngine 才把完整 `Sequence` 投递到该 rank 的 Local Scheduler。蓝色虚线总线把 routing target 与 transfer phase 分发到每个 Local Scheduler，紫色虚线总线把每个 Local Block Manager 的版本化 block/load snapshot 汇聚到 Global Block Manager。中央省略号上下的六组 NVLink 互联小矩形表示四个详细 rank 之外仍可扩展更多数据面实例。标注 `NVLink` 的绿色箭头是唯一真实的跨 GPU KV 数据通路，打包 tensor 通过 pair 专属 NCCL communicator 在成对 `ModelRunner` 间直接传输。KV payload 不经过 LLMEngine、Global Scheduler 或 Global Block Manager。
 
 ### 请求流程
 
@@ -47,15 +51,15 @@ LMPool 是一个基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的研�
 
 ![LMPool KV-aware routing 决策](./assets/fig_routing_decision_dark.png)
 
-**热点 prefix 预测**
+**Background placement**
 
-![LMPool 热点 prefix 预测决策](./assets/fig_hot_prefix_decision_dark.png)
+![LMPool background placement 决策](./assets/fig_hot_prefix_decision_dark.png)
 
-**Transfer 准入与执行**
+**事务式 KV transfer**
 
-![LMPool transfer 准入与执行](./assets/fig_transfer_decision_dark.png)
+![LMPool 事务式 KV transfer](./assets/fig_transfer_decision_dark.png)
 
-热点 prefix 预测综合三类信号：完整 prefix 链的累计 block 访问次数、route hit 次数，以及 ingress 已经看到但尚未提交的请求需求。控制面从最深热点叶子向前恢复全部常驻祖先。达到热点阈值只会产生候选，并不等于执行 transfer；目标尚无副本、源目标负载差、cooldown、pair 空闲、目标容量以及 saved-prefill/transfer-cost 收益门槛仍需全部通过。
+Background placement 综合三类信号：完整 prefix 链的累计 block 访问次数、route hit 次数，以及 ingress 已经看到但尚未提交的请求需求。控制面从最深热点叶子向前恢复全部常驻祖先。达到热点阈值只会产生候选，并不等于执行 transfer；目标尚无副本、源目标负载差、cooldown、pair 空闲、目标容量以及 saved-prefill/transfer-cost 收益门槛仍需全部通过。
 
 数据 payload 只包含 K/V 数值。对于 `L` 层和 `B` 个 block，源端通过 indexed selection 聚合出一个连续的 `[L, 2, B, block_size, num_kv_heads, head_dim]` tensor，在 pair 专属 NCCL group 上执行一次发送；目标端接收后写入 prepare 阶段预留的物理 block。hash、generation、copy/move mode 和目标 block ID 通过控制面协议独立传递，不混入 NCCL tensor。
 
@@ -95,13 +99,13 @@ prefix hash -> [(gpu, physical block, generation, readiness), ...]
 
 ### NVLink KV Transfer
 
-Foreground transfer 只申请实际 shortage，而不是整条 sequence 的 block 数量。Background placement 先用 `background_copy_max_blocks`（默认 8）限制每条候选链，再对同一有向 pair 的候选去重合并，总量受 `background_copy_batch_max_blocks`（默认 128）限制。因此 4 blocks 只是 microbenchmark 的校准档位，并不是固定线上 batch。两条路径都必须通过源块有效性、目标容量、最小批量，以及预计节省 prefill 时间与传输成本比值等门控条件。
+Foreground transfer 只申请实际 shortage，而不是整条 sequence 的 block 数量。Background placement 先用 `background_copy_max_blocks`（默认 8）限制每条候选链，再对同一有向 pair 的候选去重合并，总量受 `background_copy_batch_max_blocks`（默认 128）限制。因此运行时 batch 由实际 plan 决定，而不是固定为某个校准档。两条路径都必须通过源块有效性、目标容量、最小批量，以及预计节省 prefill 时间与传输成本比值等门控条件。
 
 #### Transfer 成本与收益模型
 
 ![LMPool transfer 成本与收益模型](./assets/fig_transfer_cost_model_dark.png)
 
-静态成本由 payload geometry、物理 pair 的实测有效带宽、固定协调延迟和干扰系数组成。运行时的 source-transfer 及 dispatch-to-publish 观测会更新 pair-local EWMA，准入取静态估计和在线观测中的最大值。Foreground 收益使用折扣后的 prefix 链复用次数；background 收益最多只计算一次可避免的冷 prefill，因为目标 GPU 第一次 miss 后会自行预热。只有节省的 prefill 时间超过配置的安全比例，并且源块有效、目标容量等门控全部通过时，plan 才会获准执行。
+静态成本先在每个逻辑 NVLink pair 的实测 P95 延迟曲线上按 plan payload 插值，只对随 payload 变化的部分施加加载态推理干扰倍率，再加上完整在线事务的固定残差。论文配置使用 `40 ms + 1.2 × profile_P95(plan_bytes)`：加性项由独立 serving pilot 校准，覆盖空载 microbenchmark 之外的调度、NCCL 排队、目标端发布与 block 注册。论文 runner 测量 1/2/4/8/16/32/64 blocks，并校验 profile 的每 block 字节数与线上模型一致。运行时的 source-transfer 及 dispatch-to-publish 观测分别更新 pair × size-bucket EWMA，准入取静态估计和在线观测中的最大值，避免一个小 plan 的抖动污染所有大 plan。Foreground 收益使用折扣后的 prefix 链复用次数；background 收益最多只计算一次可避免的冷 prefill，因为目标 GPU 第一次 miss 后会自行预热。只有节省的 prefill 时间超过配置的安全比例，并且源块有效、目标容量等门控全部通过时，plan 才会获准执行。
 
 每个计划执行幂等事务：
 
@@ -164,7 +168,7 @@ CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache uv run python main.py
 
 | 入口 | 验证目标 |
 | --- | --- |
-| `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload 的 latency、bandwidth 和数据一致性 |
+| `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload 正确性，以及 transfer 准入使用的 pair/plan-size latency profile |
 | `benchmarks/benchmark_kv_routing.py` | routing-only 的 locality 与 prefill reuse 收益 |
 | `benchmarks/benchmark_e2e.py` | load-skew、memory-skew、session-handoff 下的五配置系统对比 |
 
@@ -181,20 +185,24 @@ Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`t
 | Memory skew | 32 个 warmup 请求轮流访问 15 个可复用长热点组；随后是 32 个互不相同的一次性较短 pressure 前缀和 64 个热点 reuse 请求 | 63.28% / 67.81% |
 | Session handoff | 32 个 session 前缀组，每组包含 1 个源端 warmup 请求和 3 个伙伴端 reuse 请求 | 75.00% / 70.49% |
 
-运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。新生成的 JSON 会把完整计数写入 `metadata.dataset_profile`；归档论文批次也补充了派生文件 [`dataset_profiles.json`](./benchmarks/results/paper/20260719T072508Z/dataset_profiles.json)。
+运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。JSON 会把完整计数写入 `metadata.dataset_profile`。
 
 ### 当前论文实验批次
 
-实验数据：[`benchmarks/results/paper/20260719T072508Z`](./benchmarks/results/paper/20260719T072508Z)
+实验数据：[`benchmarks/results/paper/20260725T031840Z`](./benchmarks/results/paper/20260725T031840Z)
 
 该批次使用 5 次重复实验、6 张组成 3 对 NV4 直连的 RTX 3090、BF16 Qwen3-0.6B/Qwen3-1.7B、256-token KV block，并为每个 worker 配置相同 block budget。
 
-- **Transfer microbenchmark：** 4-block batch 达到 19.0-23.2 GiB/s，8-block batch 达到 26.1-30.1 GiB/s；所有 payload 数据校验均通过。
-- **Routing workload：** 两个模型的 prompt token reuse 从约 44% 提高到 72%，uncached prefill token 减少约 50%；吞吐提升 2.2-2.7%，mean TTFT 降低 10.6-20.2%。
-- **Session handoff：** 相比 round-robin multi-GPU，完整 LMPool 在 Qwen3-0.6B/Qwen3-1.7B 上分别将吞吐提升 4.2%/7.1%，mean TTFT 降低 33.2%/42.6%，mean E2E latency 降低 9.9%/13.7%。
-- **边界结果：** 稳定 load skew 没有触发 transfer，性能接近 multi-GPU baseline；当前 memory-skew trace 只触发少量 foreground plan，未提升吞吐。这是负结果/适用边界，不能作为 transfer 普遍有效的证据。
+- **Transfer microbenchmark：** 1/2/4/8/16/32/64-block sweep 的所有 payload 均通过一致性校验，并生成线上成本模型使用的 P95 latency profile。4 blocks 达到 20.5-23.1 GiB/s，8 blocks 达到 26.8-30.1 GiB/s，64 blocks 的跨模型/链路平均带宽为 36.5 GiB/s。
+- **Routing workload：** cached prompt token 比例从 44.1% 提高到 71.3-72.2%，uncached prefill token 减少 48.6-50.2%；throughput 与 round-robin 的差异不超过 1.4%。Qwen3-0.6B 的 mean TTFT 增加 7.4%，Qwen3-1.7B 降低 10.2%，因此该实验支持 locality 改善，但不支持“所有模型 latency 都下降”。
+- **Session handoff：** 相比 round-robin multi-GPU，完整 LMPool 在 Qwen3-0.6B/Qwen3-1.7B 上分别将 throughput 提升 4.4%/7.4%，mean TTFT 降低 32.4%/40.4%，mean E2E 降低 9.3%/12.9%，P90 E2E 降低 7.4%/7.6%。
+- **边界结果：** 稳定 load skew 没有触发 transfer，各多 GPU 方案与 round-robin 的 throughput 差异不超过 0.6%。Memory skew 在 1.7B 上没有 transfer，在 0.6B 上仅一个 trial 复制 7 blocks，均未提高 throughput。
 
 论文会同时报告以上四项观察。Session handoff 是当前主要端到端 transfer 结果，memory/load skew 不会被选择性省略。
+
+![最新论文实验摘要](./docs/paper/figures/fig_results_summary.png)
+
+NVLink transfer microbenchmark 证明 packed all-layer K/V 数据路径在字节级正确，并测得每个直连 pair、每种 plan 大小的 latency，供线上准入成本模型使用。它本身不等于端到端收益；session-handoff 进一步证明，在 transferred KV 能被后续请求充分复用时，数据移动和控制开销可以被摊销。
 
 ## 测试
 

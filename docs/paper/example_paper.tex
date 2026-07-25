@@ -53,9 +53,9 @@
 \vskip 0.3in
 
 \begin{abstract}
-Prefix caching avoids repeated prefill computation, but conventional data-parallel LLM replicas manage their KV caches independently. A cache hit may therefore exist on the wrong GPU, while blindly following cache ownership can create a compute hotspot. Moving every reusable prefix is also counterproductive when transfer costs exceed the saved prefill work. We present \sys{}, a Mini-vLLM-based prototype guided by two principles. First, KV-aware routing addresses \emph{cache locality}: it sends a request to a directly connected GPU that already owns the longest useful prefix when the reuse benefit exceeds queue and capacity pressure. Second, NVLink KV transfer provides \emph{cache fluidity}: it copies or moves blocks when cache placement and request load diverge, while an admission model rejects transfers that cannot amortize their cost. A centralized control process maintains authoritative, versioned metadata; one data-plane process per GPU retains ownership of physical blocks and inference execution. Transfers use a prepare--execute--publish--finalize protocol so a destination is not visible before its data is ready and a source is not released prematurely.
+Prefix caching avoids repeated prefill computation, but conventional data-parallel LLM replicas manage their KV caches independently. A cache hit may therefore exist on the wrong GPU, while blindly following cache ownership can create a compute hotspot. Moving every reusable prefix is also counterproductive when transfer costs exceed the saved prefill work. We present \sys{}, a Mini-vLLM-based prototype guided by two principles. KV-aware routing addresses cache locality by sending a request to a directly connected GPU that owns the longest useful prefix when the reuse benefit exceeds queue and capacity pressure. NVLink KV transfer provides cache fluidity by copying or moving blocks when cache placement and request load diverge, while an admission model rejects transfers that cannot amortize their cost. A centralized control process maintains authoritative, versioned metadata; one data-plane process per GPU retains ownership of physical blocks and inference execution. Transfers use a prepare--execute--publish--finalize protocol so a destination is not visible before its data is ready and a source is not released prematurely.
 
-On six RTX 3090 GPUs arranged as three direct NVLink pairs, the block-transfer microbenchmark sustains 19.0--23.2~GiB/s for four-block batches and 26.1--30.1~GiB/s for eight-block batches, with end-to-end data validation. Across Qwen3-0.6B and Qwen3-1.7B, routing reduces uncached prefill tokens by about 50\% in a multi-prefix locality workload. In a session-handoff workload, full \sys{} improves throughput by 4.2--7.1\%, lowers mean TTFT by 33.2--42.6\%, and lowers mean end-to-end latency by 9.9--13.7\% relative to round-robin data parallelism. Memory-skew and steady load-skew experiments show little or negative throughput benefit, defining an important boundary: transfer is useful only when future reuse repays its data-movement and interference cost. Source code is available at \url{https://github.com/0x0addc001/LMPool}.
+On six RTX 3090 GPUs arranged as three direct NVLink pairs, the block-transfer microbenchmark sustains 20.5--23.1~GiB/s for four-block batches and 26.8--30.1~GiB/s for eight-block batches, with end-to-end data validation. Across Qwen3-0.6B and Qwen3-1.7B, routing reduces uncached prefill tokens by 48.6--50.2\% in a multi-prefix locality workload. In a session-handoff workload, full \sys{} improves throughput by 4.4--7.4\%, lowers mean TTFT by 32.4--40.4\%, and lowers mean end-to-end latency by 9.3--12.9\% relative to round-robin data parallelism. Memory-skew and steady load-skew experiments show little or negative throughput benefit, defining an important boundary: transfer is useful only when future reuse repays its data-movement and interference cost. Source code is available at \url{https://github.com/0x0addc001/LMPool}.
 \end{abstract}
 ]
 \printAffiliationsAndNotice{}
@@ -67,21 +67,11 @@ PagedAttention~\citep{vLLM} and RadixAttention~\citep{SGLang} make prefix reuse 
 
 A naive global cache policy has two opposite failure modes. Always route to the prefix owner and a hot prefix concentrates requests on one replica, leaving other replicas underutilized and reducing aggregate batching efficiency. Always redistribute KV blocks and the system pays communication, synchronization, and memory-interference costs even when local recomputation is cheaper. The useful operating point requires the request router and KV-cache placement mechanism to share one view of locality, load, capacity, and topology.
 
-\sys{} follows two first principles:
+\sys{} follows two first principles. The routing principle addresses cache locality: a request should execute on a GPU that already holds its relevant KV prefix when the saved prefill work exceeds the added queueing and capacity pressure. Successful routing also reduces later data movement. The transfer principle addresses cache fluidity: when KV placement no longer matches request load, direct NVLink can move useful blocks to a replica that can reuse them. Transfer does not solve arbitrary request skew; it addresses uneven KV placement and cross-instance reuse that would otherwise require movement or recomputation.
 
-\textbf{Routing principle -- cache locality.} Route a request to a GPU or serving instance that already holds the relevant KV prefix when doing so saves more prefill work than it adds queueing and capacity pressure. Successful routing also reduces the demand for later data movement.
+The resulting rule is simple: avoid transfer when routing can preserve locality; when transfer is unavoidable and profitable, use the fastest supported direct path. \sys{} therefore treats multi-GPU HBM as a logically coordinated pool, not as physically shared memory. Each worker still owns its local allocation and KV tensor. The control plane coordinates only metadata, reservations, route decisions, and transfer transactions.
 
-\textbf{Transfer principle -- cache fluidity.} When KV placement and request load no longer match, use direct NVLink to make useful KV blocks flow to the replica that can exploit them. Transfer does not solve arbitrary request skew. It specifically addresses uneven KV placement and cross-instance reuse that otherwise requires data movement or recomputation.
-
-The resulting rule is simple: avoid transfer when routing can preserve locality; when transfer is unavoidable and profitable, use the fastest supported direct path. \sys{} therefore treats multi-GPU HBM as a \emph{logically coordinated} pool, not as physically shared memory. Each worker still owns its local allocation and KV tensor. The control plane coordinates only metadata, reservations, route decisions, and transfer transactions.
-
-This paper makes three contributions:
-
-\textbf{(1) Locality- and load-aware routing.} We design a router that matches only contiguous complete prefix blocks, considers only the initial GPU and its direct NVLink partners, and balances saved prefill work against queue, decode, capacity, and reclaim costs.
-
-\textbf{(2) Cost-gated KV-cache transfer.} We implement batched NCCL transfer for complete block chains, distinguish copy from move semantics, and use an explicit transactional protocol with generation checks and rollback.
-
-\textbf{(3) An evaluated multi-process prototype.} We implement \sys{} on Mini-vLLM and evaluate the data path, routing, load skew, memory skew, and session handoff with Qwen3-0.6B and Qwen3-1.7B. We report both improvements and workloads where transfer does not amortize its cost.
+The first contribution is a locality- and load-aware router that matches contiguous complete prefix blocks, restricts candidates to the initial GPU and its direct NVLink partners, and balances saved prefill work against queue, decode, capacity, and reclaim costs. The second is a cost-gated KV-transfer path that batches complete block chains, supports copy and move semantics, and uses generation checks and rollback in an explicit transaction. The third is an evaluated multi-process Mini-vLLM prototype. We measure its data path, routing behavior, load skew, memory skew, and session handoff with Qwen3-0.6B and Qwen3-1.7B, including workloads where transfer does not amortize its cost.
 
 \section{Background and Motivation}
 \label{sec:bg}
@@ -100,9 +90,9 @@ where $h_{-1}$ is empty. Partial tail blocks are not globally reusable. A valid 
 
 A prefix cache hit is useful only if the request executes where the matching KV is available, or if moving that KV is cheaper than recomputation. Independent round-robin replicas may preserve many local entries yet miss them at request admission. Conversely, a global router can increase request-level and token-level reuse without increasing the number of physical cache blocks. This motivates making routing the first action: cache locality should be repaired before data movement is considered.
 
-\subsection{Observation 2: Locality Competes with Parallelism}
+\subsection{Observation 2: Locality Competes with Load Balance}
 
-Long shared prefixes are often popular. Sending every matching request to the first owner converts locality into a load hotspot. The 20260719 evaluation artifacts include per-rank request, token, prefill/decode-time, GPU-utilization, and memory-utilization measurements precisely because an aggregate hit rate cannot reveal this failure. A route decision must price the remaining prefill work together with waiting tokens, running decode work, free blocks, and reclaim pressure. Thus, maximizing hit rate is not the objective; minimizing expected completion cost is.
+Long shared prefixes are often popular. Sending every matching request to the first owner converts locality into a load hotspot. Per-rank request, token, prefill/decode-time, GPU-utilization, and memory-utilization measurements are therefore necessary because an aggregate hit rate cannot reveal this failure. A route decision must price the remaining prefill work together with waiting tokens, running decode work, free blocks, and reclaim pressure. Maximizing hit rate is not the objective; minimizing expected completion cost is.
 
 \subsection{Observation 3: Transfer Must Earn Its Cost}
 
@@ -118,11 +108,11 @@ Direct NVLink is faster than host-mediated storage paths on the evaluated node, 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.92\textwidth]{fig_architecture.png}
-  \caption{\sys{} architecture. LLMEngine is the launcher, ingress, and lightweight supervisor. A dedicated control-plane process owns global scheduling and metadata. Identical data-plane processes own each GPU's local scheduler, block manager, model runner, and KV tensor. Only direct NVLink pairs exchange KV payloads.}
+  \caption{\sys{} process, control, and data paths. Every detailed GPU rank uses the same $2\times2$ data-plane layout. Rank 0--1 and Rank $N-2$--$N-1$ show two complete pairs; six smaller paired glyphs around the ellipsis denote additional instances. Global Scheduler distributes routing and transfer commands to every Local Scheduler, while every Local Block Manager publishes versioned block and load snapshots to Global Block Manager. Only paired Model Runners exchange packed KV tensors over the green NVLink path; physical KV never traverses the control plane.}
   \label{fig:arch}
 \end{figure*}
 
-Figures~\ref{fig:routing-decision}--\ref{fig:transfer-decision} separate three operations that are easy to conflate: routing chooses where a request executes, hot-prefix prediction only proposes a possible replica, and transfer admission decides whether a valid proposal is worth executing. Diamonds expose the actual rejection, deferral, spill, and rollback branches. A hotness threshold never bypasses the capacity, cooldown, pair-idleness, or measured-cost gates.
+Figures~\ref{fig:routing-decision}--\ref{fig:transfer-decision} separate three operations that are easy to conflate: routing chooses where a request executes, background placement predicts and admits a possible replica, and transactional transfer validates and executes an admitted plan. Diamonds expose the actual rejection, deferral, spill, and rollback branches. A hotness threshold never bypasses the capacity, cooldown, pair-idleness, or measured-cost gates.
 
 \begin{figure*}[t]
   \centering
@@ -134,14 +124,14 @@ Figures~\ref{fig:routing-decision}--\ref{fig:transfer-decision} separate three o
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.9\textwidth]{fig_hot_prefix_decision.png}
-  \caption{Hot-prefix prediction and background-placement admission. Observations and ingress forecasts create candidates, but replica need, load/placement conditions, cooldown, pair idleness, capacity, and measured benefit remain mandatory gates.}
+  \caption{Background-placement decision. Complete-block observations and ingress forecasts create candidates, but replica need, load/placement conditions, cooldown, pair idleness, target capacity, and measured benefit remain mandatory gates.}
   \label{fig:hot-prefix-decision}
 \end{figure*}
 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.9\textwidth]{fig_transfer_decision.png}
-  \caption{Shared transfer admission and execution path. Foreground shortage and admitted background placement use the same source-validity and benefit checks, transactional preparation, packed pair-local NCCL payload, publication, and abort path.}
+  \caption{Transactional transfer path. A foreground plan carries only an actual block shortage; a background plan carries an already admitted reusable chain. Both use the same source-validity and benefit checks, prepare, packed pair-local NCCL payload, publish/finalize, and abort path.}
   \label{fig:transfer-decision}
 \end{figure*}
 
@@ -149,19 +139,15 @@ Figures~\ref{fig:routing-decision}--\ref{fig:transfer-decision} separate three o
 
 LLMEngine is the user-facing process. It creates one independent control-plane process and $N$ identical data-plane processes, including a worker for rank~0. New sequences enter LLMEngine, which sends sequence metadata and prefix hashes through a ControlPlaneClient. The control plane chooses a rank before LLMEngine enqueues the full sequence to that worker. Workers do not normally rerun global routing.
 
-The control process owns GlobalScheduler and GlobalBlockManager. A data-plane process owns one Local Scheduler, Local Block Manager, Model Runner, and CUDA device. This separation is an ownership boundary: the global page table is authoritative metadata, whereas local block managers are authoritative for physical allocation, reference counts, readiness, and the KV tensor. No Python BlockManager object is shared across processes.
+The control process owns GlobalScheduler and GlobalBlockManager. A data-plane process owns one Local Scheduler, Local Block Manager, Model Runner, and CUDA device. This separation is an ownership boundary: the global page table is authoritative metadata, whereas local block managers are authoritative for physical allocation, reference counts, readiness, and the KV tensor. Global Scheduler sends route targets and transfer phases to each Local Scheduler. Each Local Block Manager sends a versioned snapshot to Global Block Manager after a relevant state change. No Python BlockManager object is shared across processes.
+
+Figure~\ref{fig:arch} distinguishes three communication classes. The request/result path carries full Sequence objects, generated tokens, and runtime measurements between LLMEngine and one selected worker. The metadata/control path carries versioned block and load snapshots upward and transfer phases plus heartbeat commands downward. The KV data path bypasses both processes: the source Model Runner gathers a contiguous tensor from its local HBM cache, the pair-local NCCL communicator carries it over direct NVLink, and the destination Model Runner scatters it into blocks reserved by its own Local Block Manager.
 
 LLMEngine also monitors the control process and can restart it. Bidirectional heartbeat messages detect an unresponsive worker or control process; they provide failure detection, not consensus or high availability. Worker state snapshots reconstruct control metadata after a control-process restart. The current prototype does not continue service after launcher failure.
 
 \subsection{Authoritative Global Metadata}
 
-GlobalBlockManager maintains:
-\begin{itemize}
-  \item a page table $h \mapsto \{(g,b,\mathrm{generation},\mathrm{ready})\}$ that may contain multiple replicas for one hash;
-  \item versioned free, used, evictable, parent, recency, and access-frequency snapshots per GPU;
-  \item route reservations, in-flight transfer blocks, and placement leases; and
-  \item worker epochs and snapshot versions used to reject stale updates.
-\end{itemize}
+GlobalBlockManager maintains a page table $h \mapsto \{(g,b,\mathrm{generation},\mathrm{ready})\}$ that may contain multiple replicas for one hash. It also stores versioned free, used, evictable, parent, recency, and access-frequency snapshots per GPU, together with route reservations, in-flight transfer blocks, placement leases, worker epochs, and snapshot versions used to reject stale updates.
 
 Workers publish a complete snapshot after allocation, append, release, preemption, transfer publication, and relevant cache-access changes. Replacement is atomic at GPU-snapshot granularity. Route-time reservations optimistically subtract capacity until the request commits its first prefill, preventing a burst of routes from all consuming the same stale free-block count. A heartbeat never advances page-table freshness; missing or stale snapshots trigger an explicit full-state request.
 
@@ -222,18 +208,28 @@ The separation between ``received'' and ``published'' is the visibility boundary
 \subsection{Foreground Transfer}
 \label{sec:fg-transfer}
 
-Foreground transfer is demand-driven. If a local prefill or decode append has a shortage of $k$ blocks, the worker asks the control plane for exactly $k$, not for the request's full block count. GlobalScheduler selects a complete source chain and determines whether the operation is a \emph{move} or \emph{copy}. A move may release a dependency-safe source suffix after publication; a copy retains the source and creates another replica. Pinned prefixes can be copied but never released.
+Foreground transfer is demand-driven. If a local prefill or decode append has a shortage of $k$ blocks, the worker asks the control plane for exactly $k$, not for the request's full block count. GlobalScheduler selects a complete source chain and determines whether the operation is a move or a copy. A move may release a dependency-safe source suffix after publication; a copy retains the source and creates another replica. Pinned prefixes can be copied but never released.
 
-For $B$ blocks, $L$ layers, block size $S$, $H_{kv}$ KV heads, head dimension $D$, and $d$ bytes per element, the packed payload and static estimate are
+For $B$ blocks, $L$ layers, block size $S$, $H_{kv}$ KV heads, head dimension $D$, and $d$ bytes per element, the packed payload is $X=2BLSH_{kv}Dd$. For each logical NVLink pair $p$, the transfer microbenchmark supplies monotonic P95 samples $\{(X_i,Q^{95}_{p,i})\}$. The data-path prior and static estimate are
 \begin{align}
- X &= 2BLSH_{kv}Dd, \\
- T_{\mathrm{wire}} &= \frac{1000X}{\widehat{BW}\,2^{30}}, \\
- T_{\mathrm{static}} &= (T_{\mathrm{fixed}}+I T_{\mathrm{wire}})w_x.
+ T_{\mathrm{data}}^{p}(X) &= \operatorname{PWL}\!\left(X;\{(X_i,Q^{95}_{p,i})\}\right), \\
+ T_{\mathrm{static}}^{p}(X) &= (T_{\mathrm{fixed}}+I T_{\mathrm{data}}^{p}(X))w_x.
 \end{align}
-The effective pair bandwidth $\widehat{BW}$ is initialized from the microbenchmark. Completed source operations update a pair-local transfer-extra-time EWMA, and dispatch-to-publication observations update a placement EWMA. Admission remains conservative:
+Interpolation is linear between adjacent samples; plans outside the measured range use the nearest boundary or the final measured slope. Let $b(B)=2^{\lceil\log_2 B\rceil}$ be the size bucket. Completed source operations and dispatch-to-publication observations update separate nonnegative residual EWMAs $\Delta^{src}_{p,b}$ and $\Delta^{place}_{p,b}$. Admission remains conservative:
 \begin{equation}
- T_{\mathrm{xfer}}=\max(T_{\mathrm{static}},T_{\mathrm{pair}},T_{\mathrm{placement}}).
+ T_{\mathrm{xfer}}=\max\!\left(
+ T_{\mathrm{static}}^{p},
+ (T_{\mathrm{data}}^{p}+\Delta^{src}_{p,b})w_x,
+ (T_{\mathrm{fixed}}+I T_{\mathrm{data}}^{p}+\Delta^{place}_{p,b})w_x
+ \right).
 \end{equation}
+The paper configuration uses $T_{\mathrm{fixed}}=40$ ms and $I=1.2$.
+These values are not inferred from idle bandwidth alone: a separate
+Qwen3-0.6B serving pilot measured complete target-side transactions for short
+foreground plans. Subtracting the same-size profile term left a 32--38 ms
+per-plan residual, rounded upward to 40 ms. Modeling this residual additively
+fits both short foreground and large coalesced handoff plans better than
+multiplying every payload by the short-plan slowdown.
 Foreground saved work uses discounted historical chain reuse $\widehat{R}$, whereas background admission counts only the first avoidable cold prefill because the destination self-warms after a miss:
 \begin{align}
  T_{\mathrm{save}}^{fg} &= \widehat{R}BS t_{\mathrm{prefill}}, \\
@@ -244,7 +240,7 @@ A plan is admitted only if source generations and target capacity are valid and 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.96\textwidth]{fig_transfer_cost_model.png}
-  \caption{Transfer cost and benefit model. Payload geometry and measured pair bandwidth initialize a static estimate; pair-local transfer and dispatch-to-publication EWMAs can only raise the admitted cost above that prior. Foreground and background paths use different saved-work estimates but share validity, capacity, and benefit-ratio gates.}
+  \caption{Transfer cost and benefit model. Payload geometry indexes a measured pair-specific P95 latency curve; source and dispatch-to-publication residuals are learned independently per pair and size bucket. Foreground and background paths use different saved-work estimates but share validity, capacity, and benefit-ratio gates.}
   \label{fig:transfer-cost-model}
 \end{figure*}
 
@@ -259,22 +255,14 @@ The session-handoff workload exercises this path: a warmup phase creates one cop
 
 \subsection{Transactional Transfer Protocol}
 
-A plan uses four externally visible phases:
-
-\textbf{Prepare.} The destination reserves concrete free block IDs; both workers record plan state. No new location is visible to routing.
-
-\textbf{Execute.} Source and destination issue matching NCCL point-to-point operations. The source gathers physical blocks with index selection into one contiguous tensor of shape $[L,2,B,S,H_{kv},D]$: layers, K/V, transferred blocks, block tokens, KV heads, and head dimension. It sends that tensor once on a prewarmed pair-specific process group; the destination receives an equal-shaped buffer and scatters it into reserved physical blocks with indexed copies. Hashes, generations, and destination block IDs remain control-protocol metadata rather than part of the NCCL tensor payload.
-
-\textbf{Publish.} The destination marks received blocks ready and publishes a versioned snapshot. Only then may the control plane expose the new page-table location or lease.
-
-\textbf{Finalize.} For move semantics, the source verifies block hash and generation before releasing the specified suffix. Copies skip source release. Any prepare or execute failure triggers abort, releases reservations, and keeps the source authoritative.
+A plan has four externally visible phases. During prepare, the destination reserves concrete free block IDs and both workers record plan state; no new location is visible to routing. During execute, source and destination issue matching NCCL point-to-point operations. The source gathers physical blocks with index selection into one contiguous tensor of shape $[L,2,B,S,H_{kv},D]$, representing layers, K/V, transferred blocks, block tokens, KV heads, and head dimension. It sends that tensor once on a prewarmed pair-specific process group; the destination receives an equal-shaped buffer and scatters it into reserved physical blocks with indexed copies. Hashes, generations, and destination block IDs remain control-protocol metadata rather than part of the NCCL tensor payload. During publish, the destination marks received blocks ready and publishes a versioned snapshot. Only then may the control plane expose the new page-table location or lease. During finalize, a move verifies the source block hash and generation before releasing the specified suffix, whereas a copy retains the source. A prepare or execute failure aborts the transaction, releases reservations, and keeps the source authoritative.
 
 The protocol is idempotent by plan ID and phase. Per-client receive locks serialize response-queue consumption, control-plane state is mutated in one event loop, and local block mutations remain single-threaded inside a worker. These measures avoid a global lock on the inference fast path while protecting metadata transactions.
 
 \section{Implementation}
 \label{sec:impl}
 
-\sys{} extends Mini-vLLM in Python and PyTorch. Table~\ref{tab:modules} summarizes the implementation boundaries. Legacy function names swap\_out and swap\_in remain inside the KV-transfer module; the paper and public documentation consistently use \emph{transfer} because the data path supports both copies and moves and is not a CPU swap tier.
+\sys{} extends Mini-vLLM in Python and PyTorch. Table~\ref{tab:modules} summarizes the implementation boundaries. Legacy function names swap\_out and swap\_in remain inside the KV-transfer module; the paper and public documentation use transfer because the data path supports both copies and moves and is not a CPU swap tier.
 
 \begin{table}[t]
   \centering
@@ -301,7 +289,7 @@ The protocol is idempotent by plan ID and phase. Per-client receive locks serial
 
 \subsection{Testing Strategy}
 
-The repository mirrors each engine module with focused tests rather than relying only on benchmark completion. The current CPU test run contains 181 passing tests and one hardware-gated skip. Table~\ref{tab:tests} lists the coverage intent.
+The repository mirrors each engine module with focused tests rather than relying only on benchmark completion. The current CPU test run contains 190 passing tests and one hardware-gated skip. Table~\ref{tab:tests} lists the coverage intent.
 
 \begin{table}[t]
   \centering
@@ -319,7 +307,7 @@ The repository mirrors each engine module with focused tests rather than relying
     Data plane/engine & Queue protocol, master-first ingress, worker/control lifecycle, aggregation \\
     KV transfer & Shape/byte accounting, copy/move primitives, two-rank NCCL equality and deadlock guard \\
     Model runner & KV layout, prefill/decode preparation, dtype consistency, transfer adapters \\
-    Benchmarks & Workload construction, schemas, metrics, confidence intervals, plotting \\
+    Benchmarks & Workloads, schemas, metrics, confidence intervals, plotting, transfer-profile construction and validation \\
     End-to-end & Multi-process request completion and optional CUDA/NCCL integration \\
     \bottomrule
   \end{tabular}
@@ -336,7 +324,7 @@ We answer four questions: (Q1) Does KV-aware routing improve useful prefix reuse
 
 The evaluation uses six 24~GiB GeForce RTX 3090 GPUs selected from a seven-GPU host. Physical pairs $(0,1)$, $(3,4)$, and $(5,6)$ report NV4 connectivity; the processes see them as logical pairs $(0,1)$, $(2,3)$, and $(4,5)$. We evaluate Qwen3-0.6B and Qwen3-1.7B in BF16. Both models have 28 layers, eight KV heads, head dimension 128, and therefore the same 114,688 KV bytes per token. The KV block size is 256 tokens. System experiments use a fixed per-worker KV block budget and five repetitions with seed~0 and EOS ignored, so every request produces 64 output tokens. Goodput counts output tokens from requests whose E2E latency is at most 10~s.
 
-Every JSON artifact records the command, resolved model/configuration, Git state, per-trial values, 95\% confidence intervals, and per-rank statistics. Scenarios run in fresh processes; cache contents do not persist between them. The full artifact set is the paper batch dated 20260719T072508Z.
+Every JSON artifact records the command, resolved model/configuration, Git state, per-trial values, 95\% confidence intervals, and per-rank statistics. Scenarios run in fresh processes; cache contents do not persist between them. The full artifact set is the paper batch dated 20260725T031840Z.
 
 \subsection{Synthetic Dataset Profiling}
 
@@ -364,31 +352,31 @@ We therefore report two intrinsic trace metrics before running any system policy
 
 \subsection{Baselines and Metrics}
 
-We use five normalized scenarios. \textbf{single-gpu} runs one replica. \textbf{multi-gpu} uses static round-robin data parallelism. \textbf{multi-gpu-kv-routing} enables the global router but disables transfer. \textbf{multi-gpu-kv-transfer} keeps round-robin request placement and enables transfer. \textbf{multi-gpu-lmpool} enables both mechanisms. All multi-GPU scenarios use the same per-worker KV block budget.
+We use five normalized scenarios. The single-gpu scenario runs one replica. The multi-gpu scenario uses static round-robin data parallelism. The multi-gpu-kv-routing scenario enables the global router but disables transfer. The multi-gpu-kv-transfer scenario keeps round-robin request placement and enables transfer. The multi-gpu-lmpool scenario enables both mechanisms. All multi-GPU scenarios use the same per-worker KV block budget.
 
 Primary metrics are output throughput, SLA goodput, mean TTFT, mean time per output token (TTPT), mean and P90 E2E latency, and uncached prefill tokens. We distinguish control-plane request hit, route-to-owner hit, data-plane local request hit, and cached-token ratio. Transfer counters report blocks, bytes, copy/move semantics, protocol success/failure, and estimated versus observed cost. Per-rank request/token/time/utilization distributions expose load concentration.
 
-Figure~\ref{fig:results-summary} gives a visual summary of the three positive claims. Panel~(a) compares cached prompt tokens under round-robin and KV-aware routing. Panel~(b) reports measured NVLink bandwidth, where each error bar spans the minimum and maximum over two models and three physical pairs. Panel~(c) reports the improvement of full \sys{} over multi-gpu in session handoff; positive bars denote either higher throughput or lower latency.
+Figure~\ref{fig:results-summary} summarizes three distinct claims. Panel~(a) compares cached prompt tokens under round-robin and KV-aware routing. Panel~(b) plots mean measured NVLink bandwidth over plan sizes from one to 64 blocks; the shaded band spans the minimum and maximum over two models and three physical pairs and is not a confidence interval. Panel~(c) reports the improvement of full \sys{} over multi-gpu in session handoff; positive bars denote either higher throughput or lower latency.
 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=\textwidth]{fig_results_summary.png}
-  \caption{Summary of locality, transfer-data-path, and end-to-end session-handoff results. Values are five-trial means for end-to-end workloads; transfer bars aggregate the six model/pair microbenchmark runs. Numeric labels make the plots interpretable without relying only on color.}
+  \caption{Summary of locality, transfer-data-path, and end-to-end session-handoff results. End-to-end values are five-trial means. The transfer line is the mean over six model/pair runs, and its shaded band is their observed minimum--maximum range. Numeric labels make the plots interpretable without relying only on color.}
   \label{fig:results-summary}
 \end{figure*}
 
-Figure~\ref{fig:absolute-results} retains the original units for the two workloads behind the main claims. It shows that the relative improvements in Figure~\ref{fig:results-summary} are not artifacts of normalization: routing preserves or improves absolute throughput while reducing TTFT, and full \sys{} has the highest session-handoff throughput and the lowest TTFT for both models. The complete four-panel benchmark outputs, including E2E tails, reuse, and GPU utilization, are retained with the archived artifact and the accompanying technical report.
+Figure~\ref{fig:absolute-results} retains the original units for the two workloads behind the main claims. Routing keeps throughput close to round-robin while increasing useful token reuse; its TTFT effect is model-dependent. Full \sys{} has the highest session-handoff throughput and the lowest TTFT for both models. The complete benchmark outputs, including E2E tails, reuse, and GPU utilization, are retained with the archived artifact and the accompanying technical report.
 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=\textwidth]{fig_absolute_metrics.png}
-  \caption{Absolute five-trial mean results in their original units. Panels (a)--(b) show throughput and mean TTFT for the locality/routing workload, comparing round-robin with KV-aware routing under the same KV budget. Panels (c)--(d) show the session-handoff workload, comparing round-robin, transfer-only, and full \sys{}. Numeric labels report the cross-model aggregate values; the archived per-model benchmark figures retain the wider metric set and confidence intervals.}
+  \caption{Absolute five-trial mean results in their original units. Panels (a)--(b) show throughput and mean TTFT for the locality/routing workload, comparing round-robin with KV-aware routing under the same KV budget. Panels (c)--(d) show the session-handoff workload, comparing round-robin, transfer-only, and full \sys{}. Numeric labels report each model's mean, and error bars show 95\% confidence intervals. The archived benchmark figures retain the wider metric set.}
   \label{fig:absolute-results}
 \end{figure*}
 
 \subsection{Q1: Routing Improves Token Reuse}
 
-Table~\ref{tab:routing} compares routing-only with round-robin. Across both models, cached-token ratio rises from about 44\% to 72\%, and uncached prefill tokens fall by about half. The same prompts and budget are used, so this is a placement effect rather than extra cache capacity. Routing improves mean TTFT by 20.2\% on Qwen3-0.6B and 10.6\% on Qwen3-1.7B. Throughput gains are smaller (2.7\% and 2.2\%) because the workload still generates 64 decode tokens and decode dominates steady-state service time. The first Qwen3-0.6B multi-GPU trial was colder than later trials, so we treat the reuse counters and cross-model direction as stronger evidence than a single throughput delta.
+Table~\ref{tab:routing} compares routing-only with round-robin. Cached-token ratio rises from 44.1\% to 72.2\% on Qwen3-0.6B and from 44.1\% to 71.3\% on Qwen3-1.7B. Uncached prefill tokens fall by 50.2\% and 48.6\%, respectively. The prompts and KV budget are unchanged, so this difference comes from placement rather than extra cache capacity. Throughput changes by only 0.2\% on Qwen3-0.6B and 1.4\% on Qwen3-1.7B, both small relative to run-to-run variation. Mean TTFT increases by 7.4\% on Qwen3-0.6B but decreases by 10.2\% on Qwen3-1.7B. These results establish that routing finds and realizes more reusable KV; they do not support a universal latency improvement for this workload.
 
 \begin{table}[t]
   \centering
@@ -400,23 +388,25 @@ Table~\ref{tab:routing} compares routing-only with round-robin. Across both mode
     \toprule
     Model & Policy & Tok/s & TTFT (ms) & Cached & Uncached \\
     \midrule
-    0.6B & Round-robin & 233.4 & 256.5 & 44.2\% & 204,037 \\
-         & Routing & 239.7 & 204.7 & 71.9\% & 102,814 \\
-    1.7B & Round-robin & 223.6 & 253.6 & 44.2\% & 204,293 \\
-         & Routing & 228.5 & 226.8 & 72.3\% & 101,176 \\
+    0.6B & Round-robin & 237.6 & 192.3 & 44.1\% & 204,549 \\
+         & Routing & 238.2 & 206.5 & 72.2\% & 101,842 \\
+    1.7B & Round-robin & 223.4 & 254.6 & 44.1\% & 204,651 \\
+         & Routing & 226.6 & 228.6 & 71.3\% & 105,170 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 \subsection{Q2: Batched NVLink Transfer}
 
-The microbenchmark moves every layer's K and V tensors between two ranks and validates the destination byte-for-byte. Four blocks contain 0.109~GiB and achieve 19.0--23.2~GiB/s across all model/pair runs, with 4.71--5.76~ms mean latency. Eight blocks contain 0.219~GiB and achieve 26.1--30.1~GiB/s with 7.26--8.39~ms mean latency. Larger batches better amortize fixed NCCL and kernel overhead. Because the two Qwen3 models have identical KV geometry, their payload sizes are identical; running both checks model-resolution and dtype paths rather than creating a different transfer size.
+The microbenchmark moves every layer's K and V tensors between two ranks and validates the destination byte-for-byte. It checks the packed tensor shape, byte count, dtype path, and receive-side contents; measures pair- and plan-size-specific latency and effective bandwidth; and supplies the P95 samples used to initialize the online transfer-cost model. It does not establish end-to-end serving benefit, which also depends on future reuse and interference.
 
-These values calibrate the online cost model. Four blocks are a conservative small-batch initialization point, not the runtime transfer size: foreground plans follow the actual shortage and background plans can coalesce many chains on one directed pair. A production calibration should measure the observed plan-size distribution and use a nearest-size table or a piecewise fit; the runtime EWMA partially corrects the initial estimate after completed transfers. The microbenchmark establishes data-path correctness and attainable batch bandwidth, but does not by itself imply an end-to-end gain: useful future reuse must exceed this latency plus runtime interference.
+Four blocks contain 0.109~GiB and achieve 20.5--23.1~GiB/s across all model/pair runs, with 4.73--5.34~ms mean latency. Eight blocks contain 0.219~GiB and achieve 26.8--30.1~GiB/s with 7.27--8.15~ms mean latency. Mean bandwidth reaches 36.5~GiB/s at 64 blocks. Larger batches better amortize fixed NCCL and kernel overhead. Because the two Qwen3 models have identical KV geometry, their payload sizes are identical; running both checks model resolution and dtype paths rather than creating a different transfer size.
+
+These values are samples on the online latency profile, not fixed runtime transfer sizes. Foreground plans follow the actual shortage, and background plans can coalesce several chains on one directed pair. The experiment measures 1/2/4/8/16/32/64 blocks on every physical pair, constructs a logical-pair P95 piecewise-linear profile, and then updates pair-by-size-bucket residuals from completed serving transfers. A useful plan must still save more prefill time than this measured latency plus runtime interference.
 
 \subsection{Q3: Session Handoff Benefits from Both Principles}
 
-Table~\ref{tab:handoff} reports the strongest end-to-end case. After 32 warmup sessions, \sys{} copies 224 hot blocks per trial in three batched pair plans, then routes the 96 reuse requests across source and replica. Cached-token ratio rises from 47.0\% under round-robin to 70.5\%. Compared with multi-gpu, full \sys{} improves throughput by 4.2\% on 0.6B and 7.1\% on 1.7B; mean TTFT falls by 33.2\% and 42.6\%; mean E2E falls by 9.9\% and 13.7\%. Transfer-only also helps, but routing plus placement gives the lowest TTFT and E2E. The per-rank submitted-request max/min ratio falls from approximately 3.3 to 1.8, showing that replication preserves locality without concentrating all reuse at the original owner.
+Table~\ref{tab:handoff} reports the strongest end-to-end case. After 32 warmup sessions, \sys{} copies 224 hot blocks per trial in three batched pair plans, then routes the 96 reuse requests across source and replica. Cached-token ratio rises from 47.0\% under round-robin to 70.5\%. Compared with multi-gpu, full \sys{} improves throughput by 4.4\% on 0.6B and 7.4\% on 1.7B; mean TTFT falls by 32.4\% and 40.4\%; mean E2E falls by 9.3\% and 12.9\%. Transfer-only reduces TTFT for both models, while routing plus placement gives the highest throughput and lowest mean TTFT and E2E. The per-rank submitted-request max/min ratio falls from 3.3 to 1.8, showing that replication preserves locality without concentrating all reuse at the original owner.
 
 \begin{table*}[t]
   \centering
@@ -429,33 +419,33 @@ Table~\ref{tab:handoff} reports the strongest end-to-end case. After 32 warmup s
     Model & Policy & Throughput & Mean TTFT & Mean E2E & P90 E2E & Cached tokens & Blocks copied \\
           &        & (tok/s) & (ms) & (ms) & (ms) & & \\
     \midrule
-    0.6B & Multi-gpu & 496.3 & 1,156.5 & 5,529.1 & 6,335.1 & 47.0\% & 0 \\
-         & Transfer-only & 501.4 (+1.0\%) & 1,033.6 (-10.6\%) & 5,406.8 (-2.2\%) & 6,042.9 (-4.6\%) & 70.5\% & 224 \\
-         & LMPool & 517.1 (+4.2\%) & 772.8 (-33.2\%) & 4,982.7 (-9.9\%) & 5,840.0 (-7.8\%) & 70.5\% & 224 \\
+    0.6B & Multi-gpu & 497.1 & 1,136.3 & 5,515.1 & 6,251.0 & 47.0\% & 0 \\
+         & Transfer-only & 496.9 (-0.05\%) & 1,013.9 (-10.8\%) & 5,424.8 (-1.6\%) & 6,128.0 (-2.0\%) & 70.5\% & 224 \\
+         & LMPool & 518.9 (+4.4\%) & 767.6 (-32.4\%) & 5,001.1 (-9.3\%) & 5,787.1 (-7.4\%) & 70.5\% & 224 \\
     \midrule
-    1.7B & Multi-gpu & 454.3 & 1,434.7 & 6,093.8 & 7,032.2 & 47.0\% & 0 \\
-         & Transfer-only & 469.2 (+3.3\%) & 1,126.5 (-21.5\%) & 5,705.7 (-6.4\%) & 6,518.7 (-7.3\%) & 70.5\% & 224 \\
-         & LMPool & 486.4 (+7.1\%) & 823.3 (-42.6\%) & 5,258.3 (-13.7\%) & 6,466.9 (-8.0\%) & 70.5\% & 224 \\
+    1.7B & Multi-gpu & 451.2 & 1,427.7 & 6,121.4 & 7,039.5 & 47.0\% & 0 \\
+         & Transfer-only & 465.4 (+3.2\%) & 1,117.9 (-21.7\%) & 5,746.1 (-6.1\%) & 6,554.0 (-6.9\%) & 70.5\% & 224 \\
+         & LMPool & 484.8 (+7.4\%) & 850.4 (-40.4\%) & 5,329.7 (-12.9\%) & 6,502.5 (-7.6\%) & 70.5\% & 224 \\
     \bottomrule
   \end{tabular}
 \end{table*}
 
 \subsection{Q4: Boundary Results}
 
-The memory-skew workload does not yet produce a transfer-dominated win. With Qwen3-1.7B, multi-gpu reaches 221.3 tok/s, transfer-only 211.5 tok/s, and full \sys{} 216.6 tok/s. Only three to four foreground plans succeed across five trials and no preemption occurs; the baseline therefore has little pathological work for transfer to remove. Full \sys{} reduces mean TTFT from 462.0 to 407.2~ms and mean E2E from 4,514.3 to 4,476.6~ms, but throughput and P90 E2E are worse. The 0.6B results show the same pattern. This validates cost-gated execution and protocol counters, not a broad performance claim.
+The memory-skew workload does not produce a transfer-dominated win. With Qwen3-1.7B, multi-gpu reaches 216.3 tok/s, transfer-only 212.6 tok/s, and full \sys{} 214.5 tok/s. No transfer is admitted for this model. Full \sys{} reduces mean TTFT from 469.8 to 407.8~ms and mean E2E from 4,572.7 to 4,505.4~ms, but throughput remains lower and P90 E2E changes little. Qwen3-0.6B admits seven copied blocks in only one of five trials; averaged over all trials, full \sys{} records one copied block and also loses throughput. The baseline therefore has little pathological work for transfer to remove. This is evidence that admission suppresses unprofitable movement, not a broad performance claim.
 
-Under steady load skew, no transfers are admitted and all multi-GPU policies remain within roughly one percent throughput of each other. This is a useful control: \sys{} does not manufacture data movement when placement is already adequate, but its control/routing overhead is not free. We therefore use locality to substantiate routing, the microbenchmark to substantiate the data path, and session handoff to substantiate their composition. Memory and load skew define the current prototype's limits rather than being omitted.
+Under steady load skew, no transfers are admitted and all multi-GPU policies remain within 0.6\% throughput of round-robin. This is a useful control: \sys{} does not manufacture data movement when placement is already adequate, but its control and routing overhead is not free. We therefore use locality to substantiate reusable-KV placement, the microbenchmark to substantiate the data path and its cost prior, and session handoff to substantiate their composition. Memory and load skew define the current prototype's limits rather than universal wins.
 
 \section{Discussion and Limitations}
 \label{sec:limitations}
 
-\textbf{Synthetic workloads.} The phase structure makes causal attribution possible, but it is not a substitute for profiling production traces. Future evaluation should replay a published or anonymized trace and report prefix popularity, reuse distance, prompt/decode distributions, and session-affinity transitions before selecting cache policies.
+The synthetic phase structure makes causal attribution possible, but it is not a substitute for profiling production traces. Future evaluation should replay a published or anonymized trace and report prefix popularity, reuse distance, prompt/decode distributions, and session-affinity transitions before selecting cache policies.
 
-\textbf{Scale and models.} The study uses one host, six consumer GPUs, and two sub-2B models with identical KV geometry. Larger models change the compute-to-transfer ratio, and larger NVLink fabrics change candidate selection. Results should not be extrapolated to RDMA or PCIe-only clusters.
+The study uses one host, six consumer GPUs, and two sub-2B models with identical KV geometry. Larger models change the compute-to-transfer ratio, and larger NVLink fabrics change candidate selection. Results should not be extrapolated to RDMA or PCIe-only clusters.
 
-\textbf{Control-plane availability.} Versioned snapshots, transactional transfers, heartbeats, and launcher restart protect consistency and detect failures. They do not implement replicated consensus; launcher failure stops the service and a worker failure may lose its physical cache.
+Versioned snapshots, transactional transfers, heartbeats, and launcher restart protect consistency and detect failures. They do not implement replicated consensus; launcher failure stops the service and a worker failure may lose its physical cache.
 
-\textbf{Online cost estimation.} EWMA bandwidth and configured prefill cost are coarse. Memory contention can make source and target timings diverge from isolated microbenchmarks. A production implementation should learn cost by block batch, model, pair, and concurrent compute state.
+The model- and pair-specific size curve, calibrated fixed transaction residual, and bucketed EWMA capture payload scale and observed serving overhead, but they do not explicitly condition on concurrent kernels, clocks, or link contention. Rapidly changing compute states can therefore still be mispriced; a production implementation should add concurrency-aware features after collecting enough serving samples.
 
 \section{Related Work}
 \label{sec:related}
@@ -474,7 +464,7 @@ MemServe provides an elastic memory pool and global prompt-tree scheduler for di
 
 Aqua uses spare memory on NVLink/NVSwitch-connected GPUs to page inference state for preemptive, time-sliced serving under bursty memory pressure. On eight H100 GPUs, it reports up to 20$\times$ better responsiveness and 4$\times$ higher throughput for a single long prompt~\citep{Aqua}. Aqua therefore provides fluidity for active inference state, but does not route requests by content-addressed prefix ownership. Llumnix migrates requests to support dynamic rescheduling and defragmentation~\citep{Llumnix}. MELL jointly considers multi-GPU KV load and request-migration cost~\citep{MELL}. Their work confirms that movement is a costed scheduling operation, not a universally beneficial fallback. \sys{} differs in using content-addressed prefix chains, copy-style replication, and placement leases to serve future requests from both source and destination.
 
-Table~\ref{tab:related-principles} separates three concerns that are often grouped under ``distributed KV cache.'' \emph{Locality-aware} means placing a request where its prefix already exists. \emph{Fluidity-aware} means moving state when its current placement is wrong. \emph{Coupled admission} means comparing recomputation, queueing, capacity, and measured transfer cost before choosing between those actions. The comparison does not claim that \sys{} replaces durable or cross-node stores; it shows that \sys{} is the only listed design that closes all three decisions inside the serving scheduler.
+Table~\ref{tab:related-principles} separates three concerns that are often grouped under ``distributed KV cache.'' Locality-aware placement sends a request where its prefix already exists. Fluidity-aware placement moves state when its current location is wrong. Coupled admission compares recomputation, queueing, capacity, and measured transfer cost before choosing between those actions. The comparison does not claim that \sys{} replaces durable or cross-node stores; it shows that \sys{} is the only listed design that closes all three decisions inside the serving scheduler.
 
 \begin{table*}[t]
   \caption{Principle-oriented comparison of KV-cache systems. ``Partial'' denotes metadata lookup without a published joint locality/load routing and transfer-admission policy.}

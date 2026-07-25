@@ -121,9 +121,15 @@ df -h /home/jialiangli/.cache/huggingface/hub
 
 这是论文结果的推荐模式。先执行第 2 节，再执行下面这一整块。统一运行器会依次对 0.6B 和
 1.7B 执行三个物理 NVLink pair 的 transfer sweep、routing、memory-skew、session-handoff
-和补充 load-skew。它会读取每个模型的 KV geometry/dtype，取三个 pair 的 4-block 实测
-带宽中位数作为保守的小批初值，并自动写入该模型的 E2E transfer 成本参数；这不表示线上
-plan 固定为 4 blocks，完成的 transfer 会继续更新运行时 EWMA：
+和补充 load-skew。它会读取每个模型的 KV geometry/dtype，在三个物理 pair 上测量
+1/2/4/8/16/32/64-block 延迟，将其映射为逻辑 pair 的分段 P95 latency profile，并自动写入
+该模型的 E2E transfer 成本参数。运行时按实际 plan 字节数插值，超出测量范围时用末段斜率
+外推；完成的 transfer 再按 pair 和 size bucket 更新 EWMA：
+
+空载 microbenchmark 只给出随 payload 变化的数据通路项，不能直接代表完整 serving
+事务。当前论文配置使用 `T_static = 40 ms + 1.2 × profile_P95(plan_bytes)`：40 ms 来自
+独立 Qwen3-0.6B serving pilot 中短 foreground plan 的目标端残差并向上取整，1.2 仅修正
+payload 相关的加载态干扰。该 pilot 只用于参数校准，不作为最终性能结果。
 
 首次正式采集前先完成第 5 节测试；测试不需要在每个 trial 前重复执行。
 
@@ -131,6 +137,8 @@ plan 固定为 4 blocks，完成的 transfer 会继续更新运行时 EWMA：
 export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 export OUT="benchmarks/results/paper/${RUN_ID}"
 export REPETITIONS=5
+export TRANSFER_FIXED_LATENCY_MS=40.0
+export TRANSFER_INTERFERENCE_MULTIPLIER=1.2
 
 bash benchmarks/run_paper_suite.sh
 ```
@@ -143,6 +151,29 @@ GPU 实验前失败，不会联网下载，也不会用另一模型代替。开�
 
 使用本模式时，runner 已经执行第 6--10 节列出的全部 benchmark。不要随后再手工执行这些
 命令，否则只是产生一套重复且目录结构不同的结果。
+
+如果运行中断，保留原来的 `OUT` 并设置 `RESUME=1`。runner 会校验每个 JSON 的结果结构、
+模型、重复次数、workload 和 E2E transfer 校准参数，并检查 transfer 的 7 个 payload、
+routing 的 3 个场景或 E2E 的 5 个场景是否齐全。它只跳过结构和关键配置都一致的
+artifact，只重跑缺失、不完整或配置不一致的实验。例如恢复一个未改变代码和参数的 run：
+
+```bash
+export RUN_ID=20260725T031840Z
+export OUT="benchmarks/results/paper/${RUN_ID}"
+export REPETITIONS=5
+export TRANSFER_FIXED_LATENCY_MS=40.0
+export TRANSFER_INTERFERENCE_MULTIPLIER=1.2
+export RESUME=1
+
+bash benchmarks/run_paper_suite.sh
+```
+
+`20260725T031840Z` 的 Qwen3-0.6B E2E 结果使用旧的 `2 ms` 固定事务残差，只能作为
+成本校准 pilot；不要在该目录继续拼接最终论文结果。修改成本参数后应使用新的 `RUN_ID`
+对两个模型重跑，保证同一结果目录内配置一致。
+
+KV transfer microbenchmark 为每个 payload case 使用唯一 FileStore rendezvous，不依赖临时
+TCP 端口。若某个 worker 仍异常退出，父进程会立即报告 exit code，而不会等待完整超时。
 
 ## 4. Mode B: Manual Single-Model Runs
 
@@ -162,8 +193,7 @@ export CUDA_VISIBLE_DEVICES="${GPU_SET}"
 export RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 export OUT="benchmarks/results/paper/${RUN_ID}/${MODEL_LABEL}"
 export REPETITIONS=5
-# 第 6 节跑完 transfer microbenchmark 后，用最接近实际 plan 大小的实测值替换此处。
-export TRANSFER_BANDWIDTH_GIB_S=22.95
+export TRANSFER_PROFILE="${OUT}/kv_transfer/latency_profile.json"
 mkdir -p "${OUT}"/{environment,kv_transfer,routing,memory_skew,session_handoff,load_skew}
 
 nvidia-smi -L | tee "${OUT}/environment/gpus.txt"
@@ -202,36 +232,40 @@ RUN_NCCL_INTEGRATION=1 CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
 ## 6. NVLink KV Transfer Microbenchmark
 
 该实验不加载权重，但会从指定模型解析真实 KV shape 和 dtype。对每个模型、每个物理
-NVLink pair 分别执行 1/2/4/8 blocks sweep：
+NVLink pair 分别执行 1/2/4/8/16/32/64 blocks sweep，然后按顺序映射到 E2E 的逻辑 pair：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
-  uv run python benchmarks/benchmark_kv_transfer.py \
-  --model-name-or-path "${MODEL}" \
-  --dtype auto \
-  --block-size 256 \
-  --block-counts 1,2,4,8 \
-  --iterations 100 \
-  --warmup 20 \
-  --output-json "${OUT}/kv_transfer/summary.json" \
-  --output-figure "${OUT}/kv_transfer/summary.png" \
-  2>&1 | tee "${OUT}/kv_transfer/run.log"
+transfer_inputs=()
+IFS=';' read -r -a physical_pairs <<< "${TRANSFER_PAIRS}"
+for pair in "${physical_pairs[@]}"; do
+  pair_label="${pair/,/-}"
+  pair_json="${OUT}/kv_transfer/pair_${pair_label}.json"
+  CUDA_VISIBLE_DEVICES="${pair}" UV_CACHE_DIR=/tmp/uvcache \
+    uv run python benchmarks/benchmark_kv_transfer.py \
+    --model-name-or-path "${MODEL}" \
+    --dtype auto \
+    --block-size 256 \
+    --block-counts 1,2,4,8,16,32,64 \
+    --iterations 100 \
+    --warmup 20 \
+    --output-json "${pair_json}" \
+    --output-figure "${OUT}/kv_transfer/pair_${pair_label}.png" \
+    2>&1 | tee "${OUT}/kv_transfer/pair_${pair_label}.log"
+  transfer_inputs+=("${pair_json}")
+done
+
+uv run python benchmarks/build_transfer_profile.py \
+  --inputs "${transfer_inputs[@]}" \
+  --logical-pairs "${NVLINK_PAIRS}" \
+  --latency-metric p95_latency_ms \
+  --output "${TRANSFER_PROFILE}"
 ```
 
-所有 payload 的 `data_validation` 必须为 `passed`。E2E cost model 应采用与线上常见
-transfer plan block 数最接近的一档有效带宽，不使用 NVLink 标称带宽。线上 batch 并非
-固定为 4：foreground plan 等于实际 block shortage；background 每条候选链默认最多 8
-blocks，并可对同一有向 pair 的多条候选去重合并到默认 128 blocks。当前自动 runner 使用
-4-block 中位数作为保守的小批初值，运行时完成的 transfer 还会更新 EWMA；若正式 workload
-稳定产生更大的 plan，应把 sweep 扩展到 16/32/64 blocks，并使用最接近 plan-size 分布的
-档位或拟合 `fixed_latency + bytes / bandwidth`。
-
-手工运行时，若线上 plan 主要落在 4 blocks 附近，从 JSON 中读取 4-block 的
-`effective_bandwidth_gib_s`，然后更新：
-
-```bash
-export TRANSFER_BANDWIDTH_GIB_S=22.95  # 示例；替换为本次实测值
-```
+所有 payload 的 `data_validation` 必须为 `passed`。`latency_profile.json` 保留每个物理
+pair 的来源、模型 KV geometry、原始延迟和单调化后的决策延迟。E2E loader 会校验逻辑 pair
+以及每 block 字节数，防止 0.6B/1.7B、FP16/BF16 或不同 block size 的 profile 混用。
+线上 batch 并非固定档位：foreground plan 等于实际 shortage，background plan 可合并多条
+候选；成本模型在相邻测量点间线性插值，并由运行时 pair x size-bucket EWMA 修正。
 
 ## 7. KV-Aware Routing
 
@@ -289,8 +323,8 @@ uv run python benchmarks/benchmark_e2e.py \
   --goodput-e2e-sla-ms 10000 \
   --disable-background-copy \
   --foreground-transfer-min-benefit-ratio 1.1 \
-  --foreground-transfer-bandwidth-gib-s "${TRANSFER_BANDWIDTH_GIB_S}" \
-  --foreground-transfer-fixed-latency-ms 2.0 \
+  --foreground-transfer-profile-json "${TRANSFER_PROFILE}" \
+  --foreground-transfer-fixed-latency-ms 40.0 \
   --foreground-transfer-interference-multiplier 1.2 \
   --kv-transfer-prewarm-blocks 4 \
   --output-json "${OUT}/memory_skew/summary.json" \
@@ -298,9 +332,9 @@ uv run python benchmarks/benchmark_e2e.py \
   2>&1 | tee "${OUT}/memory_skew/run.log"
 ```
 
-运行 transfer microbenchmark 后，应将 `TRANSFER_BANDWIDTH_GIB_S` 设置为 4-block 或实际
-线上 batch 对应的实测 GiB/s。验收时同时检查 `sent blocks`、`source freed`、`fg ok` 和
-reuse-phase token ratio；如果 transfer counters 为 0，该结果不能证明 foreground transfer。
+运行前必须先由第 6 节生成 `TRANSFER_PROFILE`。验收时同时检查 `sent blocks`、
+`source freed`、`fg ok` 和 reuse-phase token ratio；如果 transfer counters 为 0，该结果
+不能证明 foreground transfer。
 
 ## 9. Full LMPool Session Handoff
 
@@ -332,8 +366,8 @@ uv run python benchmarks/benchmark_e2e.py \
   --background-copy-cooldown-s 0.1 \
   --background-copy-expected-reuses 4 \
   --foreground-transfer-min-benefit-ratio 1.1 \
-  --foreground-transfer-bandwidth-gib-s "${TRANSFER_BANDWIDTH_GIB_S}" \
-  --foreground-transfer-fixed-latency-ms 2.0 \
+  --foreground-transfer-profile-json "${TRANSFER_PROFILE}" \
+  --foreground-transfer-fixed-latency-ms 40.0 \
   --foreground-transfer-interference-multiplier 1.2 \
   --kv-transfer-prewarm-blocks 4 \
   --output-json "${OUT}/session_handoff/summary.json" \
@@ -367,7 +401,7 @@ uv run python benchmarks/benchmark_e2e.py \
   --gpu-memory-utilization 0.5 \
   --goodput-e2e-sla-ms 10000 \
   --disable-background-copy \
-  --foreground-transfer-bandwidth-gib-s "${TRANSFER_BANDWIDTH_GIB_S}" \
+  --foreground-transfer-profile-json "${TRANSFER_PROFILE}" \
   --output-json "${OUT}/load_skew/summary.json" \
   --output-figure "${OUT}/load_skew/summary.png" \
   2>&1 | tee "${OUT}/load_skew/run.log"

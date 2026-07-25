@@ -597,6 +597,9 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             scheduler.transfer_interference_multiplier,
         )),
     )
+    scheduler.set_transfer_latency_profile(
+        config.get("foreground_transfer_latency_profile")
+    )
     scheduler.prefill_token_time_ms = max(
         0.0,
         float(config.get("foreground_prefill_token_time_ms", scheduler.prefill_token_time_ms)),

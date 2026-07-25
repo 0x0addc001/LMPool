@@ -1,0 +1,143 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-25T07:10:16.175479+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e --dtype auto --block-size 256 --block-counts 1,2,4,8,16,32,64 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_3-4.json --output-figure benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_3-4.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "d495a96564999d812399e4bfc8120d7e6eddaffb",
+    "git_status": "M README.md\n M README_zh.md\n M assets/fig_transfer_cost_model_dark.png\n M benchmarks/PAPER_RUNBOOK.md\n M benchmarks/README.md\n M benchmarks/benchmark_e2e.py\n M benchmarks/benchmark_kv_transfer.py\n M benchmarks/run_paper_suite.sh\n M docs/flow/decisions.md\n M docs/paper/example_paper.tex\n M docs/paper/figures/fig_transfer_cost_model.png\n M docs/paper/figures/generate_cost_models.py\n M src/lmpool/engine/control_plane.py\n M src/lmpool/engine/global_scheduler.py\n M tests/README.md\n M tests/test_benchmark_kv_transfer.py\n M tests/test_global_scheduler.py\n?? benchmarks/build_transfer_profile.py\n?? benchmarks/results/paper/20260725T031840Z/\n?? benchmarks/transfer_profile.py\n?? tests/test_transfer_profile.py",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "3,4",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8,16,32,64",
+      "iterations": 100,
+      "warmup": 20,
+      "input_json": "",
+      "output_json": "benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_3-4.json",
+      "output_figure": "benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_3-4.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "label": "Qwen/Qwen3-1.7B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 2048,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 6144,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 2048,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 6144,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 3.4811375608842354,
+      "p50_latency_ms": 3.470871495665051,
+      "p95_latency_ms": 3.5714363017177675,
+      "effective_bandwidth_gib_s": 7.854831796148406,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 4.05830114003038,
+      "p50_latency_ms": 4.044741501274984,
+      "p95_latency_ms": 4.148347194859525,
+      "effective_bandwidth_gib_s": 13.475466238956978,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 5.2364147585467435,
+      "p50_latency_ms": 5.389845508034341,
+      "p95_latency_ms": 5.462384143174859,
+      "effective_bandwidth_gib_s": 20.887382883771934,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 7.724277420056751,
+      "p50_latency_ms": 7.291353002074175,
+      "p95_latency_ms": 8.369859558297321,
+      "effective_bandwidth_gib_s": 28.319801077055672,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 16,
+      "bytes_per_iteration": 469762048,
+      "gib_per_iteration": 0.4375,
+      "mean_latency_ms": 13.532456760294735,
+      "p50_latency_ms": 13.520740503736306,
+      "p95_latency_ms": 13.602769151475513,
+      "effective_bandwidth_gib_s": 32.329680245767236,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 32,
+      "bytes_per_iteration": 939524096,
+      "gib_per_iteration": 0.875,
+      "mean_latency_ms": 24.41160883012344,
+      "p50_latency_ms": 24.39308750035707,
+      "p95_latency_ms": 24.4605976055027,
+      "effective_bandwidth_gib_s": 35.843602365128326,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 64,
+      "bytes_per_iteration": 1879048192,
+      "gib_per_iteration": 1.75,
+      "mean_latency_ms": 47.89852867965237,
+      "p50_latency_ms": 47.89237699878868,
+      "p95_latency_ms": 47.932311143085826,
+      "effective_bandwidth_gib_s": 36.53556900889551,
+      "data_validation": "passed"
+    }
+  ]
+}

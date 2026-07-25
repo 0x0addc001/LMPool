@@ -3,45 +3,48 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.path import Path as MplPath
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PAPER_OUTPUT = Path(__file__).with_name("fig_kv_block_lifecycle.png")
-README_OUTPUT = ROOT / "assets/fig_kv_block_lifecycle_dark.png"
+PAPER_PNG = Path(__file__).with_name("fig_kv_block_lifecycle.png")
+PAPER_PDF = Path(__file__).with_name("fig_kv_block_lifecycle.pdf")
+README_LIGHT = ROOT / "assets" / "fig_kv_block_lifecycle.png"
+README_DARK = ROOT / "assets" / "fig_kv_block_lifecycle_dark.png"
 
 LIGHT = {
-    "background": "#ffffff",
-    "text": "#17212b",
-    "muted": "#52606d",
-    "arrow": "#4f5b66",
-    "free_face": "#f2f4f6",
-    "free_edge": "#66717a",
-    "active_face": "#dbe9f6",
-    "active_edge": "#4477aa",
-    "cache_face": "#e2f2e8",
-    "cache_edge": "#228833",
-    "transfer_face": "#fff0d4",
-    "transfer_edge": "#ee7733",
-    "pending_face": "#eee3f2",
-    "pending_edge": "#aa3377",
+    "background": "#FFFFFF",
+    "text": "#293744",
+    "muted": "#667482",
+    "arrow": "#66899F",
+    "free_fill": "#F1F6F8",
+    "free_edge": "#66899F",
+    "active_fill": "#F1F6F8",
+    "active_edge": "#66899F",
+    "cache_fill": "#F1F6F8",
+    "cache_edge": "#66899F",
+    "transfer_fill": "#F1F6F8",
+    "transfer_edge": "#66899F",
+    "pending_fill": "#E8F1F4",
+    "pending_edge": "#66899F",
 }
 
 DARK = {
-    "background": "#0d1117",
-    "text": "#e6edf3",
-    "muted": "#b1bac4",
-    "arrow": "#b1bac4",
-    "free_face": "#161b22",
-    "free_edge": "#8b949e",
-    "active_face": "#132f4c",
-    "active_edge": "#58a6ff",
-    "cache_face": "#102f1e",
-    "cache_edge": "#56d364",
-    "transfer_face": "#3a2717",
-    "transfer_edge": "#ffa657",
-    "pending_face": "#32213c",
-    "pending_edge": "#d2a8ff",
+    "background": "#0E141A",
+    "text": "#F1F5F7",
+    "muted": "#A8B4BF",
+    "arrow": "#84AFC2",
+    "free_fill": "#17232A",
+    "free_edge": "#84AFC2",
+    "active_fill": "#17232A",
+    "active_edge": "#84AFC2",
+    "cache_fill": "#17232A",
+    "cache_edge": "#84AFC2",
+    "transfer_fill": "#17232A",
+    "transfer_edge": "#84AFC2",
+    "pending_fill": "#1C2C34",
+    "pending_edge": "#84AFC2",
 }
 
 
@@ -52,27 +55,28 @@ def state_box(
     title,
     subtitle,
     palette,
-    face_key,
+    fill_key,
     edge_key,
     *,
-    title_size=11.2,
-    subtitle_size=8.7,
+    title_size=9.6,
+    subtitle_size=7.6,
 ):
     x, y = center
     width, height = size
-    patch = FancyBboxPatch(
-        (x - width / 2, y - height / 2),
-        width,
-        height,
-        boxstyle="round,pad=0.008,rounding_size=0.012",
-        linewidth=1.7,
-        edgecolor=palette[edge_key],
-        facecolor=palette[face_key],
+    ax.add_patch(
+        FancyBboxPatch(
+            (x - width / 2, y - height / 2),
+            width,
+            height,
+            boxstyle="round,pad=0.006,rounding_size=0.010",
+            linewidth=1.45,
+            edgecolor=palette[edge_key],
+            facecolor=palette[fill_key],
+        )
     )
-    ax.add_patch(patch)
     ax.text(
         x,
-        y + 0.018,
+        y + 0.012,
         title,
         ha="center",
         va="center",
@@ -82,385 +86,414 @@ def state_box(
     )
     ax.text(
         x,
-        y - 0.027,
+        y - 0.019,
         subtitle,
         ha="center",
         va="center",
         fontsize=subtitle_size,
         color=palette["muted"],
-        linespacing=1.12,
+        linespacing=1.1,
     )
 
 
-def decision(ax, center, size, text, palette):
+def decision(ax, center, size, text, palette, *, accent_key="pending_edge"):
     x, y = center
     width, height = size
-    patch = Polygon(
-        [
-            (x, y + height / 2),
-            (x + width / 2, y),
-            (x, y - height / 2),
-            (x - width / 2, y),
-        ],
-        closed=True,
-        linewidth=1.7,
-        edgecolor=palette["pending_edge"],
-        facecolor=palette["pending_face"],
+    ax.add_patch(
+        Polygon(
+            [
+                (x, y + height / 2),
+                (x + width / 2, y),
+                (x, y - height / 2),
+                (x - width / 2, y),
+            ],
+            closed=True,
+            linewidth=1.45,
+            edgecolor=palette[accent_key],
+            facecolor=palette["pending_fill"],
+        )
     )
-    ax.add_patch(patch)
     ax.text(
         x,
         y,
         text,
         ha="center",
         va="center",
-        fontsize=9.3,
+        fontsize=8.3,
         color=palette["text"],
-        linespacing=1.1,
+        linespacing=1.08,
     )
 
 
-def arrow(
+def orth_arrow(
     ax,
-    start,
-    end,
+    points,
     palette,
     *,
+    color_key="arrow",
     label=None,
     label_position=None,
-    connectionstyle="arc3,rad=0",
 ):
+    path = MplPath(
+        points,
+        [MplPath.MOVETO] + [MplPath.LINETO] * (len(points) - 1),
+    )
     ax.add_patch(
         FancyArrowPatch(
-            start,
-            end,
+            path=path,
             arrowstyle="-|>",
-            mutation_scale=14,
+            mutation_scale=13,
             linewidth=1.45,
-            color=palette["arrow"],
-            connectionstyle=connectionstyle,
-            shrinkA=2,
-            shrinkB=2,
+            color=palette[color_key],
+            shrinkA=0,
+            shrinkB=0,
         )
     )
     if label:
-        x, y = label_position or (
-            (start[0] + end[0]) / 2,
-            (start[1] + end[1]) / 2,
-        )
         ax.text(
-            x,
-            y,
+            *label_position,
             label,
             ha="center",
             va="center",
-            fontsize=8.2,
-            color=palette["muted"],
-            bbox={
-                "facecolor": palette["background"],
-                "edgecolor": "none",
-                "pad": 1.2,
-            },
+            fontsize=7.7,
+            fontweight="bold",
+            color=palette[color_key],
         )
 
 
-def elbow_arrow(ax, points, palette, *, label=None, label_position=None):
-    """Draw an orthogonal connector with one arrowhead at the destination."""
-    xs = [point[0] for point in points[:-1]]
-    ys = [point[1] for point in points[:-1]]
-    ax.plot(xs, ys, color=palette["arrow"], linewidth=1.45)
-    arrow(ax, points[-2], points[-1], palette, label=label, label_position=label_position)
-
-
-def render(output: Path, palette: dict[str, str]) -> None:
-    fig, ax = plt.subplots(figsize=(15.5, 9.5))
-    fig.patch.set_facecolor(palette["background"])
-    ax.set_facecolor(palette["background"])
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-
+def heading(ax, title, subtitle, palette):
     ax.text(
         0.5,
-        0.955,
-        "KV Block Lifecycle",
+        0.958,
+        title,
         ha="center",
         va="center",
-        fontsize=17,
+        fontsize=16.5,
         fontweight="bold",
         color=palette["text"],
     )
     ax.text(
         0.5,
         0.918,
-        "LocalBlockManager owns block state; ModelRunner writes or transfers the physical K/V tensor.",
+        subtitle,
         ha="center",
         va="center",
-        fontsize=10.3,
+        fontsize=9.8,
         color=palette["muted"],
     )
+
+
+def render(palette, outputs):
+    fig, ax = plt.subplots(figsize=(15.2, 8.6))
+    fig.patch.set_facecolor(palette["background"])
+    ax.set_facecolor(palette["background"])
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    heading(
+        ax,
+        "KV Block Lifecycle",
+        "Local metadata controls visibility; ModelRunner owns the physical K/V tensor.",
+        palette,
+    )
+
     ax.text(
-        0.04,
-        0.845,
-        "Normal allocation and prefix-cache path",
-        ha="left",
-        va="center",
-        fontsize=11.5,
+        0.055,
+        0.855,
+        "Local allocation and prefix reuse",
+        fontsize=10.2,
         fontweight="bold",
         color=palette["active_edge"],
+        ha="left",
+        va="center",
     )
 
     state_box(
         ax,
-        (0.10, 0.72),
-        (0.16, 0.105),
+        (0.10, 0.735),
+        (0.14, 0.10),
         "Free",
-        "ID is available\nno visible KV owner",
+        "available ID\nno KV owner",
         palette,
-        "free_face",
+        "free_fill",
         "free_edge",
     )
     state_box(
         ax,
-        (0.335, 0.72),
-        (0.19, 0.105),
+        (0.31, 0.735),
+        (0.18, 0.10),
         "Allocated / Writing",
-        "generation incremented\nKV not reusable yet",
+        "generation advanced\nnot reusable",
         palette,
-        "active_face",
+        "active_fill",
         "active_edge",
     )
     state_box(
         ax,
-        (0.58, 0.72),
-        (0.18, 0.105),
+        (0.535, 0.735),
+        (0.17, 0.10),
         "Ready / In Use",
         "kv_ready = true\nref_count > 0",
         palette,
-        "active_face",
+        "active_fill",
         "active_edge",
     )
     state_box(
         ax,
-        (0.835, 0.72),
-        (0.2, 0.105),
+        (0.80, 0.735),
+        (0.22, 0.10),
         "Cached / Reclaimable",
-        "ready prefix; ref_count = 0\nreusable until reclaimed",
+        "ready prefix; ref_count = 0\nvisible until reclaimed",
         palette,
-        "cache_face",
+        "cache_fill",
         "cache_edge",
     )
 
-    arrow(ax, (0.18, 0.72), (0.24, 0.72), palette, label="allocate", label_position=(0.21, 0.79))
-    arrow(
+    orth_arrow(
         ax,
-        (0.43, 0.72),
-        (0.49, 0.72),
+        [(0.17, 0.735), (0.22, 0.735)],
         palette,
-        label="KV complete + publish",
-        label_position=(0.46, 0.79),
+        label="allocate",
+        label_position=(0.195, 0.775),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.67, 0.72),
-        (0.735, 0.72),
+        [(0.40, 0.735), (0.45, 0.735)],
         palette,
-        label="request release",
-        label_position=(0.70, 0.79),
+        label="publish",
+        label_position=(0.425, 0.775),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.79, 0.785),
-        (0.63, 0.785),
+        [(0.62, 0.735), (0.69, 0.735)],
         palette,
-        label="prefix hit; ref_count++",
-        label_position=(0.71, 0.815),
-        connectionstyle="arc3,rad=0",
+        label="release",
+        label_position=(0.655, 0.775),
     )
-    elbow_arrow(
+    orth_arrow(
         ax,
-        [(0.835, 0.667), (0.835, 0.625), (0.10, 0.625), (0.10, 0.667)],
+        [(0.80, 0.785), (0.80, 0.825), (0.535, 0.825), (0.535, 0.785)],
+        palette,
+        label="prefix hit: ref_count++",
+        label_position=(0.668, 0.846),
+    )
+    orth_arrow(
+        ax,
+        [(0.80, 0.685), (0.80, 0.615), (0.10, 0.615), (0.10, 0.685)],
         palette,
         label="dependency-safe reclaim / eviction",
-        label_position=(0.47, 0.605),
+        label_position=(0.45, 0.596),
     )
-    elbow_arrow(
+    orth_arrow(
         ax,
-        [(0.30, 0.667), (0.30, 0.65), (0.16, 0.65), (0.16, 0.667)],
+        [(0.31, 0.685), (0.31, 0.655), (0.17, 0.655), (0.17, 0.685)],
         palette,
         label="partial release",
-        label_position=(0.23, 0.638),
+        label_position=(0.24, 0.641),
     )
 
-    ax.plot([0.04, 0.96], [0.565, 0.565], color=palette["free_edge"], linewidth=0.9, alpha=0.65)
     ax.text(
-        0.04,
-        0.525,
-        "Transactional cross-GPU transfer branch",
-        ha="left",
-        va="center",
-        fontsize=11.5,
+        0.055,
+        0.535,
+        "Transactional cross-GPU transfer",
+        fontsize=10.2,
         fontweight="bold",
         color=palette["transfer_edge"],
+        ha="left",
+        va="center",
     )
     ax.text(
-        0.96,
-        0.525,
-        "entry: Ready/Cached source + Free target",
+        0.945,
+        0.535,
+        "entry: ready source + reserved target",
+        fontsize=8.3,
+        color=palette["muted"],
         ha="right",
         va="center",
-        fontsize=9.3,
-        color=palette["muted"],
     )
 
     state_box(
         ax,
-        (0.13, 0.39),
-        (0.19, 0.105),
+        (0.10, 0.405),
+        (0.15, 0.10),
         "Prepared",
-        "source generation locked\nfree target IDs reserved",
+        "lock generation\nreserve target",
         palette,
-        "transfer_face",
+        "transfer_fill",
         "transfer_edge",
     )
     state_box(
         ax,
-        (0.34, 0.39),
-        (0.18, 0.105),
-        "Transfer Executing",
-        "ModelRunner packs K/V\npair-local NCCL send/recv",
+        (0.29, 0.405),
+        (0.16, 0.10),
+        "Executing",
+        "pack / send\nreceive / unpack",
         palette,
-        "transfer_face",
+        "transfer_fill",
         "transfer_edge",
     )
-    decision(ax, (0.53, 0.39), (0.16, 0.115), "Data path\nsucceeded?", palette)
+    decision(
+        ax,
+        (0.47, 0.405),
+        (0.15, 0.11),
+        "Data path\nsucceeded?",
+        palette,
+        accent_key="transfer_edge",
+    )
     state_box(
         ax,
-        (0.70, 0.39),
-        (0.17, 0.105),
+        (0.65, 0.405),
+        (0.15, 0.10),
         "Received / Hidden",
-        "kv_ready = true\npending_publish = true",
+        "kv_ready = true\npending_publish",
         palette,
-        "pending_face",
+        "pending_fill",
         "pending_edge",
     )
     state_box(
         ax,
-        (0.89, 0.39),
-        (0.17, 0.105),
-        "Published Replica",
-        "hash becomes routable\ntarget enters cached-ready state",
+        (0.84, 0.405),
+        (0.17, 0.10),
+        "Published",
+        "hash becomes routable\ntarget is cache-ready",
         palette,
-        "cache_face",
+        "cache_fill",
         "cache_edge",
     )
-    decision(ax, (0.74, 0.215), (0.18, 0.105), "Source semantics?", palette)
     state_box(
         ax,
-        (0.60, 0.095),
-        (0.22, 0.09),
-        "Copy Finalize",
-        "retain source + unlock\nsource returns to prior ready state",
-        palette,
-        "cache_face",
-        "cache_edge",
-        title_size=10.4,
-        subtitle_size=8.2,
-    )
-    state_box(
-        ax,
-        (0.88, 0.095),
-        (0.18, 0.09),
-        "Move Finalize",
-        "reclaim safe source suffix\nsource enters Free",
-        palette,
-        "free_face",
-        "free_edge",
-        title_size=10.4,
-        subtitle_size=8.2,
-    )
-    state_box(
-        ax,
-        (0.50, 0.215),
-        (0.18, 0.09),
+        (0.46, 0.225),
+        (0.15, 0.085),
         "Abort",
-        "target -> Free\nsource -> prior ready state",
+        "target -> Free\nsource restored",
         palette,
-        "free_face",
+        "free_fill",
         "free_edge",
-        title_size=10.4,
-        subtitle_size=8.2,
+        title_size=9.2,
+        subtitle_size=7.3,
+    )
+    decision(
+        ax,
+        (0.80, 0.225),
+        (0.18, 0.10),
+        "Source\nsemantics?",
+        palette,
+        accent_key="transfer_edge",
+    )
+    state_box(
+        ax,
+        (0.65, 0.075),
+        (0.20, 0.08),
+        "Copy Finalize",
+        "retain source + unlock",
+        palette,
+        "cache_fill",
+        "cache_edge",
+        title_size=9.2,
+        subtitle_size=7.3,
+    )
+    state_box(
+        ax,
+        (0.90, 0.075),
+        (0.16, 0.08),
+        "Move Finalize",
+        "safe source -> Free",
+        palette,
+        "free_fill",
+        "free_edge",
+        title_size=9.2,
+        subtitle_size=7.3,
     )
 
-    arrow(ax, (0.225, 0.39), (0.25, 0.39), palette, label="execute", label_position=(0.238, 0.418))
-    arrow(ax, (0.43, 0.39), (0.45, 0.39), palette)
-    arrow(
+    transfer_key = "transfer_edge"
+    orth_arrow(
         ax,
-        (0.53, 0.333),
-        (0.50, 0.26),
+        [(0.175, 0.405), (0.21, 0.405)],
         palette,
-        label="No",
-        label_position=(0.49, 0.30),
+        color_key=transfer_key,
+        label="execute",
+        label_position=(0.193, 0.437),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.61, 0.39),
-        (0.615, 0.39),
+        [(0.37, 0.405), (0.395, 0.405)],
         palette,
+        color_key=transfer_key,
+    )
+    orth_arrow(
+        ax,
+        [(0.545, 0.405), (0.575, 0.405)],
+        palette,
+        color_key=transfer_key,
         label="Yes",
-        label_position=(0.61, 0.42),
+        label_position=(0.56, 0.438),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.785, 0.39),
-        (0.805, 0.39),
+        [(0.47, 0.35), (0.47, 0.285), (0.46, 0.285), (0.46, 0.2675)],
         palette,
+        color_key=transfer_key,
+        label="No",
+        label_position=(0.50, 0.305),
+    )
+    orth_arrow(
+        ax,
+        [(0.725, 0.405), (0.755, 0.405)],
+        palette,
+        color_key=transfer_key,
         label="publish",
-        label_position=(0.795, 0.42),
+        label_position=(0.74, 0.437),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.89, 0.337),
-        (0.79, 0.255),
+        [(0.84, 0.355), (0.84, 0.295), (0.80, 0.295), (0.80, 0.275)],
         palette,
-        label="finalize source",
-        label_position=(0.86, 0.29),
+        color_key=transfer_key,
+        label="finalize",
+        label_position=(0.87, 0.315),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.69, 0.176),
-        (0.64, 0.14),
+        [(0.71, 0.225), (0.65, 0.225), (0.65, 0.115)],
         palette,
+        color_key=transfer_key,
         label="Copy",
-        label_position=(0.655, 0.175),
+        label_position=(0.70, 0.245),
     )
-    arrow(
+    orth_arrow(
         ax,
-        (0.79, 0.176),
-        (0.84, 0.14),
+        [(0.89, 0.225), (0.90, 0.225), (0.90, 0.115)],
         palette,
+        color_key=transfer_key,
         label="Move",
-        label_position=(0.825, 0.175),
+        label_position=(0.88, 0.245),
     )
 
     ax.text(
-        0.5,
-        0.018,
-        "Routing sees only published ready blocks. Reserved or received-but-unpublished destination blocks remain invisible; abort restores both local managers.",
-        ha="center",
+        0.055,
+        0.015,
+        "Only published ready blocks are routable; reserved and received-but-hidden blocks remain invisible.",
+        ha="left",
         va="center",
-        fontsize=9.2,
+        fontsize=8.2,
         color=palette["muted"],
     )
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=220, bbox_inches="tight", facecolor=palette["background"])
+    for output in outputs:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(
+            output,
+            dpi=240,
+            bbox_inches="tight",
+            facecolor=palette["background"],
+        )
     plt.close(fig)
 
 
-def main() -> None:
-    render(PAPER_OUTPUT, LIGHT)
-    render(README_OUTPUT, DARK)
+def main():
+    render(LIGHT, [PAPER_PNG, PAPER_PDF, README_LIGHT])
+    render(DARK, [README_DARK])
 
 
 if __name__ == "__main__":

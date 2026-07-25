@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "profile_type": "piecewise_linear_kv_transfer_latency",
+  "latency_metric": "p95_latency_ms",
+  "model_labels": [
+    "Qwen/Qwen3-1.7B"
+  ],
+  "kv_geometry": {
+    "num_layers": 28,
+    "block_size": 256,
+    "num_kv_heads": 8,
+    "head_dim": 128,
+    "dtype": "bfloat16",
+    "kv_dtype_bytes": 2,
+    "bytes_per_block": 29360128
+  },
+  "default_points": [
+    {
+      "blocks": 1,
+      "bytes": 29360128,
+      "raw_latency_ms": 3.6481688483036123,
+      "latency_ms": 3.6481688483036123
+    },
+    {
+      "blocks": 2,
+      "bytes": 58720256,
+      "raw_latency_ms": 4.148347194859525,
+      "latency_ms": 4.148347194859525
+    },
+    {
+      "blocks": 4,
+      "bytes": 117440512,
+      "raw_latency_ms": 4.830997104363632,
+      "latency_ms": 4.830997104363632
+    },
+    {
+      "blocks": 8,
+      "bytes": 234881024,
+      "raw_latency_ms": 8.369859558297321,
+      "latency_ms": 8.369859558297321
+    },
+    {
+      "blocks": 16,
+      "bytes": 469762048,
+      "raw_latency_ms": 13.602769151475513,
+      "latency_ms": 13.602769151475513
+    },
+    {
+      "blocks": 32,
+      "bytes": 939524096,
+      "raw_latency_ms": 24.581544652755838,
+      "latency_ms": 24.581544652755838
+    },
+    {
+      "blocks": 64,
+      "bytes": 1879048192,
+      "raw_latency_ms": 47.932311143085826,
+      "latency_ms": 47.932311143085826
+    }
+  ],
+  "pairs": {
+    "0,1": {
+      "logical_pair": [
+        0,
+        1
+      ],
+      "physical_pair": [
+        0,
+        1
+      ],
+      "source": "benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_0-1.json",
+      "points": [
+        {
+          "blocks": 1,
+          "bytes": 29360128,
+          "raw_latency_ms": 3.6589212526450865,
+          "latency_ms": 3.6589212526450865,
+          "mean_latency_ms": 3.620060489993193,
+          "p50_latency_ms": 3.575071503291838,
+          "p95_latency_ms": 3.6589212526450865
+        },
+        {
+          "blocks": 2,
+          "bytes": 58720256,
+          "raw_latency_ms": 5.430295900805504,
+          "latency_ms": 5.430295900805504,
+          "mean_latency_ms": 5.030348720247275,
+          "p50_latency_ms": 5.290861005050829,
+          "p95_latency_ms": 5.430295900805504
+        },
+        {
+          "blocks": 4,
+          "bytes": 117440512,
+          "raw_latency_ms": 4.830997104363632,
+          "latency_ms": 5.430295900805504,
+          "mean_latency_ms": 4.726449710215093,
+          "p50_latency_ms": 4.72402599916677,
+          "p95_latency_ms": 4.830997104363632
+        },
+        {
+          "blocks": 8,
+          "bytes": 234881024,
+          "raw_latency_ms": 8.487205201527104,
+          "latency_ms": 8.487205201527104,
+          "mean_latency_ms": 8.147767569680582,
+          "p50_latency_ms": 7.992615497641964,
+          "p95_latency_ms": 8.487205201527104
+        },
+        {
+          "blocks": 16,
+          "bytes": 469762048,
+          "raw_latency_ms": 13.350899603028665,
+          "latency_ms": 13.350899603028665,
+          "mean_latency_ms": 13.29487044014968,
+          "p50_latency_ms": 13.284236494655488,
+          "p95_latency_ms": 13.350899603028665
+        },
+        {
+          "blocks": 32,
+          "bytes": 939524096,
+          "raw_latency_ms": 24.581544652755838,
+          "latency_ms": 24.581544652755838,
+          "mean_latency_ms": 24.524016169598326,
+          "p50_latency_ms": 24.520455499441596,
+          "p95_latency_ms": 24.581544652755838
+        },
+        {
+          "blocks": 64,
+          "bytes": 1879048192,
+          "raw_latency_ms": 48.068396553208004,
+          "latency_ms": 48.068396553208004,
+          "mean_latency_ms": 48.0402403500193,
+          "p50_latency_ms": 48.035202504252084,
+          "p95_latency_ms": 48.068396553208004
+        }
+      ]
+    },
+    "2,3": {
+      "logical_pair": [
+        2,
+        3
+      ],
+      "physical_pair": [
+        3,
+        4
+      ],
+      "source": "benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_3-4.json",
+      "points": [
+        {
+          "blocks": 1,
+          "bytes": 29360128,
+          "raw_latency_ms": 3.5714363017177675,
+          "latency_ms": 3.5714363017177675,
+          "mean_latency_ms": 3.4811375608842354,
+          "p50_latency_ms": 3.470871495665051,
+          "p95_latency_ms": 3.5714363017177675
+        },
+        {
+          "blocks": 2,
+          "bytes": 58720256,
+          "raw_latency_ms": 4.148347194859525,
+          "latency_ms": 4.148347194859525,
+          "mean_latency_ms": 4.05830114003038,
+          "p50_latency_ms": 4.044741501274984,
+          "p95_latency_ms": 4.148347194859525
+        },
+        {
+          "blocks": 4,
+          "bytes": 117440512,
+          "raw_latency_ms": 5.462384143174859,
+          "latency_ms": 5.462384143174859,
+          "mean_latency_ms": 5.2364147585467435,
+          "p50_latency_ms": 5.389845508034341,
+          "p95_latency_ms": 5.462384143174859
+        },
+        {
+          "blocks": 8,
+          "bytes": 234881024,
+          "raw_latency_ms": 8.369859558297321,
+          "latency_ms": 8.369859558297321,
+          "mean_latency_ms": 7.724277420056751,
+          "p50_latency_ms": 7.291353002074175,
+          "p95_latency_ms": 8.369859558297321
+        },
+        {
+          "blocks": 16,
+          "bytes": 469762048,
+          "raw_latency_ms": 13.602769151475513,
+          "latency_ms": 13.602769151475513,
+          "mean_latency_ms": 13.532456760294735,
+          "p50_latency_ms": 13.520740503736306,
+          "p95_latency_ms": 13.602769151475513
+        },
+        {
+          "blocks": 32,
+          "bytes": 939524096,
+          "raw_latency_ms": 24.4605976055027,
+          "latency_ms": 24.4605976055027,
+          "mean_latency_ms": 24.41160883012344,
+          "p50_latency_ms": 24.39308750035707,
+          "p95_latency_ms": 24.4605976055027
+        },
+        {
+          "blocks": 64,
+          "bytes": 1879048192,
+          "raw_latency_ms": 47.932311143085826,
+          "latency_ms": 47.932311143085826,
+          "mean_latency_ms": 47.89852867965237,
+          "p50_latency_ms": 47.89237699878868,
+          "p95_latency_ms": 47.932311143085826
+        }
+      ]
+    },
+    "4,5": {
+      "logical_pair": [
+        4,
+        5
+      ],
+      "physical_pair": [
+        5,
+        6
+      ],
+      "source": "benchmarks/results/paper/20260725T031840Z/qwen3-1.7b/kv_transfer/pair_5-6.json",
+      "points": [
+        {
+          "blocks": 1,
+          "bytes": 29360128,
+          "raw_latency_ms": 3.6481688483036123,
+          "latency_ms": 3.6481688483036123,
+          "mean_latency_ms": 3.555967059946852,
+          "p50_latency_ms": 3.5450264913379215,
+          "p95_latency_ms": 3.6481688483036123
+        },
+        {
+          "blocks": 2,
+          "bytes": 58720256,
+          "raw_latency_ms": 3.628667003067676,
+          "latency_ms": 3.6481688483036123,
+          "mean_latency_ms": 3.5522025398677215,
+          "p50_latency_ms": 3.5420265048742294,
+          "p95_latency_ms": 3.628667003067676
+        },
+        {
+          "blocks": 4,
+          "bytes": 117440512,
+          "raw_latency_ms": 4.824807388649788,
+          "latency_ms": 4.824807388649788,
+          "mean_latency_ms": 4.727933810791001,
+          "p50_latency_ms": 4.728324500320014,
+          "p95_latency_ms": 4.824807388649788
+        },
+        {
+          "blocks": 8,
+          "bytes": 234881024,
+          "raw_latency_ms": 7.339400955243036,
+          "latency_ms": 7.339400955243036,
+          "mean_latency_ms": 7.271104390383698,
+          "p50_latency_ms": 7.25728549878113,
+          "p95_latency_ms": 7.339400955243036
+        },
+        {
+          "blocks": 16,
+          "bytes": 469762048,
+          "raw_latency_ms": 13.983391095825937,
+          "latency_ms": 13.983391095825937,
+          "mean_latency_ms": 13.445335730357328,
+          "p50_latency_ms": 13.27932300773682,
+          "p95_latency_ms": 13.983391095825937
+        },
+        {
+          "blocks": 32,
+          "bytes": 939524096,
+          "raw_latency_ms": 24.594644405442523,
+          "latency_ms": 24.594644405442523,
+          "mean_latency_ms": 24.575837470038095,
+          "p50_latency_ms": 24.5543839992024,
+          "p95_latency_ms": 24.594644405442523
+        },
+        {
+          "blocks": 64,
+          "bytes": 1879048192,
+          "raw_latency_ms": 47.92962860155967,
+          "latency_ms": 47.92962860155967,
+          "mean_latency_ms": 47.91595041038818,
+          "p50_latency_ms": 47.90352650161367,
+          "p95_latency_ms": 47.92962860155967
+        }
+      ]
+    }
+  }
+}

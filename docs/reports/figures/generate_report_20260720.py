@@ -11,7 +11,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[3]
-ARTIFACT_ROOT = ROOT / "benchmarks/results/paper/20260719T072508Z"
+ARTIFACT_ROOT = ROOT / "benchmarks/results/paper/20260725T031840Z"
 OUTPUT = Path(__file__).with_name("report_20260720_summary.png")
 ABSOLUTE_OUTPUT = Path(__file__).with_name("report_20260720_absolute_metrics.png")
 MODELS = ("qwen3-0.6b", "qwen3-1.7b")
@@ -35,6 +35,19 @@ def annotate_bars(axis, bars, suffix: str = "") -> None:
             f"{value:.1f}{suffix}",
             (bar.get_x() + bar.get_width() / 2, value),
             xytext=(0, 4),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+
+def annotate_points(axis, x_values, y_values, suffix: str = "") -> None:
+    for x_value, y_value in zip(x_values, y_values):
+        axis.annotate(
+            f"{y_value:.1f}{suffix}",
+            (x_value, y_value),
+            xytext=(0, 6),
             textcoords="offset points",
             ha="center",
             va="bottom",
@@ -129,8 +142,8 @@ def main() -> None:
     axes[0].set_ylim(0, 95)
     axes[0].legend(frameon=False, loc="upper left")
 
-    # B. Transfer microbenchmark: mean and observed range over two models and three NVLink pairs.
-    block_counts = (4, 8)
+    # B. Transfer profile: mean and observed range over two models and three pairs.
+    block_counts = (1, 2, 4, 8, 16, 32, 64)
     bandwidths: dict[int, list[float]] = {count: [] for count in block_counts}
     for model in MODELS:
         for pair in ("0-1", "3-4", "5-6"):
@@ -140,21 +153,31 @@ def main() -> None:
                 bandwidths[count].append(by_count[count]["effective_bandwidth_gib_s"])
 
     transfer_means = np.array([np.mean(bandwidths[count]) for count in block_counts])
-    lower = transfer_means - np.array([np.min(bandwidths[count]) for count in block_counts])
-    upper = np.array([np.max(bandwidths[count]) for count in block_counts]) - transfer_means
-    transfer_bars = axes[1].bar(
-        np.arange(2),
-        transfer_means,
-        width=0.55,
-        color=("#54A24B", "#E45756"),
-        yerr=np.vstack((lower, upper)),
-        capsize=5,
+    transfer_min = np.array([np.min(bandwidths[count]) for count in block_counts])
+    transfer_max = np.array([np.max(bandwidths[count]) for count in block_counts])
+    transfer_x = np.arange(len(block_counts))
+    axes[1].fill_between(
+        transfer_x,
+        transfer_min,
+        transfer_max,
+        color="#9ECAE1",
+        alpha=0.45,
+        linewidth=0,
     )
-    annotate_bars(axes[1], transfer_bars)
-    axes[1].set_title("(b) NVLink transfer")
+    axes[1].plot(
+        transfer_x,
+        transfer_means,
+        color="#2F6F8F",
+        linewidth=2.0,
+        marker="o",
+        markersize=4.5,
+    )
+    annotate_points(axes[1], transfer_x, transfer_means)
+    axes[1].set_title("(b) NVLink transfer profile")
     axes[1].set_ylabel("Effective bandwidth (GiB/s)")
-    axes[1].set_xticks(np.arange(2), ("4 blocks\n0.109 GiB", "8 blocks\n0.219 GiB"))
-    axes[1].set_ylim(0, 35)
+    axes[1].set_xlabel("Transferred blocks per plan")
+    axes[1].set_xticks(transfer_x, [str(count) for count in block_counts])
+    axes[1].set_ylim(0, float(np.max(transfer_max)) * 1.25)
 
     # C. End-to-end result: positive values consistently mean an improvement over multi-gpu.
     metric_labels = ("Throughput", "Mean TTFT", "Mean E2E", "P90 E2E")
@@ -221,6 +244,11 @@ def main() -> None:
             values = [
                 scale * scenario(model, workload, name)[metric] for model in MODELS
             ]
+            confidence = [
+                scale
+                * scenario(model, workload, name).get(f"{metric}_ci95", 0.0)
+                for model in MODELS
+            ]
             maximum = max(maximum, *values)
             bars = axis.bar(
                 group_x + offset,
@@ -228,6 +256,8 @@ def main() -> None:
                 width=bar_width * 0.9,
                 label=label,
                 color=color,
+                yerr=confidence,
+                capsize=3,
             )
             annotate_bars(axis, bars)
         axis.set_xticks(group_x, MODEL_LABELS)

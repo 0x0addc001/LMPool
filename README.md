@@ -27,10 +27,14 @@ For `N` GPUs, the runtime contains one user/launcher process, one independent co
 | Component | Role |
 | --- | --- |
 | `LLMEngine` | User API, master-side ingress, process launch/supervision, request forwarding, completion aggregation |
-| `control_plane_process` | Owns `GlobalScheduler` and `GlobalBlockManager`; handles routing, global metadata, transfer plans, leases, and heartbeat |
-| `ControlPlaneClient` | Queue-based protocol endpoint used by LLMEngine and workers to communicate with the control process |
-| `data_plane_process` | One per GPU; owns the local `Scheduler`, `BlockManager`, and `ModelRunner` |
-| `KV Transfer` | Packs complete KV blocks and performs paired NCCL send/receive on direct NVLink pairs |
+| Control-plane process | Owns the Global Scheduler and Global Block Manager; serializes route, transfer, lease, and health decisions |
+| Global Scheduler | Reads global state and computes capacity-feasible routing and cost-gated transfer plans |
+| Global Block Manager | Holds versioned page-table, capacity, reservation, in-flight, and placement metadata; never stores physical KV tensors |
+| Data-plane process | One per GPU; owns one Local Scheduler, Local Block Manager, Model Runner, and physical KV cache |
+| Local Scheduler / Block Manager | Build prefill/decode batches and own physical block allocation, references, readiness, and reclamation |
+| Model Runner / KV cache | Execute the model, read and write local K/V, and pack or unpack admitted cross-GPU payloads |
+
+LLMEngine sends a route query to the Global Scheduler, which reads prefix, load, capacity, and lease metadata from the Global Block Manager and returns a target GPU rank. LLMEngine then dispatches the full `Sequence` to that rank's Local Scheduler. The blue dashed fan-out sends routing targets and transfer phases from the Global Scheduler to every Local Scheduler. The purple dashed fan-in carries versioned block and load snapshots from every Local Block Manager to the Global Block Manager. Six small NVLink-connected pairs around the central ellipsis denote additional data-plane instances beyond the four detailed ranks. Green arrows labeled `NVLink` are the only real cross-GPU KV data paths: packed tensors move directly between paired Model Runners over pair-specific NCCL communicators. KV payloads never pass through LLMEngine, the Global Scheduler, or the Global Block Manager.
 
 ### Request Flow
 
@@ -47,15 +51,15 @@ For `N` GPUs, the runtime contains one user/launcher process, one independent co
 
 ![LMPool KV-aware routing decision](./assets/fig_routing_decision_dark.png)
 
-**Hot-prefix prediction**
+**Background placement**
 
-![LMPool hot-prefix prediction decision](./assets/fig_hot_prefix_decision_dark.png)
+![LMPool background placement decision](./assets/fig_hot_prefix_decision_dark.png)
 
-**Transfer admission and execution**
+**Transactional KV transfer**
 
-![LMPool transfer admission and execution](./assets/fig_transfer_decision_dark.png)
+![LMPool transactional KV transfer](./assets/fig_transfer_decision_dark.png)
 
-Hot-prefix prediction combines cumulative complete-chain block accesses, route-hit counts, and optional demand for requests already visible at ingress but not yet submitted. It reconstructs the deepest hot leaf with all resident ancestors. Passing the hotness threshold only creates a candidate: destination replica absence, source/target load skew, cooldown, pair idleness, target capacity, and the saved-prefill/transfer-cost gate must still pass.
+Background placement combines cumulative complete-chain block accesses, route-hit counts, and optional demand for requests already visible at ingress but not yet submitted. It reconstructs the deepest hot leaf with all resident ancestors. Passing the hotness threshold only creates a candidate: destination replica absence, source/target load skew, cooldown, pair idleness, target capacity, and the saved-prefill/transfer-cost gate must still pass.
 
 The data payload contains only K/V values. For `L` layers and `B` selected blocks, the source gathers one contiguous `[L, 2, B, block_size, num_kv_heads, head_dim]` tensor with indexed selection, sends it once on the pair-specific NCCL group, and the destination scatters it into reserved blocks. Hashes, generations, modes, and physical block IDs travel separately through the control-plane protocol.
 
@@ -95,13 +99,13 @@ Cross-GPU transfer is transactional. `prepare` locks a source generation and res
 
 ### NVLink KV Transfer
 
-Foreground transfer requests only the actual shortage, not an entire sequence. Background placement limits each candidate chain with `background_copy_max_blocks` (default 8), then deduplicates and coalesces candidates for one directed pair up to `background_copy_batch_max_blocks` (default 128). Thus four blocks are a microbenchmark calibration point, not a fixed runtime batch. Both paths are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.
+Foreground transfer requests only the actual shortage, not an entire sequence. Background placement limits each candidate chain with `background_copy_max_blocks` (default 8), then deduplicates and coalesces candidates for one directed pair up to `background_copy_batch_max_blocks` (default 128). Runtime batches therefore follow the plan rather than one calibration size. Both paths are admitted only when source validity, destination capacity, minimum batch size, and the estimated saved-prefill/transfer-cost ratio are acceptable.
 
 #### Transfer Cost and Benefit Model
 
 ![LMPool transfer cost and benefit model](./assets/fig_transfer_cost_model_dark.png)
 
-The static estimate uses payload geometry, measured effective pair bandwidth, fixed coordination latency, and an interference multiplier. Runtime source-transfer and dispatch-to-publish observations update pair-local EWMAs; admission takes the maximum of static and observed estimates. Foreground benefit uses discounted chain reuse, while background benefit counts at most one avoidable cold prefill because the destination self-warms after its first miss. A plan is admitted only when saved prefill time clears the configured safety ratio and all source-validity and target-capacity gates.
+The static estimate interpolates the plan payload on a measured P95 latency curve for each logical NVLink pair, scales only that payload-varying term for loaded inference interference, and adds a fixed full-transaction residual. The paper setting uses `40 ms + 1.2 x profile_P95(plan_bytes)`: the additive term comes from an independent serving pilot and covers scheduling, NCCL queuing, target publication, and block registration outside the idle microbenchmark. The runner measures 1/2/4/8/16/32/64 blocks and validates that the profile matches the serving model's KV bytes per block. Runtime source-transfer and dispatch-to-publish observations update independent pair-by-size-bucket EWMAs; admission takes the maximum of the static and observed estimates. Foreground benefit uses discounted chain reuse, while background benefit counts at most one avoidable cold prefill because the destination self-warms after its first miss. A plan is admitted only when saved prefill time clears the configured safety ratio and all source-validity and target-capacity gates.
 
 Each plan follows an idempotent transaction:
 
@@ -164,7 +168,7 @@ Three complete benchmark entry points are retained:
 
 | Entry | Claim |
 | --- | --- |
-| `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload latency, bandwidth, and data equality |
+| `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload correctness and the pair/plan-size latency profile used by transfer admission |
 | `benchmarks/benchmark_kv_routing.py` | Routing-only locality and prefill-reuse benefit |
 | `benchmarks/benchmark_e2e.py` | Five-way system comparison under load-skew, memory-skew, and session-handoff workloads |
 
@@ -181,20 +185,24 @@ The benchmark profiles prefix sharing before launching the system. `trace req sh
 | Memory skew | 32 warm-up requests over 15 reusable long hot groups, 32 distinct one-shot shorter pressure prefixes, then 64 hot-prefix reuse requests | 63.28% / 67.81% |
 | Session handoff | 32 session-prefix groups, each with 1 source warm-up request and 3 partner-side reuse requests | 75.00% / 70.49% |
 
-Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. New JSON artifacts store the full counts under `metadata.dataset_profile`; the archived paper batch also includes the derived [`dataset_profiles.json`](./benchmarks/results/paper/20260719T072508Z/dataset_profiles.json).
+Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. JSON artifacts store the full counts under `metadata.dataset_profile`.
 
 ### Current Paper Batch
 
-Artifacts: [`benchmarks/results/paper/20260719T072508Z`](./benchmarks/results/paper/20260719T072508Z)
+Artifacts: [`benchmarks/results/paper/20260725T031840Z`](./benchmarks/results/paper/20260725T031840Z)
 
 The batch uses five repetitions, six RTX 3090 GPUs arranged as three NV4 pairs, BF16 Qwen3-0.6B/Qwen3-1.7B, 256-token KV blocks, and equal per-worker block budgets.
 
-- **Transfer microbenchmark:** four-block batches sustain 19.0-23.2 GiB/s; eight-block batches sustain 26.1-30.1 GiB/s. Every payload validation passes.
-- **Routing workload:** routing raises cached prompt-token ratio from about 44% to 72% and reduces uncached prefill tokens by about 50% for both models. Throughput improves by 2.2-2.7%, while mean TTFT falls by 10.6-20.2%.
-- **Session handoff:** full LMPool improves throughput by 4.2%/7.1%, lowers mean TTFT by 33.2%/42.6%, and lowers mean E2E latency by 9.9%/13.7% for Qwen3-0.6B/Qwen3-1.7B relative to round-robin multi-GPU.
-- **Boundary results:** steady load skew admits no transfer and stays near the multi-GPU baseline. The current memory-skew trace triggers few foreground plans and does not improve throughput; it is a negative/boundary result, not evidence of universal transfer benefit.
+- **Transfer microbenchmark:** the 1/2/4/8/16/32/64-block sweep validates every payload and provides the P95 latency samples used by the online cost model. Four-block batches sustain 20.5-23.1 GiB/s, eight-block batches sustain 26.8-30.1 GiB/s, and mean bandwidth reaches 36.5 GiB/s at 64 blocks.
+- **Routing workload:** routing raises cached prompt-token ratio from 44.1% to 71.3-72.2% and reduces uncached prefill tokens by 48.6-50.2%. Throughput remains within 1.4% of round-robin. Mean TTFT is 7.4% higher on Qwen3-0.6B and 10.2% lower on Qwen3-1.7B, so this experiment supports locality improvement rather than a universal latency claim.
+- **Session handoff:** full LMPool improves throughput by 4.4%/7.4%, lowers mean TTFT by 32.4%/40.4%, lowers mean E2E latency by 9.3%/12.9%, and lowers P90 E2E by 7.4%/7.6% for Qwen3-0.6B/Qwen3-1.7B relative to round-robin multi-GPU.
+- **Boundary results:** steady load skew admits no transfer and remains within 0.6% throughput of round-robin. Memory skew admits no transfer for Qwen3-1.7B and only seven blocks in one Qwen3-0.6B trial; neither case improves throughput.
 
 The paper reports all four observations. Session handoff is the main end-to-end transfer result; memory/load skew are not silently omitted.
+
+![Latest paper-result summary](./docs/paper/figures/fig_results_summary.png)
+
+The transfer microbenchmark proves that the packed all-layer K/V path is byte-correct and measures the latency available to the admission model for each direct pair and plan size. It does not prove that serving will improve merely because data can move quickly. The session-handoff result supplies that end-to-end evidence by showing a workload in which copied KV is reused often enough to repay transfer and control overhead.
 
 ## Tests
 

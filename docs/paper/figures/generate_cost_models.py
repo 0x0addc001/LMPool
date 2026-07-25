@@ -1,86 +1,105 @@
-"""Generate separate routing and transfer cost-model figures."""
+"""Generate synchronized light and dark routing and transfer cost diagrams."""
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.path import Path as MplPath
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon
 
 
 ROOT = Path(__file__).resolve().parents[3]
 
-LIGHT = {
-    "background": "#ffffff",
-    "text": "#17212b",
-    "muted": "#52606d",
-    "routing": "#4477aa",
-    "transfer": "#aa3377",
+LIGHT_BASE = {
+    "background": "#FFFFFF",
+    "text": "#293744",
+    "muted": "#667482",
+}
+DARK_BASE = {
+    "background": "#0E141A",
+    "text": "#F1F5F7",
+    "muted": "#A8B4BF",
 }
 
-DARK = {
-    "background": "#0d1117",
-    "text": "#e6edf3",
-    "muted": "#b1bac4",
-    "routing": "#58a6ff",
-    "transfer": "#d2a8ff",
+PALETTES = {
+    "routing": {
+        "light": {
+            **LIGHT_BASE,
+            "accent": "#6F91AE",
+            "fill": "#EAF2F8",
+            "outcome": "#DCEAF4",
+        },
+        "dark": {
+            **DARK_BASE,
+            "accent": "#87AFCC",
+            "fill": "#172A39",
+            "outcome": "#1B3548",
+        },
+    },
+    "transfer": {
+        "light": {
+            **LIGHT_BASE,
+            "accent": "#60947B",
+            "fill": "#EAF4EF",
+            "outcome": "#DCEDE5",
+        },
+        "dark": {
+            **DARK_BASE,
+            "accent": "#79B797",
+            "fill": "#172B23",
+            "outcome": "#1B382B",
+        },
+    },
 }
 
 OUTPUTS = {
     "routing": {
-        "paper": Path(__file__).with_name("fig_routing_cost_model.png"),
-        "readme": ROOT / "assets/fig_routing_cost_model_dark.png",
+        "paper_png": Path(__file__).with_name("fig_routing_cost_model.png"),
+        "paper_pdf": Path(__file__).with_name("fig_routing_cost_model.pdf"),
+        "readme_light": ROOT / "assets" / "fig_routing_cost_model.png",
+        "readme_dark": ROOT / "assets" / "fig_routing_cost_model_dark.png",
     },
     "transfer": {
-        "paper": Path(__file__).with_name("fig_transfer_cost_model.png"),
-        "readme": ROOT / "assets/fig_transfer_cost_model_dark.png",
+        "paper_png": Path(__file__).with_name("fig_transfer_cost_model.png"),
+        "paper_pdf": Path(__file__).with_name("fig_transfer_cost_model.pdf"),
+        "readme_light": ROOT / "assets" / "fig_transfer_cost_model.png",
+        "readme_dark": ROOT / "assets" / "fig_transfer_cost_model_dark.png",
     },
 }
 
 
-def mix(color: str, background: str, amount: float = 0.87) -> str:
-    color = color.lstrip("#")
-    background = background.lstrip("#")
-    rgb = [int(color[index : index + 2], 16) for index in (0, 2, 4)]
-    bg = [int(background[index : index + 2], 16) for index in (0, 2, 4)]
-    values = [
-        round(channel * (1 - amount) + base * amount)
-        for channel, base in zip(rgb, bg)
-    ]
-    return "#" + "".join(f"{value:02x}" for value in values)
-
-
-def box(
+def process(
     ax,
     center,
     size,
     title,
     body,
     palette,
-    accent,
     *,
-    title_size=11.0,
-    body_size=9.0,
-    weight="bold",
+    outcome=False,
+    title_size=9.6,
+    body_size=7.6,
 ):
     x, y = center
     width, height = size
-    patch = FancyBboxPatch(
-        (x - width / 2, y - height / 2),
-        width,
-        height,
-        boxstyle="round,pad=0.008,rounding_size=0.012",
-        linewidth=1.7,
-        edgecolor=accent,
-        facecolor=mix(accent, palette["background"]),
+    ax.add_patch(
+        FancyBboxPatch(
+            (x - width / 2, y - height / 2),
+            width,
+            height,
+            boxstyle="round,pad=0.006,rounding_size=0.010",
+            linewidth=1.45,
+            edgecolor=palette["accent"],
+            facecolor=palette["outcome"] if outcome else palette["fill"],
+        )
     )
-    ax.add_patch(patch)
     ax.text(
         x,
-        y + height * 0.20,
+        y + height * 0.18,
         title,
         ha="center",
         va="center",
         fontsize=title_size,
-        fontweight=weight,
+        fontweight="bold",
         color=palette["text"],
     )
     ax.text(
@@ -91,26 +110,27 @@ def box(
         va="center",
         fontsize=body_size,
         color=palette["muted"],
-        linespacing=1.18,
+        linespacing=1.12,
     )
 
 
-def decision(ax, center, size, text, palette, accent, *, fontsize=9.4):
+def decision(ax, center, size, text, palette, *, fontsize=8.4):
     x, y = center
     width, height = size
-    patch = Polygon(
-        [
-            (x, y + height / 2),
-            (x + width / 2, y),
-            (x, y - height / 2),
-            (x - width / 2, y),
-        ],
-        closed=True,
-        linewidth=1.7,
-        edgecolor=accent,
-        facecolor=mix(accent, palette["background"]),
+    ax.add_patch(
+        Polygon(
+            [
+                (x, y + height / 2),
+                (x + width / 2, y),
+                (x, y - height / 2),
+                (x - width / 2, y),
+            ],
+            closed=True,
+            linewidth=1.45,
+            edgecolor=palette["accent"],
+            facecolor=palette["fill"],
+        )
     )
-    ax.add_patch(patch)
     ax.text(
         x,
         y,
@@ -119,350 +139,392 @@ def decision(ax, center, size, text, palette, accent, *, fontsize=9.4):
         va="center",
         fontsize=fontsize,
         color=palette["text"],
-        linespacing=1.12,
+        linespacing=1.08,
     )
 
 
-def arrow(
+def orth_arrow(
     ax,
-    start,
-    end,
+    points,
     palette,
-    accent,
     *,
     label=None,
     label_position=None,
+    arrowstyle="-|>",
 ):
+    path = MplPath(
+        points,
+        [MplPath.MOVETO] + [MplPath.LINETO] * (len(points) - 1),
+    )
     ax.add_patch(
         FancyArrowPatch(
-            start,
-            end,
-            arrowstyle="-|>",
-            mutation_scale=14,
+            path=path,
+            arrowstyle=arrowstyle,
+            mutation_scale=13,
             linewidth=1.45,
-            color=accent,
-            shrinkA=2,
-            shrinkB=2,
+            color=palette["accent"],
+            shrinkA=0,
+            shrinkB=0,
         )
     )
     if label:
-        x, y = label_position or (
-            (start[0] + end[0]) / 2,
-            (start[1] + end[1]) / 2,
-        )
         ax.text(
-            x,
-            y,
+            *label_position,
             label,
             ha="center",
             va="center",
-            fontsize=8.7,
+            fontsize=7.8,
             fontweight="bold",
-            color=accent,
-            bbox={
-                "facecolor": palette["background"],
-                "edgecolor": "none",
-                "pad": 1.2,
-            },
+            color=palette["accent"],
         )
 
 
-def title(ax, heading, subtitle, palette, accent):
-    ax.text(
-        0.5,
-        0.96,
-        heading,
-        ha="center",
-        va="center",
-        fontsize=17,
-        fontweight="bold",
-        color=accent,
-    )
-    ax.text(
-        0.5,
-        0.915,
-        subtitle,
-        ha="center",
-        va="center",
-        fontsize=10.3,
-        color=palette["muted"],
-    )
-
-
-def setup(palette):
-    fig, ax = plt.subplots(figsize=(14.5, 8.2))
+def setup(palette, title, subtitle):
+    fig, ax = plt.subplots(figsize=(14.6, 8.4))
     fig.patch.set_facecolor(palette["background"])
     ax.set_facecolor(palette["background"])
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
+    ax.text(
+        0.5,
+        0.958,
+        title,
+        ha="center",
+        va="center",
+        fontsize=16.5,
+        fontweight="bold",
+        color=palette["text"],
+    )
+    ax.text(
+        0.5,
+        0.918,
+        subtitle,
+        ha="center",
+        va="center",
+        fontsize=9.8,
+        color=palette["muted"],
+    )
     return fig, ax
 
 
-def draw_routing(palette, output: Path):
-    accent = palette["routing"]
-    fig, ax = setup(palette)
-    title(
-        ax,
+def save(fig, outputs):
+    for output in outputs:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(
+            output,
+            dpi=240,
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+        )
+    plt.close(fig)
+
+
+def draw_routing(palette, outputs):
+    fig, ax = setup(
+        palette,
         "Routing Cost Model",
-        "Projected work is measured in token-equivalent units for every feasible rank.",
-        palette,
-        accent,
+        "Choose the feasible rank with the least projected token-equivalent work.",
     )
-    box(
+
+    process(
         ax,
-        (0.5, 0.82),
-        (0.68, 0.105),
-        "Inputs for candidate rank g",
-        "request: N prompt tokens, R blocks; prefix match: h_g blocks\n"
-        "snapshot: free/effective capacity, waiting/running tokens and sequences",
+        (0.50, 0.825),
+        (0.62, 0.10),
+        "Candidate Rank Snapshot",
+        "request tokens N, required blocks R, local prefix blocks h_g\n"
+        "free capacity, queued/running tokens, active sequences",
         palette,
-        accent,
+        title_size=10.0,
+        body_size=7.8,
     )
     decision(
         ax,
-        (0.5, 0.68),
-        (0.31, 0.12),
-        "effective_capacity_g >=\nR - h_g ?",
+        (0.50, 0.675),
+        (0.28, 0.11),
+        "enough effective capacity\nfor R - h_g blocks?",
         palette,
-        accent,
     )
-    box(
+    process(
         ax,
-        (0.16, 0.68),
-        (0.20, 0.09),
-        "Exclude rank",
-        "cannot safely admit request",
+        (0.15, 0.675),
+        (0.18, 0.08),
+        "Exclude Rank",
+        "unsafe admission",
         palette,
-        accent,
-        title_size=10.2,
-        body_size=8.5,
+        outcome=True,
+        title_size=9.0,
+        body_size=7.2,
     )
-    box(
+    process(
         ax,
-        (0.20, 0.50),
-        (0.26, 0.145),
-        "Queue work Q_g",
-        "1.0 x (waiting + pending tokens)\n"
+        (0.20, 0.495),
+        (0.24, 0.13),
+        "Queue Work  Q_g",
+        "waiting + pending tokens\n"
         "+ 0.25 x running tokens\n"
-        "+ 32 x (running + pending sequences)",
+        "+ 32 x active sequences",
         palette,
-        accent,
-        body_size=8.5,
+        body_size=7.4,
     )
-    box(
+    process(
         ax,
-        (0.50, 0.50),
-        (0.26, 0.145),
-        "Missing prefill M_g",
+        (0.50, 0.495),
+        (0.24, 0.13),
+        "Missing Prefill  M_g",
         "new_g = max(0, R - h_g)\n"
         "M_g = min(N, new_g x block_size)\n"
-        "prefix reuse lowers M_g directly",
+        "local reuse directly reduces work",
         palette,
-        accent,
-        body_size=8.5,
+        body_size=7.4,
     )
-    box(
+    process(
         ax,
-        (0.80, 0.50),
-        (0.26, 0.145),
-        "Reclaim pressure P_g",
+        (0.80, 0.495),
+        (0.24, 0.13),
+        "Reclaim Pressure  P_g",
         "reclaim_g = max(0, new_g - free_g)\n"
         "P_g = reclaim_g x block_size\n"
-        "        x reclaim_weight (default 0.5)",
+        "x reclaim_weight",
         palette,
-        accent,
-        body_size=8.5,
+        body_size=7.4,
     )
-    box(
+    process(
         ax,
-        (0.5, 0.315),
-        (0.68, 0.10),
-        "Projected route cost",
-        "C_route(g) = Q_g + prefill_weight x M_g + P_g     (prefill_weight default: 1.0)",
+        (0.50, 0.315),
+        (0.62, 0.095),
+        "Projected Route Cost",
+        "C_route(g) = Q_g + prefill_weight x M_g + P_g",
         palette,
-        accent,
-        body_size=9.2,
+        title_size=10.0,
+        body_size=8.3,
     )
     decision(
         ax,
-        (0.5, 0.17),
-        (0.41, 0.11),
-        "owner pressure skew exceeds threshold\nand spill extra cost is bounded?",
+        (0.50, 0.165),
+        (0.38, 0.105),
+        "owner pressure exceeds threshold\nand spill cost stays bounded?",
         palette,
-        accent,
-        fontsize=9.1,
+        fontsize=8.2,
     )
-    box(
+    process(
         ax,
-        (0.27, 0.055),
-        (0.31, 0.07),
-        "Choose minimum C_route",
-        "prefix/topology score breaks equivalent-cost ties",
+        (0.25, 0.055),
+        (0.30, 0.07),
+        "Choose Minimum Cost",
+        "locality and topology break ties",
         palette,
-        accent,
-        title_size=9.8,
-        body_size=7.9,
+        outcome=True,
+        title_size=9.0,
+        body_size=7.0,
     )
-    box(
+    process(
         ax,
-        (0.73, 0.055),
-        (0.31, 0.07),
-        "Bounded spill",
-        "route current request to lower-pressure rank",
+        (0.75, 0.055),
+        (0.30, 0.07),
+        "Bounded Spill",
+        "route to a lower-pressure rank",
         palette,
-        accent,
-        title_size=9.8,
-        body_size=7.9,
+        outcome=True,
+        title_size=9.0,
+        body_size=7.0,
     )
 
-    arrow(ax, (0.5, 0.767), (0.5, 0.742), palette, accent)
-    arrow(ax, (0.345, 0.68), (0.265, 0.68), palette, accent, label="No")
-    arrow(ax, (0.5, 0.62), (0.5, 0.59), palette, accent, label="Yes", label_position=(0.535, 0.61))
-    arrow(ax, (0.45, 0.62), (0.23, 0.574), palette, accent)
-    arrow(ax, (0.55, 0.62), (0.77, 0.574), palette, accent)
-    arrow(ax, (0.20, 0.427), (0.41, 0.365), palette, accent)
-    arrow(ax, (0.50, 0.427), (0.50, 0.365), palette, accent)
-    arrow(ax, (0.80, 0.427), (0.59, 0.365), palette, accent)
-    arrow(ax, (0.5, 0.265), (0.5, 0.225), palette, accent)
-    arrow(ax, (0.40, 0.135), (0.30, 0.09), palette, accent, label="No", label_position=(0.35, 0.12))
-    arrow(ax, (0.60, 0.135), (0.70, 0.09), palette, accent, label="Yes", label_position=(0.65, 0.12))
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=220, bbox_inches="tight", facecolor=palette["background"])
-    plt.close(fig)
-
-
-def draw_transfer(palette, output: Path):
-    accent = palette["transfer"]
-    fig, ax = setup(palette)
-    title(
+    orth_arrow(ax, [(0.50, 0.775), (0.50, 0.73)], palette)
+    orth_arrow(
         ax,
+        [(0.36, 0.675), (0.24, 0.675)],
+        palette,
+        label="No",
+        label_position=(0.30, 0.695),
+    )
+    orth_arrow(
+        ax,
+        [(0.50, 0.62), (0.50, 0.59), (0.20, 0.59), (0.20, 0.56)],
+        palette,
+        label="Yes",
+        label_position=(0.535, 0.602),
+    )
+    orth_arrow(ax, [(0.50, 0.62), (0.50, 0.56)], palette)
+    orth_arrow(ax, [(0.50, 0.62), (0.50, 0.59), (0.80, 0.59), (0.80, 0.56)], palette)
+    orth_arrow(ax, [(0.20, 0.43), (0.20, 0.395), (0.35, 0.395), (0.35, 0.3625)], palette)
+    orth_arrow(ax, [(0.50, 0.43), (0.50, 0.3625)], palette)
+    orth_arrow(ax, [(0.80, 0.43), (0.80, 0.395), (0.65, 0.395), (0.65, 0.3625)], palette)
+    orth_arrow(ax, [(0.50, 0.2675), (0.50, 0.2175)], palette)
+    orth_arrow(
+        ax,
+        [(0.31, 0.165), (0.25, 0.165), (0.25, 0.09)],
+        palette,
+        label="No",
+        label_position=(0.275, 0.185),
+    )
+    orth_arrow(
+        ax,
+        [(0.69, 0.165), (0.75, 0.165), (0.75, 0.09)],
+        palette,
+        label="Yes",
+        label_position=(0.725, 0.185),
+    )
+
+    save(fig, outputs)
+
+
+def draw_transfer(palette, outputs):
+    fig, ax = setup(
+        palette,
         "Transfer Cost and Benefit Model",
-        "Admission compares saved prefill time with calibrated pair-local movement cost.",
-        palette,
-        accent,
+        "Admit movement only when calibrated transfer cost is lower than saved prefill work.",
     )
-    box(
+
+    process(
         ax,
-        (0.5, 0.82),
-        (0.66, 0.105),
-        "Candidate plan",
-        "B blocks; L layers; block size S; H_kv heads; head dimension D; dtype bytes d\n"
-        "source generations valid, destination capacity checked separately",
+        (0.50, 0.825),
+        (0.62, 0.10),
+        "Candidate Plan",
+        "B blocks and tensor shape define payload bytes\n"
+        "source generation and destination capacity are validated separately",
         palette,
-        accent,
+        title_size=10.0,
+        body_size=7.8,
     )
-    box(
+    process(
         ax,
         (0.25, 0.65),
-        (0.38, 0.125),
-        "Payload and static wire estimate",
-        "bytes = B x 2 x L x S x H_kv x D x d\n"
-        "wire_ms = bytes / measured_pair_bandwidth\n"
-        "T_static = (T_fixed + wire_ms x interference) x cost_weight",
+        (0.38, 0.15),
+        "Size-Aware Offline Prior",
+        "bytes = B x 2 x L x S x H_kv x D x dtype_bytes\n"
+        "piecewise-linear P95 latency over 1/2/4/8/16/32/64 blocks\n"
+        "T_base = T_fixed + interference x T_data",
         palette,
-        accent,
-        body_size=8.7,
+        title_size=9.5,
+        body_size=7.2,
     )
-    box(
+    process(
         ax,
         (0.75, 0.65),
-        (0.38, 0.125),
-        "Online pair observations",
-        "source transfer extra-time EWMA\n"
-        "dispatch-to-publish placement EWMA\n"
-        "microbenchmark bandwidth initializes the prior",
+        (0.38, 0.15),
+        "Online Pair Observations",
+        "bucket by next power-of-two plan size\n"
+        "source residual EWMA + placement residual EWMA\n"
+        "updates measured pair-local execution cost",
         palette,
-        accent,
-        body_size=8.7,
+        title_size=9.5,
+        body_size=7.2,
     )
-    box(
+    process(
         ax,
-        (0.5, 0.475),
-        (0.66, 0.095),
-        "Conservative transfer cost",
-        "T_xfer = max(T_static, T_pair_EWMA, T_placement_EWMA)",
+        (0.50, 0.465),
+        (0.62, 0.095),
+        "Conservative Transfer Cost",
+        "T_xfer = max(T_base, T_data + delta_source, T_base + delta_place) x cost_weight",
         palette,
-        accent,
-        body_size=9.4,
+        title_size=10.0,
+        body_size=7.8,
     )
-    box(
+    process(
         ax,
-        (0.27, 0.305),
-        (0.39, 0.12),
-        "Foreground saved work",
-        "reuse_hat = discounted historical chain reuse\n"
-        "T_save_fg = reuse_hat x B x S x configured prefill_ms/token",
+        (0.27, 0.295),
+        (0.39, 0.115),
+        "Foreground Saved Work",
+        "discounted observed reuse estimates reuse_hat\n"
+        "T_save_fg = reuse_hat x B x S x prefill_ms/token",
         palette,
-        accent,
-        body_size=8.6,
+        title_size=9.4,
+        body_size=7.4,
     )
-    box(
+    process(
         ax,
-        (0.73, 0.305),
-        (0.39, 0.12),
-        "Background saved work",
-        "forecast first qualifies a candidate\n"
-        "T_save_bg = B x S x destination prefill_ms/token\n"
-        "(one avoidable cold prefill; target then self-warms)",
+        (0.73, 0.295),
+        (0.39, 0.115),
+        "Background Saved Work",
+        "forecast qualifies a reusable prefix chain\n"
+        "T_save_bg = B x S x destination prefill_ms/token",
         palette,
-        accent,
-        body_size=8.4,
+        title_size=9.4,
+        body_size=7.4,
     )
     decision(
         ax,
-        (0.5, 0.155),
-        (0.39, 0.11),
-        "T_save >= benefit_ratio x T_xfer\nand all validity/capacity gates pass?",
+        (0.50, 0.145),
+        (0.38, 0.105),
+        "saved work covers transfer cost\nand all validity gates pass?",
         palette,
-        accent,
-        fontsize=9.1,
+        fontsize=8.2,
     )
-    box(
+    process(
         ax,
-        (0.27, 0.05),
-        (0.31, 0.065),
-        "Reject / defer",
-        "cache identical low-value rejection",
+        (0.25, 0.045),
+        (0.30, 0.065),
+        "Reject / Defer",
+        "cache repeated low-value decision",
         palette,
-        accent,
-        title_size=9.8,
-        body_size=7.9,
+        outcome=True,
+        title_size=9.0,
+        body_size=6.9,
     )
-    box(
+    process(
         ax,
-        (0.73, 0.05),
-        (0.31, 0.065),
-        "Admit transaction",
+        (0.75, 0.045),
+        (0.30, 0.065),
+        "Admit Transaction",
         "prepare -> execute -> publish -> finalize",
         palette,
-        accent,
-        title_size=9.8,
-        body_size=7.9,
+        outcome=True,
+        title_size=9.0,
+        body_size=6.9,
     )
 
-    arrow(ax, (0.45, 0.767), (0.29, 0.713), palette, accent)
-    arrow(ax, (0.55, 0.767), (0.71, 0.713), palette, accent)
-    arrow(ax, (0.25, 0.587), (0.42, 0.523), palette, accent)
-    arrow(ax, (0.75, 0.587), (0.58, 0.523), palette, accent)
-    arrow(ax, (0.45, 0.427), (0.31, 0.365), palette, accent)
-    arrow(ax, (0.55, 0.427), (0.69, 0.365), palette, accent)
-    arrow(ax, (0.33, 0.245), (0.43, 0.205), palette, accent)
-    arrow(ax, (0.67, 0.245), (0.57, 0.205), palette, accent)
-    arrow(ax, (0.40, 0.12), (0.30, 0.083), palette, accent, label="No", label_position=(0.35, 0.105))
-    arrow(ax, (0.60, 0.12), (0.70, 0.083), palette, accent, label="Yes", label_position=(0.65, 0.105))
+    orth_arrow(ax, [(0.50, 0.775), (0.50, 0.75), (0.25, 0.75), (0.25, 0.725)], palette)
+    orth_arrow(ax, [(0.50, 0.775), (0.50, 0.75), (0.75, 0.75), (0.75, 0.725)], palette)
+    orth_arrow(ax, [(0.25, 0.575), (0.25, 0.545), (0.42, 0.545), (0.42, 0.5125)], palette)
+    orth_arrow(ax, [(0.75, 0.575), (0.75, 0.545), (0.58, 0.545), (0.58, 0.5125)], palette)
+    orth_arrow(ax, [(0.50, 0.4175), (0.50, 0.385), (0.27, 0.385), (0.27, 0.3525)], palette)
+    orth_arrow(ax, [(0.50, 0.4175), (0.50, 0.385), (0.73, 0.385), (0.73, 0.3525)], palette)
+    orth_arrow(
+        ax,
+        [(0.27, 0.2375), (0.27, 0.215), (0.50, 0.215)],
+        palette,
+        arrowstyle="-",
+    )
+    orth_arrow(
+        ax,
+        [(0.73, 0.2375), (0.73, 0.215), (0.50, 0.215)],
+        palette,
+        arrowstyle="-",
+    )
+    orth_arrow(ax, [(0.50, 0.215), (0.50, 0.1975)], palette)
+    orth_arrow(
+        ax,
+        [(0.31, 0.145), (0.25, 0.145), (0.25, 0.0775)],
+        palette,
+        label="No",
+        label_position=(0.275, 0.165),
+    )
+    orth_arrow(
+        ax,
+        [(0.69, 0.145), (0.75, 0.145), (0.75, 0.0775)],
+        palette,
+        label="Yes",
+        label_position=(0.725, 0.165),
+    )
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=220, bbox_inches="tight", facecolor=palette["background"])
-    plt.close(fig)
+    save(fig, outputs)
 
 
-def main() -> None:
-    draw_routing(LIGHT, OUTPUTS["routing"]["paper"])
-    draw_routing(DARK, OUTPUTS["routing"]["readme"])
-    draw_transfer(LIGHT, OUTPUTS["transfer"]["paper"])
-    draw_transfer(DARK, OUTPUTS["transfer"]["readme"])
+def main():
+    routing = OUTPUTS["routing"]
+    draw_routing(
+        PALETTES["routing"]["light"],
+        [routing["paper_png"], routing["paper_pdf"], routing["readme_light"]],
+    )
+    draw_routing(PALETTES["routing"]["dark"], [routing["readme_dark"]])
+
+    transfer = OUTPUTS["transfer"]
+    draw_transfer(
+        PALETTES["transfer"]["light"],
+        [transfer["paper_png"], transfer["paper_pdf"], transfer["readme_light"]],
+    )
+    draw_transfer(PALETTES["transfer"]["dark"], [transfer["readme_dark"]])
 
 
 if __name__ == "__main__":

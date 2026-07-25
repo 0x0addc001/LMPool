@@ -15,12 +15,23 @@ def test_parse_block_counts_rejects_non_positive_values():
         benchmark.parse_block_counts("1,0,4", 2)
 
 
+def test_rendezvous_paths_are_unique_and_do_not_prebind_a_tcp_port():
+    first = benchmark._new_rendezvous_path()
+    second = benchmark._new_rendezvous_path()
+
+    assert first != second
+    assert first.parent.as_posix() == "/tmp"
+    assert not first.exists()
+    assert not second.exists()
+
+
 def test_transfer_benchmark_json_contains_metadata_and_results(tmp_path):
     results = [{
         "num_transfer_blocks": 1,
         "bytes_per_iteration": 1024,
         "gib_per_iteration": 1024 / (1024 ** 3),
         "mean_latency_ms": 1.0,
+        "p50_latency_ms": 1.2,
         "p95_latency_ms": 1.5,
         "effective_bandwidth_gib_s": 2.0,
         "data_validation": "passed",
@@ -40,6 +51,10 @@ def test_transfer_benchmark_json_contains_metadata_and_results(tmp_path):
     figure = tmp_path / "transfer.png"
     benchmark.save_results_figure(results, str(figure))
     assert figure.stat().st_size > 0
+
+    regenerated = tmp_path / "transfer-regenerated.png"
+    benchmark.regenerate_figure_from_json(str(output), str(regenerated))
+    assert regenerated.stat().st_size > 0
 
 
 def test_transfer_contract_defaults_to_qwen_geometry_without_model():

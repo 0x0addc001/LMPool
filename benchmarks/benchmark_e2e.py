@@ -33,8 +33,9 @@
     --foreground-transfer-cost-weight 1.0 \
     --foreground-transfer-min-benefit-ratio 1.5 \
     --foreground-transfer-bandwidth-gib-s 3.5 \
-    --foreground-transfer-fixed-latency-ms 2.0 \
-    --foreground-transfer-interference-multiplier 1.5 \
+    --foreground-transfer-profile-json ./benchmarks/results/kv_transfer/latency_profile.json \
+    --foreground-transfer-fixed-latency-ms 40.0 \
+    --foreground-transfer-interference-multiplier 1.2 \
     --foreground-prefill-token-time-ms 0.02 \
     --foreground-future-reuse-discount 0.5 \
     --route-cache-queue-slack 256 \
@@ -106,125 +107,137 @@
 14. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
-15. `--nvlink-pairs`：
+15. `--dtype`：
+  模型权重与 KV cache 的运行 dtype。`auto` 从模型 `config.json` 读取；也可显式指定
+  `float16`、`bfloat16` 或 `float32`。构建和加载 transfer profile 时 dtype 必须一致。
+
+16. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
   可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
   例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-16. `--world-size`：
+17. `--world-size`：
   多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
   该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
 
-17. `--kv-block-budget`：
+18. `--kv-block-budget`：
   每个 rank 请求使用的 KV block 数。五个场景必须使用同一个值，避免把容量差异误判成
   routing / transfer 收益。显式设置后采用严格语义：worker 实际容量不足时会在提交请求前报错，
   不再静默缩小预算。
 
-18. `--gpu-memory-utilization`：
+19. `--gpu-memory-utilization`：
   ModelRunner 推导可用 KV cache 容量时可使用的空闲显存比例，范围 `(0, 1]`，benchmark
   默认 0.20。最终分配仍受 `--kv-block-budget` 限制；提高该值只是让显式 block budget
   能够实现，不会越过该上限。
 
-19. `--goodput-e2e-sla-ms`：
+20. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-20. `--skip-pool`：
+21. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-21. `--output-figure`：
+22. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-22. `--submit-window`：
+23. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
-23. `--disable-background-copy`：
+24. `--disable-background-copy`：
   关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
   伙伴，服务后续请求；关闭后只保留因当前请求容量不足而同步触发的 foreground transfer。
 
-24. `--background-copy-max-blocks`：
+25. `--background-copy-max-blocks`：
   每条后台候选前缀链最多贡献多少个 prefix block。相同方向、相同 NVLink pair 的多条候选
   会在内部合并成一个有界 plan，以摊薄控制协议和 payload 启动开销。
 
-25. `--background-copy-cooldown-s`：
+26. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
-26. `--background-copy-hot-threshold`：
+27. `--background-copy-hot-threshold`：
   最大热点前缀链中每个 block 至少需要达到的 worker 上报访问次数。值越大越保守，能减少
   无效 copy；该统计来自真实数据面访问，不再使用路由请求次数代替。
 
-27. `--background-copy-min-load-skew`：
+28. `--background-copy-min-load-skew`：
   route-originated 候选发现要求 prefix owner 与 NVLink partner 至少相差多少队列压力，默认 2；
   phase 边界的 ingress forecast 使用已观测的数据放置偏斜，不受该瞬时负载差限制。
 
-28. `--background-copy-expected-reuses`：
+29. `--background-copy-expected-reuses`：
   预测未来复用次数的保守上限，默认 4。实际预测来自 ingress 尚未提交请求的逐前缀计数；
   没有 forecast 时才使用折扣后的 worker 历史访问次数，不再固定假设一定有 4 次复用。
 
-29. `--route-decode-token-weight`：
-  一个预计 decode token 在路由负载快照中的权重，默认 8，用于避免长输出请求集中到单一 owner。
-
-30. `--route-owner-spill-sequence-skew`：
-  prefix owner 比 NVLink partner 多出的序列压力达到该值时允许 pair 内 spill，默认 2。
-
-31. `--route-owner-spill-max-extra-cost`：
-  pair spill 相比留在 owner 最多允许增加的 token-equivalent 重算成本，默认 2048。
-
-32. `--route-load-weight`：
+30. `--route-load-weight`：
   旧 prefix score 中 token-aware load 的 tie-break 权重。主路由决策现在使用统一预计完成成本；
   该参数只在成本相同时参与稳定排序，通常保持默认值。
 
-33. `--route-load-bypass-threshold`：
+31. `--route-decode-token-weight`：
+  一个预计 decode token 在路由负载快照中的权重，默认 8，用于避免长输出请求集中到单一 owner。
+
+32. `--route-owner-spill-sequence-skew`：
+  prefix owner 比 NVLink partner 多出的序列压力达到该值时允许 pair 内 spill，默认 2。
+
+33. `--route-owner-spill-max-extra-cost`：
+  pair spill 相比留在 owner 最多允许增加的 token-equivalent 重算成本，默认 2048。
+
+34. `--route-load-bypass-threshold`：
   冷目标的预计总成本必须比 prefix owner 至少低多少 token-equivalent cost，才允许绕过
   owner。值越小越激进，越容易牺牲 locality 换并行度。
 
-34. `--route-prefill-cost-weight`：
+35. `--route-prefill-cost-weight`：
   缺失 prefix token 的重算成本权重。默认 1.0，使一个缺失 token 与一个 waiting token
   使用相同成本单位；增大后路由更偏向已有 prefix 的 owner。
 
-35. `--route-reclaim-cost-weight`：
+36. `--route-reclaim-cost-weight`：
   使用 reclaimable capacity 时，每个待回收 block 按 `block_size * weight` 计入的附加成本。
   默认 0.5，用于反映回收元数据操作及未来 cache miss 风险。
 
-36. `--foreground-transfer-cost-weight`：
+37. `--foreground-transfer-cost-weight`：
   对时间模型算出的 transfer 成本施加的整体倍率，默认 1.0。大于 1 会更保守；通常保持
   1.0，优先校准下面的带宽、固定延迟和干扰系数。
 
-37. `--foreground-transfer-min-benefit-ratio`：
+38. `--foreground-transfer-min-benefit-ratio`：
   foreground transfer 预计节省的 prefill 毫秒数与预计 transfer 毫秒数的最小比值。
   默认 1.5；未达到门槛时跳过 transfer，直接使用本地回收。
 
-38. `--foreground-transfer-bandwidth-gib-s`：
-  成本模型采用的有效 KV transfer 带宽，单位 GiB/s。应使用
-  `benchmarks/benchmark_kv_transfer.py` 在当前 GPU/NVLink 拓扑上的实测值，而不是 NVLink
-  链路标称带宽；默认 3.5。
+39. `--foreground-transfer-bandwidth-gib-s`：
+  未提供 size-aware profile 时的兼容回退带宽，单位 GiB/s，默认 3.5。正式实验应优先使用
+  下一项 profile，不再用单一带宽代表所有 plan 大小。
 
-39. `--foreground-transfer-fixed-latency-ms`：
-  每个 transfer plan 的固定协议、协调和启动延迟，单位毫秒，默认 2.0。
+40. `--foreground-transfer-profile-json`：
+  `build_transfer_profile.py` 生成的分段延迟 profile。它按逻辑 NVLink pair 保存
+  1/2/4/8/16/32/64-block 的实测延迟；运行时按实际 payload 插值，并严格校验模型、dtype
+  对应的每 block 字节数。未提供时才回退到上一项标量带宽。
 
-40. `--foreground-transfer-interference-multiplier`：
-  对纯链路传输时间施加的前台推理干扰倍率，默认 1.5，且不能小于 1。它用于反映打包、
-  解包以及源/目标 GPU 被通信占用的代价。
+41. `--foreground-transfer-fixed-latency-ms`：
+  每个在线 transfer plan 在空载数据通路之外的固定事务残差，单位毫秒，默认 40.0。
+  它覆盖调度、协调、NCCL 排队、目标端发布与 block 注册等完整 serving 路径开销；
+  应由独立 pilot 的 `目标端完整耗时 - 干扰倍率 × 同尺寸 microbenchmark P95`
+  按成功 plan 数归一化后保守校准。
 
-41. `--foreground-prefill-token-time-ms`：
+42. `--foreground-transfer-interference-multiplier`：
+  对空载 transfer microbenchmark 的分段数据通路 P95 施加的加载态干扰倍率，
+  默认 1.2，且不能小于 1。它只表示随 payload 变化的模型执行竞争、打包和解包干扰；
+  完整 serving 事务中不随 payload 线性变化的部分由上一项固定残差表示。
+
+43. `--foreground-prefill-token-time-ms`：
   重算一个未缓存 prompt token 的预计耗时，单位毫秒，默认 0.02。该值应由目标模型的
   prefill 统计校准。
 
-42. `--foreground-future-reuse-discount`：
+44. `--foreground-future-reuse-discount`：
   将历史叶前缀访问次数折算成未来复用次数的折扣，范围 `[0, 1]`，默认 0.5。成本模型不会
   再把前缀链上每个 block 的访问次数相加，从而避免将一条请求重复计算多次。
 
-43. `--kv-transfer-prewarm-blocks`：
+45. `--kv-transfer-prewarm-blocks`：
   serving 开始前，每个 NVLink pair 使用真实 KV 形状预热的 block 数，默认 2。预热会循环
   使用与线上一致的单个 all-layer 连续 payload，并把测得的 pair-specific 成本送入控制面，
   但不计入 throughput 或 latency。
 
-44. `--route-cache-queue-slack`：
+46. `--route-cache-queue-slack`：
   route cache 命中时允许 cached owner 相比最低成本候选多出的 token-equivalent cost。
   值越小，缓存路由越容易被负载不均打破。
 
@@ -271,8 +284,10 @@ from lmpool.sampling_parameters import SamplingParams
 
 try:
     from .benchmark_utils import build_run_metadata, resolve_model_runtime_config
+    from .transfer_profile import load_transfer_latency_profile
 except ImportError:
     from benchmark_utils import build_run_metadata, resolve_model_runtime_config
+    from transfer_profile import load_transfer_latency_profile
 
 
 def prepare_benchmark_rendezvous(config: dict) -> tuple[dict, Path | None]:
@@ -342,12 +357,13 @@ MODEL_CONFIG = {
     "foreground_transfer_min_blocks": 2,
     "foreground_transfer_cost_weight": 1.0,
     "foreground_transfer_min_benefit_ratio": 1.5,
-    # Time-domain transfer cost model. Calibrate bandwidth with
-    # benchmark_kv_transfer.py; the other terms account for protocol setup and
-    # interference with foreground model execution.
+    # The profile measures an otherwise-idle packed data path. Add a
+    # loaded-serving transaction residual, then scale only the payload-varying
+    # part. Pair/size EWMAs can raise the estimate after complete observations.
     "foreground_transfer_bandwidth_gib_s": 3.5,
-    "foreground_transfer_fixed_latency_ms": 2.0,
-    "foreground_transfer_interference_multiplier": 1.5,
+    "foreground_transfer_latency_profile": None,
+    "foreground_transfer_fixed_latency_ms": 40.0,
+    "foreground_transfer_interference_multiplier": 1.2,
     "foreground_prefill_token_time_ms": 0.02,
     "foreground_future_reuse_discount": 0.5,
     "foreground_transfer_ewma_alpha": 0.25,
@@ -2654,6 +2670,16 @@ def parse_args():
         "--foreground-transfer-bandwidth-gib-s",
         type=float,
         default=MODEL_CONFIG["foreground_transfer_bandwidth_gib_s"],
+        help="Scalar fallback used only when no size-aware profile is provided.",
+    )
+    parser.add_argument(
+        "--foreground-transfer-profile-json",
+        type=str,
+        default="",
+        help=(
+            "Size-aware logical-pair latency profile produced by "
+            "build_transfer_profile.py."
+        ),
     )
     parser.add_argument(
         "--foreground-transfer-fixed-latency-ms",
@@ -2717,7 +2743,11 @@ def apply_background_copy_args(config: dict, args) -> None:
     config["background_copy_expected_reuses"] = args.background_copy_expected_reuses
 
 
-def apply_route_args(config: dict, args) -> None:
+def apply_route_args(
+    config: dict,
+    args,
+    transfer_latency_profile: dict | None = None,
+) -> None:
     config["route_load_weight"] = args.route_load_weight
     config["route_decode_token_weight"] = args.route_decode_token_weight
     config["route_owner_spill_sequence_skew"] = args.route_owner_spill_sequence_skew
@@ -2730,6 +2760,7 @@ def apply_route_args(config: dict, args) -> None:
         args.foreground_transfer_min_benefit_ratio
     )
     config["foreground_transfer_bandwidth_gib_s"] = args.foreground_transfer_bandwidth_gib_s
+    config["foreground_transfer_latency_profile"] = transfer_latency_profile
     config["foreground_transfer_fixed_latency_ms"] = args.foreground_transfer_fixed_latency_ms
     config["foreground_transfer_interference_multiplier"] = (
         args.foreground_transfer_interference_multiplier
@@ -2821,6 +2852,24 @@ def main():
     )
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
     nvlink_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else []
+    transfer_latency_profile = None
+    if args.foreground_transfer_profile_json:
+        expected_bytes_per_block = (
+            2
+            * int(runtime_model_config["num_layers"])
+            * int(runtime_model_config["block_size"])
+            * int(runtime_model_config["num_kv_heads"])
+            * int(runtime_model_config["head_dim"])
+            * int(runtime_model_config["kv_dtype_bytes"])
+        )
+        try:
+            transfer_latency_profile = load_transfer_latency_profile(
+                args.foreground_transfer_profile_json,
+                expected_bytes_per_block=expected_bytes_per_block,
+                expected_pairs=nvlink_pairs,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot load transfer latency profile: {exc}") from exc
     memory_skew_source_ranks = sorted({int(pair[0]) for pair in nvlink_pairs}) or [0]
     memory_skew_target_by_source = {
         int(source): int(target) for source, target in nvlink_pairs
@@ -2903,7 +2952,7 @@ def main():
     routing_config["enable_background_copy"] = False
     routing_config["random_seed"] = args.seed
     apply_transfer_placement(routing_config)
-    apply_route_args(routing_config, args)
+    apply_route_args(routing_config, args, transfer_latency_profile)
     kv_routing = run_repeated_engine_scenario(
         args.repetitions,
         name="multi-gpu-kv-routing",
@@ -2933,7 +2982,7 @@ def main():
         "session-handoff",
     }
     apply_background_copy_args(eviction_config, args)
-    apply_route_args(eviction_config, args)
+    apply_route_args(eviction_config, args, transfer_latency_profile)
     kv_eviction = run_repeated_engine_scenario(
         args.repetitions,
         name="multi-gpu-kv-transfer",
@@ -2969,7 +3018,7 @@ def main():
                 "session-handoff",
             }
             apply_background_copy_args(pool_config, args)
-            apply_route_args(pool_config, args)
+            apply_route_args(pool_config, args, transfer_latency_profile)
             pool_result = run_repeated_engine_scenario(
                 args.repetitions,
                 name="multi-gpu-lmpool",

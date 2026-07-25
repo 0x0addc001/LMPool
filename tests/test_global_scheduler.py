@@ -314,6 +314,8 @@ def test_route_keeps_current_request_on_owner_when_hot_replica_copy_is_cheaper()
     }
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
     scheduler.enable_routing_guided_copy = True
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
 
     target, info = scheduler.route_sequence_meta(
         requester_rank=-1,
@@ -687,6 +689,115 @@ def test_observed_transfer_cost_is_isolated_by_nvlink_pair():
     assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 0, 1) > cold_pair_cost
     assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 2, 3) == cold_pair_cost
     assert (0, 1) in scheduler.observed_transfer_extra_ms_by_pair
+
+
+def test_transfer_latency_profile_interpolates_per_pair():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.set_transfer_latency_profile({
+        "default_points": [
+            {"bytes": 100, "latency_ms": 20.0},
+            {"bytes": 300, "latency_ms": 60.0},
+        ],
+        "pairs": {
+            "0,1": {
+                "points": [
+                    {"bytes": 100, "latency_ms": 10.0},
+                    {"bytes": 300, "latency_ms": 30.0},
+                ],
+            },
+        },
+    })
+
+    assert scheduler._estimate_transfer_cost_ms(200, 0, 1) == 20.0
+    assert scheduler._estimate_transfer_cost_ms(200, 2, 3) == 40.0
+    assert scheduler._estimate_transfer_cost_ms(50, 0, 1) == 10.0
+    assert scheduler._estimate_transfer_cost_ms(400, 0, 1) == 40.0
+
+
+def test_loaded_profile_prior_rejects_small_plan_but_keeps_amortized_large_plan():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 40.0
+    scheduler.transfer_interference_multiplier = 1.2
+    scheduler.foreground_transfer_min_benefit_ratio = 1.1
+    one_block = scheduler._estimate_transfer_bytes(1)
+    scheduler.set_transfer_latency_profile({
+        "pairs": {
+            "0,1": {
+                "points": [
+                    {"bytes": one_block * 4, "latency_ms": 5.0},
+                    {"bytes": one_block * 8, "latency_ms": 8.0},
+                    {"bytes": one_block * 64, "latency_ms": 48.0},
+                ],
+            },
+        },
+    })
+
+    short_blocks = 7
+    short_cost_ms = scheduler._estimate_transfer_cost_ms(
+        one_block * short_blocks,
+        0,
+        1,
+    )
+    short_saved_ms = short_blocks * scheduler.block_size * 0.02
+    assert (
+        short_saved_ms
+        < short_cost_ms * scheduler.foreground_transfer_min_benefit_ratio
+    )
+
+    large_blocks = 64
+    large_cost_ms = scheduler._estimate_transfer_cost_ms(
+        one_block * large_blocks,
+        0,
+        1,
+    )
+    large_saved_ms = large_blocks * scheduler.block_size * 0.02
+    assert (
+        large_saved_ms
+        >= large_cost_ms * scheduler.foreground_transfer_min_benefit_ratio
+    )
+
+
+def test_profile_observations_are_isolated_by_pair_and_size_bucket():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.transfer_cost_ewma_alpha = 1.0
+    one_block = scheduler._estimate_transfer_bytes(1)
+    eight_blocks = scheduler._estimate_transfer_bytes(8)
+    scheduler.set_transfer_latency_profile({
+        "pairs": {
+            "0,1": {
+                "points": [
+                    {"bytes": one_block, "latency_ms": 10.0},
+                    {"bytes": eight_blocks, "latency_ms": 80.0},
+                ],
+            },
+        },
+    })
+
+    scheduler.observe_transfer(
+        one_block,
+        elapsed_s=0.100,
+        src_gpu=0,
+        dst_gpu=1,
+    )
+
+    assert scheduler._estimate_transfer_cost_ms(one_block, 0, 1) == 100.0
+    assert scheduler._estimate_transfer_cost_ms(eight_blocks, 0, 1) == 80.0
+    assert scheduler.transfer_observation_count_by_pair_bucket[((0, 1), 1)] == 1
+
+    scheduler.observe_transfer(
+        eight_blocks,
+        elapsed_s=0.160,
+        src_gpu=0,
+        dst_gpu=1,
+    )
+
+    assert scheduler._estimate_transfer_cost_ms(one_block, 0, 1) == 100.0
+    assert scheduler._estimate_transfer_cost_ms(eight_blocks, 0, 1) == 160.0
+    assert scheduler.transfer_observation_count_by_pair_bucket[((0, 1), 8)] == 1
 
 
 def test_plan_rebalance_does_not_use_recursive_target_victims():

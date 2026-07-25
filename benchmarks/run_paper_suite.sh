@@ -17,12 +17,68 @@ GPU_SET="${GPU_SET:-0,1,3,4,5,6}"
 WORLD_SIZE="${WORLD_SIZE:-6}"
 NVLINK_PAIRS="${NVLINK_PAIRS:-0,1;2,3;4,5}"
 TRANSFER_PAIRS="${TRANSFER_PAIRS:-0,1;3,4;5,6}"
+TRANSFER_FIXED_LATENCY_MS="${TRANSFER_FIXED_LATENCY_MS:-40.0}"
+TRANSFER_INTERFERENCE_MULTIPLIER="${TRANSFER_INTERFERENCE_MULTIPLIER:-1.2}"
 REPETITIONS="${REPETITIONS:-5}"
 SEED="${SEED:-0}"
 DTYPE="${DTYPE:-auto}"
+RESUME="${RESUME:-0}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="${OUT:-benchmarks/results/paper/${RUN_ID}}"
 HF_HUB="${HF_HOME:-${HOME}/.cache/huggingface}/hub"
+
+artifact_complete() {
+  local path="$1"
+  local expected_results="$2"
+  local expected_type="$3"
+  local expected_model="$4"
+  local expected_workload="${5:-}"
+  local expected_interference_multiplier="${6:-}"
+  local expected_fixed_latency_ms="${7:-}"
+  [[ "${RESUME}" == "1" ]] \
+    && [[ -s "${path}" ]] \
+    && jq -e \
+      --argjson expected_results "${expected_results}" \
+      --arg expected_type "${expected_type}" \
+      --arg expected_model "${expected_model}" \
+      --arg expected_workload "${expected_workload}" \
+      --arg expected_interference_multiplier "${expected_interference_multiplier}" \
+      --arg expected_fixed_latency_ms "${expected_fixed_latency_ms}" \
+      --argjson expected_repetitions "${REPETITIONS}" \
+      '.metadata != null
+       and (.results | type) == $expected_type
+       and (.results | length == $expected_results)
+       and .metadata.model.name_or_path == $expected_model
+       and (
+         if $expected_type == "object"
+         then .metadata.arguments.repetitions == $expected_repetitions
+         else true
+         end
+       )
+       and (
+         if $expected_workload != ""
+         then .metadata.arguments.workload == $expected_workload
+         else true
+         end
+       )
+       and (
+         if $expected_interference_multiplier != ""
+         then
+           .metadata.arguments.foreground_transfer_interference_multiplier
+           == ($expected_interference_multiplier | tonumber)
+         else true
+         end
+       )
+       and (
+         if $expected_fixed_latency_ms != ""
+         then
+           .metadata.arguments.foreground_transfer_fixed_latency_ms
+           == ($expected_fixed_latency_ms | tonumber)
+         else true
+         end
+       )' \
+      "${path}" >/dev/null
+}
 
 find_snapshot() {
   local repository="$1"
@@ -73,141 +129,165 @@ run_model_suite() {
   mkdir -p "${model_out}"/{kv_transfer,routing,memory_skew,session_handoff,load_skew}
 
   local pair
+  local -a transfer_profile_inputs=()
   IFS=';' read -r -a physical_pairs <<< "${TRANSFER_PAIRS}"
   for pair in "${physical_pairs[@]}"; do
     local pair_label="${pair/,/-}"
-    CUDA_VISIBLE_DEVICES="${pair}" uv run python benchmarks/benchmark_kv_transfer.py \
-      --model-name-or-path "${model}" \
-      --dtype "${DTYPE}" \
-      --block-size 256 \
-      --block-counts 1,2,4,8 \
-      --iterations 100 \
-      --warmup 20 \
-      --output-json "${model_out}/kv_transfer/pair_${pair_label}.json" \
-      --output-figure "${model_out}/kv_transfer/pair_${pair_label}.png" \
-      2>&1 | tee "${model_out}/kv_transfer/pair_${pair_label}.log"
+    local pair_json="${model_out}/kv_transfer/pair_${pair_label}.json"
+    if artifact_complete "${pair_json}" 7 array "${model}"; then
+      echo "[resume] reuse ${pair_json}"
+    else
+      CUDA_VISIBLE_DEVICES="${pair}" uv run python benchmarks/benchmark_kv_transfer.py \
+        --model-name-or-path "${model}" \
+        --dtype "${DTYPE}" \
+        --block-size 256 \
+        --block-counts 1,2,4,8,16,32,64 \
+        --iterations 100 \
+        --warmup 20 \
+        --output-json "${pair_json}" \
+        --output-figure "${model_out}/kv_transfer/pair_${pair_label}.png" \
+        2>&1 | tee "${model_out}/kv_transfer/pair_${pair_label}.log"
+    fi
+    transfer_profile_inputs+=("${pair_json}")
   done
 
-  local transfer_bandwidth
-  transfer_bandwidth="$(uv run python -c '
-import json, statistics, sys
-values = []
-for path in sys.argv[1:]:
-    payload = json.load(open(path, encoding="utf-8"))
-    values.extend(
-        row["effective_bandwidth_gib_s"]
-        for row in payload["results"]
-        if row["num_transfer_blocks"] == 4
-    )
-if not values:
-    raise SystemExit("missing 4-block transfer result")
-print(f"{statistics.median(values):.6f}")
-' "${model_out}"/kv_transfer/pair_*.json)"
-  printf '%s\n' "${transfer_bandwidth}" > "${model_out}/kv_transfer/median_4_block_gib_s.txt"
+  local transfer_profile="${model_out}/kv_transfer/latency_profile.json"
+  uv run python benchmarks/build_transfer_profile.py \
+    --inputs "${transfer_profile_inputs[@]}" \
+    --logical-pairs "${NVLINK_PAIRS}" \
+    --latency-metric p95_latency_ms \
+    --output "${transfer_profile}"
 
-  CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_kv_routing.py \
-    --model-name-or-path "${model}" \
-    --dtype "${DTYPE}" \
-    --world-size "${WORLD_SIZE}" \
-    --num-prompts 192 \
-    --prompt-repeat 16 \
-    --max-tokens 64 \
-    --temperature 0.6 \
-    --ignore-eos \
-    --seed "${SEED}" \
-    --repetitions "${REPETITIONS}" \
-    --locality-prefix-groups 16 \
-    --nvlink-pairs "${NVLINK_PAIRS}" \
-    --submit-window 16 \
-    --kv-block-budget 64 \
-    --gpu-memory-utilization 0.5 \
-    --goodput-e2e-sla-ms 10000 \
-    --output-json "${model_out}/routing/summary.json" \
-    --output-figure "${model_out}/routing/summary.png" \
-    2>&1 | tee "${model_out}/routing/run.log"
+  if artifact_complete "${model_out}/routing/summary.json" 3 object "${model}"; then
+    echo "[resume] reuse ${model_out}/routing/summary.json"
+  else
+    CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_kv_routing.py \
+      --model-name-or-path "${model}" \
+      --dtype "${DTYPE}" \
+      --world-size "${WORLD_SIZE}" \
+      --num-prompts 192 \
+      --prompt-repeat 16 \
+      --max-tokens 64 \
+      --temperature 0.6 \
+      --ignore-eos \
+      --seed "${SEED}" \
+      --repetitions "${REPETITIONS}" \
+      --locality-prefix-groups 16 \
+      --nvlink-pairs "${NVLINK_PAIRS}" \
+      --submit-window 16 \
+      --kv-block-budget 64 \
+      --gpu-memory-utilization 0.5 \
+      --goodput-e2e-sla-ms 10000 \
+      --output-json "${model_out}/routing/summary.json" \
+      --output-figure "${model_out}/routing/summary.png" \
+      2>&1 | tee "${model_out}/routing/run.log"
+  fi
 
-  CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
-    --model-name-or-path "${model}" \
-    --dtype "${DTYPE}" \
-    --world-size "${WORLD_SIZE}" \
-    --workload memory-skew \
-    --memory-skew-prefix-groups 15 \
-    --num-prompts 128 \
-    --prompt-repeat 16 \
-    --max-tokens 64 \
-    --temperature 0.6 \
-    --ignore-eos \
-    --seed "${SEED}" \
-    --repetitions "${REPETITIONS}" \
-    --nvlink-pairs "${NVLINK_PAIRS}" \
-    --submit-window 16 \
-    --kv-block-budget 64 \
-    --gpu-memory-utilization 0.5 \
-    --goodput-e2e-sla-ms 10000 \
-    --disable-background-copy \
-    --foreground-transfer-min-benefit-ratio 1.1 \
-    --foreground-transfer-bandwidth-gib-s "${transfer_bandwidth}" \
-    --foreground-transfer-fixed-latency-ms 2.0 \
-    --foreground-transfer-interference-multiplier 1.2 \
-    --kv-transfer-prewarm-blocks 4 \
-    --output-json "${model_out}/memory_skew/summary.json" \
-    --output-figure "${model_out}/memory_skew/summary.png" \
-    2>&1 | tee "${model_out}/memory_skew/run.log"
+  if artifact_complete \
+    "${model_out}/memory_skew/summary.json" \
+    5 object "${model}" memory-skew "${TRANSFER_INTERFERENCE_MULTIPLIER}" \
+    "${TRANSFER_FIXED_LATENCY_MS}"; then
+    echo "[resume] reuse ${model_out}/memory_skew/summary.json"
+  else
+    CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
+      --model-name-or-path "${model}" \
+      --dtype "${DTYPE}" \
+      --world-size "${WORLD_SIZE}" \
+      --workload memory-skew \
+      --memory-skew-prefix-groups 15 \
+      --num-prompts 128 \
+      --prompt-repeat 16 \
+      --max-tokens 64 \
+      --temperature 0.6 \
+      --ignore-eos \
+      --seed "${SEED}" \
+      --repetitions "${REPETITIONS}" \
+      --nvlink-pairs "${NVLINK_PAIRS}" \
+      --submit-window 16 \
+      --kv-block-budget 64 \
+      --gpu-memory-utilization 0.5 \
+      --goodput-e2e-sla-ms 10000 \
+      --disable-background-copy \
+      --foreground-transfer-min-benefit-ratio 1.1 \
+      --foreground-transfer-profile-json "${transfer_profile}" \
+      --foreground-transfer-fixed-latency-ms "${TRANSFER_FIXED_LATENCY_MS}" \
+      --foreground-transfer-interference-multiplier "${TRANSFER_INTERFERENCE_MULTIPLIER}" \
+      --kv-transfer-prewarm-blocks 4 \
+      --output-json "${model_out}/memory_skew/summary.json" \
+      --output-figure "${model_out}/memory_skew/summary.png" \
+      2>&1 | tee "${model_out}/memory_skew/run.log"
+  fi
 
-  CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
-    --model-name-or-path "${model}" \
-    --dtype "${DTYPE}" \
-    --world-size "${WORLD_SIZE}" \
-    --workload session-handoff \
-    --handoff-prefix-groups 32 \
-    --handoff-warmup-prompts 32 \
-    --num-prompts 128 \
-    --prompt-repeat 16 \
-    --max-tokens 64 \
-    --temperature 0.6 \
-    --ignore-eos \
-    --seed "${SEED}" \
-    --repetitions "${REPETITIONS}" \
-    --nvlink-pairs "${NVLINK_PAIRS}" \
-    --submit-window 64 \
-    --kv-block-budget 128 \
-    --gpu-memory-utilization 0.5 \
-    --goodput-e2e-sla-ms 10000 \
-    --background-copy-max-blocks 8 \
-    --background-copy-hot-threshold 1 \
-    --background-copy-cooldown-s 0.1 \
-    --background-copy-expected-reuses 4 \
-    --foreground-transfer-min-benefit-ratio 1.1 \
-    --foreground-transfer-bandwidth-gib-s "${transfer_bandwidth}" \
-    --foreground-transfer-fixed-latency-ms 2.0 \
-    --foreground-transfer-interference-multiplier 1.2 \
-    --kv-transfer-prewarm-blocks 4 \
-    --output-json "${model_out}/session_handoff/summary.json" \
-    --output-figure "${model_out}/session_handoff/summary.png" \
-    2>&1 | tee "${model_out}/session_handoff/run.log"
+  if artifact_complete \
+    "${model_out}/session_handoff/summary.json" \
+    5 object "${model}" session-handoff "${TRANSFER_INTERFERENCE_MULTIPLIER}" \
+    "${TRANSFER_FIXED_LATENCY_MS}"; then
+    echo "[resume] reuse ${model_out}/session_handoff/summary.json"
+  else
+    CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
+      --model-name-or-path "${model}" \
+      --dtype "${DTYPE}" \
+      --world-size "${WORLD_SIZE}" \
+      --workload session-handoff \
+      --handoff-prefix-groups 32 \
+      --handoff-warmup-prompts 32 \
+      --num-prompts 128 \
+      --prompt-repeat 16 \
+      --max-tokens 64 \
+      --temperature 0.6 \
+      --ignore-eos \
+      --seed "${SEED}" \
+      --repetitions "${REPETITIONS}" \
+      --nvlink-pairs "${NVLINK_PAIRS}" \
+      --submit-window 64 \
+      --kv-block-budget 128 \
+      --gpu-memory-utilization 0.5 \
+      --goodput-e2e-sla-ms 10000 \
+      --background-copy-max-blocks 8 \
+      --background-copy-hot-threshold 1 \
+      --background-copy-cooldown-s 0.1 \
+      --background-copy-expected-reuses 4 \
+      --foreground-transfer-min-benefit-ratio 1.1 \
+      --foreground-transfer-profile-json "${transfer_profile}" \
+      --foreground-transfer-fixed-latency-ms "${TRANSFER_FIXED_LATENCY_MS}" \
+      --foreground-transfer-interference-multiplier "${TRANSFER_INTERFERENCE_MULTIPLIER}" \
+      --kv-transfer-prewarm-blocks 4 \
+      --output-json "${model_out}/session_handoff/summary.json" \
+      --output-figure "${model_out}/session_handoff/summary.png" \
+      2>&1 | tee "${model_out}/session_handoff/run.log"
+  fi
 
-  CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
-    --model-name-or-path "${model}" \
-    --dtype "${DTYPE}" \
-    --world-size "${WORLD_SIZE}" \
-    --workload load-skew \
-    --num-prompts 192 \
-    --prompt-repeat 16 \
-    --max-tokens 64 \
-    --temperature 0.6 \
-    --ignore-eos \
-    --seed "${SEED}" \
-    --repetitions "${REPETITIONS}" \
-    --nvlink-pairs "${NVLINK_PAIRS}" \
-    --submit-window 16 \
-    --kv-block-budget 64 \
-    --gpu-memory-utilization 0.5 \
-    --goodput-e2e-sla-ms 10000 \
-    --disable-background-copy \
-    --foreground-transfer-bandwidth-gib-s "${transfer_bandwidth}" \
-    --output-json "${model_out}/load_skew/summary.json" \
-    --output-figure "${model_out}/load_skew/summary.png" \
-    2>&1 | tee "${model_out}/load_skew/run.log"
+  if artifact_complete \
+    "${model_out}/load_skew/summary.json" \
+    5 object "${model}" load-skew "${TRANSFER_INTERFERENCE_MULTIPLIER}" \
+    "${TRANSFER_FIXED_LATENCY_MS}"; then
+    echo "[resume] reuse ${model_out}/load_skew/summary.json"
+  else
+    CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
+      --model-name-or-path "${model}" \
+      --dtype "${DTYPE}" \
+      --world-size "${WORLD_SIZE}" \
+      --workload load-skew \
+      --num-prompts 192 \
+      --prompt-repeat 16 \
+      --max-tokens 64 \
+      --temperature 0.6 \
+      --ignore-eos \
+      --seed "${SEED}" \
+      --repetitions "${REPETITIONS}" \
+      --nvlink-pairs "${NVLINK_PAIRS}" \
+      --submit-window 16 \
+      --kv-block-budget 64 \
+      --gpu-memory-utilization 0.5 \
+      --goodput-e2e-sla-ms 10000 \
+      --disable-background-copy \
+      --foreground-transfer-profile-json "${transfer_profile}" \
+      --foreground-transfer-fixed-latency-ms "${TRANSFER_FIXED_LATENCY_MS}" \
+      --foreground-transfer-interference-multiplier "${TRANSFER_INTERFERENCE_MULTIPLIER}" \
+      --output-json "${model_out}/load_skew/summary.json" \
+      --output-figure "${model_out}/load_skew/summary.png" \
+      2>&1 | tee "${model_out}/load_skew/run.log"
+  fi
 }
 
 run_model_suite "qwen3-0.6b" "${MODEL_06B}"

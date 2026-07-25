@@ -1920,3 +1920,382 @@ decision demand, decision plan, decision implementation, and decision result.
 - Decision result: Prefix sharing percentages are now auditable from exact
   trace composition, and every report figure states both its workload and its
   relationship to the underlying benchmark artifacts.
+
+## 2026-07-25: Replace Single-Point Transfer Pricing with Size-Aware Profiles
+
+- Decision demand: The serving cost model priced every transfer with one
+  effective-bandwidth scalar, historically selected from the four-block
+  microbenchmark. Fixed NCCL and packing overhead makes effective bandwidth
+  strongly payload-dependent, so that scalar overprices large plans and can
+  underprice small plans. The pair-local EWMA also mixed observations from
+  different plan sizes, allowing one cold small transfer to reject unrelated
+  large transfers.
+- Decision plan: Preserve the measured latency curve instead of collapsing it
+  to one bandwidth. Calibrate every physical NVLink pair at powers-of-two block
+  counts, map those files to the logical pairs used after CUDA remapping, use
+  conservative piecewise-linear P95 latency as the offline prior, and restrict
+  online corrections to the observed pair and block-size bucket.
+- Decision implementation: `benchmark_kv_transfer.py` now reports mean, P50,
+  and P95 for the paper sweep `1,2,4,8,16,32,64`.
+  `build_transfer_profile.py` and `transfer_profile.py` create a versioned
+  artifact containing physical provenance, logical-pair mapping, model KV
+  geometry, raw samples, and monotonic decision points. `benchmark_e2e.py`
+  loads this artifact through `--foreground-transfer-profile-json` and rejects
+  pair or bytes-per-block mismatches before worker launch. `GlobalScheduler`
+  interpolates within each pair curve, uses the final measured slope beyond
+  the range, and maintains separate source-transfer and
+  dispatch-to-publication residual EWMAs keyed by `(pair,
+  next_power_of_two(block_count))`. The old bandwidth option remains only as a
+  no-profile fallback. `run_paper_suite.sh` now constructs one profile per
+  model and injects it into every E2E workload.
+- Decision result: Transfer admission now prices the actual plan size and
+  topology instead of treating four blocks as representative of all plans.
+  Focused scheduler/profile coverage passes 40 tests and the complete CPU suite
+  passes 188 tests with one hardware-gated NCCL skip. Coverage includes
+  interpolation, pair isolation, size-bucket isolation, monotonic profile
+  construction, and geometry/topology mismatch rejection. End-to-end
+  performance claims require a fresh GPU benchmark run with the generated
+  profile and are not inferred from these unit tests.
+
+## 2026-07-25: Make Transfer Figures Reproducible from Result Artifacts
+
+- Decision demand: Mean, P50, and P95 transfer latencies converge for warmed
+  large payloads. Placing every value two points above its grouped bar caused
+  the three labels to overlap, even though the underlying JSON and latency
+  profile were correct.
+- Decision plan: Treat figures as deterministic post-processing artifacts,
+  preserve horizontal value labels, and make historical results redrawable
+  without allocating GPUs or rerunning the microbenchmark.
+- Decision implementation: `benchmark_kv_transfer.py` now uses a wider
+  two-panel canvas, places Mean/P50/P95 labels on three vertical levels, and
+  reserves explicit y-axis headroom. The new `--input-json` mode reads the
+  model label and result rows from an existing artifact and writes only the
+  requested PNG. A benchmark test covers this JSON-to-figure path.
+- Decision result: Transfer plots can be corrected or restyled independently
+  of measurement, while the JSON and E2E latency profile remain immutable.
+
+## 2026-07-25: Remove Transfer-Sweep Port Races and Support Resumption
+
+- Decision demand: The dual-model paper run aborted in the Qwen3-1.7B transfer
+  sweep with `TCPStore EADDRINUSE`. The benchmark selected a nominally free TCP
+  port, closed the probing socket, and only later spawned rank 0 to bind it.
+  Another process could claim the port in that interval. The abort also forced
+  users to choose between rerunning completed experiments and manually
+  reconstructing the remaining matrix.
+- Decision plan: Remove the probe-then-bind race instead of retrying arbitrary
+  ports, fail fast when a worker exits, and make the paper runner reuse only
+  structurally complete result artifacts.
+- Decision implementation: Every transfer payload case now creates a unique
+  `/tmp/lmpool-kv-transfer-<pid>-<uuid>.store` rendezvous and initializes NCCL
+  through `file://`, then removes the store after both workers join. Queue
+  polling catches only `queue.Empty`, stops as soon as a worker has a nonzero
+  exit code, and includes both exit codes in validation failures. The known
+  eager-init unbatched-P2P warning is disabled for this benchmark because each
+  pair intentionally admits one transfer transaction at a time.
+  `run_paper_suite.sh` adds `RESUME=1`; it accepts an existing JSON only when it
+  is nonempty, contains both `metadata` and `results`, and has exactly the
+  expected 7 transfer, 3 routing, or 5 E2E result rows. It rebuilds the transfer
+  profile from the complete pair artifacts.
+- Decision result: Five focused CPU tests pass, including unique rendezvous
+  coverage. A real Qwen3-1.7B two-case sweep on physical GPUs 3/4 completed
+  both one- and two-block cases with data validation passed, no TCP bind
+  failure, and no eager-init serialization warning. The complete CPU suite
+  passes 189 tests with one hardware-gated NCCL skip. The interrupted paper
+  run was intended to continue in place without rerunning the complete
+  Qwen3-0.6B matrix; the next decision records and corrects a schema-validation
+  defect in that first resume implementation.
+
+## 2026-07-25: Correct Resume Validation and Loaded Transfer Admission
+
+- Decision demand: Resuming the interrupted paper suite unexpectedly reran and
+  overwrote completed Qwen3-0.6B E2E experiments. The repeated memory-skew
+  results also showed that size-aware admission accepted transfers whose
+  measured target-side cost exceeded their predicted recomputation saving.
+- Decision plan: Validate the actual JSON schemas emitted by every benchmark,
+  then compare estimated transfer cost with the complete target-side serving
+  transaction. Correct the calibration boundary without adding another
+  scheduling policy.
+- Decision implementation: `run_paper_suite.sh` now validates the transfer
+  microbenchmark's result array and the routing/E2E benchmarks'
+  scenario-keyed result object, while still requiring metadata and the exact
+  expected result count. Resume additionally matches the model path,
+  repetition count, workload, and E2E transfer-cost calibration so
+  structurally complete artifacts from a different configuration are not
+  silently mixed. The transfer profile remains an idle, pair- and size-specific P95
+  data-path measurement. A size-independent additive residual fits both the
+  short foreground and large handoff plans better than multiplying every
+  payload by the short-plan slowdown. The final cold-start prior is therefore
+  `40 ms + 1.2 * profile_P95(plan_bytes)`, calibrated from the five-trial
+  Qwen3-0.6B pilot: the old model estimated 7-block foreground plans at roughly
+  10.7 ms each, while complete target-side transactions consumed roughly
+  43--47 ms. The additive term prices scheduling, NCCL queuing, target
+  publication, and block registration outside the idle microbenchmark
+  boundary. Existing pair-and-size placement EWMAs remain a conservative
+  online correction. A scheduler regression test checks the intended decision
+  boundary: a low-reuse 7-block plan is rejected, while an amortized 64-block plan remains
+  admissible under the measured latency-curve shape.
+- Decision result: Resumption reuses matching transfer arrays and matching
+  scenario-keyed routing/E2E artifacts, while rejecting old E2E files whose
+  cost calibration differs. Cold, one-shot foreground plans are not admitted on an
+  underpriced idle-link estimate, while session-handoff-scale transfers can
+  still pass when their predicted prefill saving covers the loaded cost. The
+  overwritten `20260725T031840Z` Qwen3-0.6B results are retained as calibration
+  data rather than final post-fix evaluation. The complete CPU suite passes
+  190 tests with one hardware-gated NCCL test skipped.
+
+## 2026-07-25: Redraw Process Architecture and Decision Flows from Runtime Ownership
+
+- Decision demand: The existing figures mixed process ownership with logical
+  modules, routed request arrows through control-plane boxes, and used dark
+  README variants that no longer matched the requested paper style. The
+  diagrams also needed to make explicit that global state is metadata while
+  physical KV moves only between data-plane Model Runners.
+- Decision plan: Use one white-background, pastel, flat-vector visual system
+  for the paper, READMEs, and report. Separate the architecture into the main,
+  control-plane, and per-GPU data-plane processes; distinguish request/result,
+  metadata/control, and KV-payload paths; and keep routing, background
+  placement, and transactional transfer as three independent branching
+  flowcharts.
+- Decision implementation: Rewrote `generate_architecture.py` with explicit
+  LLMEngine, Global Scheduler, Global Block Manager, Local Scheduler, Local
+  Block Manager, Model Runner, and physical KV-cache modules. Request/result
+  paths now run outside the control-plane modules, state/control paths are
+  dashed, and the packed KV tensor connects the two Model Runners directly.
+  Rewrote `generate_decision_flow.py` with concise English labels and actual
+  feasibility, owner-spill, hotness, replica, capacity, cost, prepare, publish,
+  and abort branches. Both generators emit synchronized PNG assets for
+  README, paper, and report, plus vector PDF paper outputs. Updated both
+  READMEs, the paper design section, the paper artifact guide, and the
+  2026-07-20 report to describe the same ownership and flow semantics.
+- Decision result: All current architecture and decision figures use a pure
+  white background, soft academic colors, readable English labels, and no
+  decorative texture or shadow. Visual inspection confirmed that arrows
+  terminate at the intended modules, the NVLink payload is aligned between
+  Model Runners, and every decision flow exposes its rejection or rollback
+  path. This change is documentation-only and does not alter runtime behavior.
+
+## 2026-07-25: Refine Diagram Geometry and Restore Dual Light/Dark Themes
+
+- Decision demand: The first redraw still used opaque arrow-label backgrounds,
+  compressed several arrowheads between tightly packed nodes, showed only two
+  full worker ranks, and left the lifecycle and cost-model figures in the older
+  visual style. README also needed a dark-background presentation while the
+  paper and report required a white-background version.
+- Decision plan: Keep one implementation-aligned diagram source per concept,
+  but render synchronized light and dark variants. Use transparent labels,
+  orthogonal connectors that terminate exactly at node borders, visible gaps
+  before every arrowhead, a green KV payload path, and enough representative
+  workers to communicate an N-rank deployment without duplicating every
+  internal module.
+- Decision implementation: `generate_architecture.py` now renders complete
+  Rank 0 and Rank N-1 data planes plus compact Rank 1, Rank 2, intermediate,
+  and Rank N-2 workers. LLMEngine request/result paths enter each full worker
+  at its side midpoint, while the packed KV tensor connects Model Runners in
+  green. `generate_decision_flow.py` uses compact process nodes, explicit
+  feasibility/admission/failure diamonds, and only horizontal or vertical
+  connectors. `generate_block_lifecycle.py` was rebuilt around separate local
+  reuse and transactional transfer state machines, including hidden receive,
+  publish, abort, copy, and move states. `generate_cost_models.py` was rebuilt
+  as separate routing and transfer decision diagrams with size-aware profile,
+  online EWMA, saved-work, and admission branches. All four generators emit
+  light PNG/PDF paper assets and dark README assets; README links and color
+  descriptions now select the dark variants.
+- Decision result: Visual inspection of every light figure and representative
+  dark variants confirmed readable arrowheads, border-aligned endpoints,
+  transparent labels, balanced whitespace, and consistent academic colors.
+  Paper/report figures remain white, README figures remain dark, and KV
+  transfer is consistently green. This is a documentation-only change and
+  does not alter routing, transfer, or block-management behavior.
+
+## 2026-07-25: Center Architecture Content and Expose NVLink Rank Pairs
+
+- Decision demand: The architecture still inherited a left-biased module
+  helper, oversized process containers, labels that competed with box
+  boundaries, and one-dimensional rank abbreviations. This made LLMEngine look
+  off-center, allowed long local-module titles to approach their borders, and
+  obscured that every intermediate rank has the same four-module process
+  structure and belongs to a direct NVLink pair.
+- Decision plan: Replace coordinate patching with a geometry-first layout.
+  Center every title and subtitle on its owning rectangle, reserve whitespace
+  between process containers for inter-process labels, make outer containers
+  fit their contents, and represent the scalable worker topology with compact
+  two-by-two rank cards connected in explicit pairs.
+- Decision implementation: Rebuilt `generate_architecture.py` around centered
+  process-band and module primitives. Main Process, Control Plane Process, and
+  Data Plane Processes now use content-sized bounds. Full Rank 0 and Rank N-1
+  workers and compact Rank 1, Rank 2, Rank 3, and Rank N-2 workers all use a
+  two-by-two Scheduler, Block Manager, Model Runner, and KV Cache arrangement.
+  Rank 0--1, Rank 2--3, and Rank N-2--N-1 Model Runners are joined by green
+  bidirectional NVLink paths. The LLMEngine request/result path terminates at
+  the Data Plane Processes side midpoint, while control/data labels sit beside
+  their arrows in the gap between process borders. Long local-module titles
+  use centered two-line text, and repeated labels that could enter adjacent
+  rank cards were removed.
+- Decision result: Light and dark renders now keep all module text centered and
+  inside its owner, keep external labels out of module bounds, show scalable
+  rank/process multiplicity, and expose three representative direct-NVLink
+  pairs without a long payload line crossing unrelated ranks. The paper,
+  report, and both READMEs describe the same paired topology. Runtime behavior
+  is unchanged.
+
+## 2026-07-25: Make Figure Edges Match Runtime Component Boundaries
+
+- Decision demand: The architecture still hid the routing chain behind
+  process-level arrows, abbreviated modules inside compact ranks, and did not
+  label each pair-local payload edge as NVLink. The lifecycle figure mixed
+  several unrelated state colors and started Copy/Move paths inside their
+  decision diamond. The transfer cost figure merged saved-work inputs above
+  the admission diamond without visibly reaching its top vertex.
+- Decision plan: Draw communication between the concrete runtime owners,
+  preserve only the two endpoint rank pairs plus an ellipsis for scalability,
+  and make every connector terminate exactly at a module or decision border.
+  Use one restrained state color family for the lifecycle rather than encoding
+  undocumented semantics with color.
+- Decision implementation: `generate_architecture.py` now labels workers as
+  `Data Plane Process @ GPU Rank x`, expands every compact rank to the full
+  Local Scheduler, Local Block Manager, Model Runner, and Physical KV Cache
+  names, and shows Rank 0--1 and Rank N-2--N-1 Model Runner links with an
+  explicit `NVLink` label. LLMEngine exchanges route query/target-rank data
+  directly with Global Scheduler, dispatches the selected Sequence to a Local
+  Scheduler, and the control plane exchanges transfer phases and versioned
+  snapshots with concrete Local Block Managers. Process containers now use
+  near-background fills so their modules remain visually distinct.
+  `generate_block_lifecycle.py` applies one blue-green family to every state,
+  decision, and edge, and starts Copy/Move at the left/right diamond vertices.
+  `generate_cost_models.py` joins foreground and background saved-work inputs
+  immediately above the admission decision and connects the merged edge to the
+  diamond's top vertex.
+- Decision result: The synchronized paper/report light figures and README dark
+  figures expose routing, control, dispatch, and pair-local KV movement without
+  crossing labels or entering node interiors. The lifecycle and transfer-cost
+  decisions now have border-exact incoming and outgoing edges. These changes
+  only affect documentation assets; runtime routing and transfer behavior are
+  unchanged.
+
+## 2026-07-25: Separate Process Boundaries from Runtime Module Colors
+
+- Decision demand: The architecture process containers still reused the blue,
+  purple, and green colors of their internal modules, compact ranks reduced
+  module labels below the full-rank font size, and the Global Scheduler edge
+  visually ended at a worker boundary rather than at the component that
+  consumes routing and transfer decisions.
+- Decision plan: Treat process boundaries as neutral grouping regions, retain
+  semantic colors only for runtime modules, and keep compact ranks readable
+  without expanding the overall topology. Route every control edge to the
+  concrete component that owns the operation.
+- Decision implementation: `generate_architecture.py` now uses neutral gray
+  fills and borders for Main Process, Control Plane Process, Data Plane
+  Processes, and individual rank containers. Process headings use a distinct
+  deep blue in the light figure and a matching light blue in the dark figure.
+  Compact Rank 1 and Rank N-2 cards were widened, moved toward the central
+  ellipsis, and assigned the same per-module font sizes as full Rank 0 and
+  Rank N-1. The dashed Global Scheduler edge now enters Rank 0's Local
+  Scheduler directly and is labeled `routing target / transfer phases`;
+  Local Block Manager snapshots remain connected to Global Block Manager.
+- Decision result: Regenerated paper/report light assets and README dark assets
+  keep process grouping visually separate from scheduler, manager, runner, and
+  cache semantics. The scalable rank layout is denser without shrinking text,
+  and both the request dispatch and control-plane routing path visibly
+  terminate at Local Scheduler. This is a documentation-only change.
+
+## 2026-07-25: Use Uniform Full-Rank Architecture Cards
+
+- Decision demand: Mixed full and compact rank cards made paired NVLink edges
+  slightly diagonal, reduced the visual weight of intermediate workers, and
+  left excessive whitespace around the central ellipsis. Main Process and
+  Control Plane Process also used narrower containers than Data Plane
+  Processes, while arrow annotations were too small at paper scale.
+- Decision plan: Give every explicitly named rank the same complete process
+  representation, reserve the center only for an abstract multiplicity cue,
+  and align every pair-local transfer edge on a shared horizontal axis. Use
+  full-width process bands and one stronger annotation style throughout.
+- Decision implementation: `generate_architecture.py` now draws Rank 0, Rank 1,
+  Rank N-2, and Rank N-1 with identical-size two-by-two Local Scheduler, Local
+  Block Manager, Model Runner, and Physical KV Cache layouts. Mirrored cards
+  place paired Model Runners on the facing edges, making both labeled NVLink
+  payload arrows exactly horizontal. Four small neutral rank pairs with green
+  horizontal NVLink links surround the central ellipsis to represent the
+  omitted instances. Main Process, Control Plane Process, and Data Plane
+  Processes now share the same width. Arrow labels use larger bold text in
+  both light and dark themes.
+- Decision result: The regenerated paper/report and README figures present all
+  visible workers at equal importance, distinguish omitted multiplicity
+  without allocating another full card, and preserve horizontal transfer
+  geometry. Updated paper and report captions describe the same representation.
+  Runtime behavior remains unchanged.
+
+## 2026-07-25: Expose All Scheduler and Block-Metadata Connections
+
+- Decision demand: The architecture showed only representative control edges,
+  which could be read as Global Scheduler controlling one worker and Global
+  Block Manager receiving one worker snapshot. The scalable topology cue also
+  needed six paired instances, larger labels, and connectors with simple
+  orthogonal geometry.
+- Decision plan: Draw separate scheduler fan-out and block-metadata fan-in
+  buses. Every detailed Local Scheduler must receive a control branch from
+  Global Scheduler, and every detailed Local Block Manager must publish a
+  branch to Global Block Manager. Keep each bus segment straight and each
+  local branch to at most one bend, retain horizontal green NVLink links, and
+  enlarge labels without changing the process boundaries.
+- Decision implementation: `generate_architecture.py` now draws a blue dashed
+  routing/transfer-phase fan-out to all four detailed Local Schedulers and a
+  purple dashed versioned-snapshot fan-in from all four detailed Local Block
+  Managers. The central multiplicity cue contains six small NVLink-connected
+  pairs, three above and three below the ellipsis. Process headings render
+  above crossing lines, and all architecture annotations use the larger
+  shared font scale. The paper caption, both READMEs, and the technical report
+  describe the same component-level semantics.
+- Decision result: Regenerated light and dark architecture assets make the
+  global-to-local control relation and local-to-global metadata relation
+  explicit for every detailed rank. Visual inspection confirms horizontal
+  NVLink paths, border-terminated arrows, readable text, and no module-label
+  overflow. Runtime behavior is unchanged.
+
+## 2026-07-25: Rebase Paper Claims on the Latest Five-Trial Artifact
+
+- Decision demand: The paper, READMEs, and report still quoted the
+  `20260719T072508Z` batch after a new complete dual-model batch had been
+  produced at `20260725T031840Z`. The old text also overstated routing latency
+  gains and reduced the transfer microbenchmark to two calibration sizes.
+- Decision plan: Recompute every stated number directly from the latest JSON,
+  separate mechanism evidence from end-to-end evidence, retain negative
+  workload results, and use figures that show both relative effects and
+  absolute units with uncertainty.
+- Decision implementation: Updated the routing and session-handoff tables,
+  abstract, evaluation, conclusion, READMEs, paper guide, and report. Routing
+  is now reported as a 48.6--50.2% reduction in uncached prefill tokens with a
+  model-dependent TTFT result. Session handoff reports 4.4--7.4% throughput,
+  32.4--40.4% mean-TTFT, 9.3--12.9% mean-E2E, and 7.4--7.6% P90-E2E
+  improvements over round-robin multi-GPU. The transfer figure now plots the
+  1/2/4/8/16/32/64-block mean profile with an observed min--max band over two
+  models and three physical pairs. Absolute throughput and TTFT panels carry
+  95% confidence intervals from five trials.
+- Decision result: The public narrative now distinguishes three claims:
+  routing improves cached-token locality, the NVLink microbenchmark validates
+  and calibrates the packed data path, and session handoff demonstrates that
+  reuse can amortize transfer end to end. Load skew and memory skew remain
+  visible boundary results. The complete CPU suite passes with
+  `190 passed, 1 skipped`; the skipped case is the opt-in CUDA/NCCL integration
+  test. A local PDF build was not possible because neither `latexmk` nor
+  `pdflatex` is installed.
+
+## 2026-07-25: Rewrite the Paper as Continuous Academic Prose
+
+- Decision demand: The draft contained emphasized principle labels, numbered
+  contribution fragments, itemized metadata, and phase labels that read like
+  generated notes rather than a finished systems paper.
+- Decision plan: Preserve technically precise passages that already read
+  naturally, but replace list-like body text with connected paragraphs,
+  remove decorative bold and italic emphasis, and keep mathematical notation,
+  tables, and escaped LaTeX characters intact.
+- Decision implementation: Rewrote the abstract, principles, contributions,
+  global-metadata description, transfer protocol, baselines, limitations, and
+  related-work comparison in `example_paper.tex`. The routing discussion now
+  refers to load balance rather than conflating request concentration with
+  model/data parallelism. All `itemize`, body `textbf`, and body `emph`
+  constructs were removed.
+- Decision result: Static checks find no list environments or bold/italic body
+  emphasis, no stale artifact identifiers or headline metrics, no trailing
+  whitespace, and no `git diff --check` errors. Existing natural technical
+  passages and equations were retained rather than rewritten for stylistic
+  variation alone.

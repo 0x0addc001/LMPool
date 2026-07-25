@@ -42,8 +42,15 @@ The coverage is organized around the runtime structure:
 
 - `tests/test_benchmark_kv_transfer.py`
   - transfer block-count sweep parsing and validation
+  - collision-free unique FileStore rendezvous creation
   - model-shaped transfer-contract resolution
   - machine-readable schema-v2 JSON export contract
+  - plot-only figure regeneration from saved JSON
+
+- `tests/test_transfer_profile.py`
+  - physical-to-logical NVLink pair profile mapping
+  - monotonic P95 profile construction
+  - model/dtype KV bytes-per-block validation
 
 - `tests/test_control_plane.py`
   - control-plane routing
@@ -70,6 +77,8 @@ The coverage is organized around the runtime structure:
   - prefix-hit selection
   - free-space fallback
   - rebalance plan generation
+  - per-pair piecewise transfer-latency interpolation
+  - pair-by-size-bucket EWMA isolation
 
 - `tests/test_e2e.py`
   - LLMEngine ingress routing

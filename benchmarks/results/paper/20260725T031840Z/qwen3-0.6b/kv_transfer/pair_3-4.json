@@ -1,0 +1,142 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-25T03:20:27.150046+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca --dtype auto --block-size 256 --block-counts 1,2,4,8,16,32,64 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260725T031840Z/qwen3-0.6b/kv_transfer/pair_3-4.json --output-figure benchmarks/results/paper/20260725T031840Z/qwen3-0.6b/kv_transfer/pair_3-4.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "d495a96564999d812399e4bfc8120d7e6eddaffb",
+    "git_status": "M README.md\n M README_zh.md\n M assets/fig_transfer_cost_model_dark.png\n M benchmarks/PAPER_RUNBOOK.md\n M benchmarks/README.md\n M benchmarks/benchmark_e2e.py\n M benchmarks/benchmark_kv_transfer.py\n M benchmarks/run_paper_suite.sh\n M docs/flow/decisions.md\n M docs/paper/example_paper.tex\n M docs/paper/figures/fig_transfer_cost_model.png\n M docs/paper/figures/generate_cost_models.py\n M src/lmpool/engine/control_plane.py\n M src/lmpool/engine/global_scheduler.py\n M tests/README.md\n M tests/test_global_scheduler.py\n?? benchmarks/build_transfer_profile.py\n?? benchmarks/results/paper/20260725T031840Z/\n?? benchmarks/transfer_profile.py\n?? tests/test_transfer_profile.py",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "3,4",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8,16,32,64",
+      "iterations": 100,
+      "warmup": 20,
+      "output_json": "benchmarks/results/paper/20260725T031840Z/qwen3-0.6b/kv_transfer/pair_3-4.json",
+      "output_figure": "benchmarks/results/paper/20260725T031840Z/qwen3-0.6b/kv_transfer/pair_3-4.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "label": "Qwen/Qwen3-0.6B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 2.9636254897195613,
+      "p50_latency_ms": 2.923200499935774,
+      "p95_latency_ms": 3.5939146455348236,
+      "effective_bandwidth_gib_s": 9.22645256455378,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 4.249283080207533,
+      "p50_latency_ms": 4.2468750034458935,
+      "p95_latency_ms": 4.368859749592957,
+      "effective_bandwidth_gib_s": 12.869818029946146,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 5.305056549914298,
+      "p50_latency_ms": 5.3967194944561925,
+      "p95_latency_ms": 5.47050200002559,
+      "effective_bandwidth_gib_s": 20.617122356926984,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 7.349703289728495,
+      "p50_latency_ms": 7.246050499816192,
+      "p95_latency_ms": 8.383059555490036,
+      "effective_bandwidth_gib_s": 29.763106261134634,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 16,
+      "bytes_per_iteration": 469762048,
+      "gib_per_iteration": 0.4375,
+      "mean_latency_ms": 13.265854920100537,
+      "p50_latency_ms": 13.251114996819524,
+      "p95_latency_ms": 13.295456852574716,
+      "effective_bandwidth_gib_s": 32.979404843113144,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 32,
+      "bytes_per_iteration": 939524096,
+      "gib_per_iteration": 0.875,
+      "mean_latency_ms": 24.531970800162526,
+      "p50_latency_ms": 24.51977449891274,
+      "p95_latency_ms": 24.611037603244768,
+      "effective_bandwidth_gib_s": 35.667741785923006,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 64,
+      "bytes_per_iteration": 1879048192,
+      "gib_per_iteration": 1.75,
+      "mean_latency_ms": 47.88242585986154,
+      "p50_latency_ms": 47.869357997115,
+      "p95_latency_ms": 47.94229964973056,
+      "effective_bandwidth_gib_s": 36.54785589021242,
+      "data_validation": "passed"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+ M README.md
+ M README_zh.md
+ M assets/fig_transfer_cost_model_dark.png
+ M benchmarks/PAPER_RUNBOOK.md
+ M benchmarks/README.md
+ M benchmarks/benchmark_e2e.py
+ M benchmarks/benchmark_kv_transfer.py
+ M benchmarks/run_paper_suite.sh
+ M docs/flow/decisions.md
+ M docs/paper/example_paper.tex
+ M docs/paper/figures/fig_transfer_cost_model.png
+ M docs/paper/figures/generate_cost_models.py
+ M src/lmpool/engine/control_plane.py
+ M src/lmpool/engine/global_scheduler.py
+ M tests/README.md
+ M tests/test_benchmark_kv_transfer.py
+ M tests/test_global_scheduler.py
+?? benchmarks/build_transfer_profile.py
+?? benchmarks/results/paper/20260725T031840Z/
+?? benchmarks/transfer_profile.py
+?? tests/test_transfer_profile.py

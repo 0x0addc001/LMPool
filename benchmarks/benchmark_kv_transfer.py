@@ -9,7 +9,7 @@ Example:
   CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_kv_transfer.py \
     --model-name-or-path /path/to/Qwen3-0.6B \
     --block-size 256 \
-    --block-counts 1,2,4,8 \
+    --block-counts 1,2,4,8,16,32,64 \
     --iterations 100 \
     --warmup 20 \
     --output-json benchmarks/results/kv_transfer.json \
@@ -20,16 +20,17 @@ Notes:
   - The benchmark uses the existing kv_transfer.swap_in legacy API, whose
     semantic role is transfer-in / transfer-out.
   - Reported bandwidth counts both K and V tensors across all layers.
-  - Use --block-counts 1,2,4,8 for a paper-ready payload-size sweep.
+  - Use --block-counts 1,2,4,8,16,32,64 for a paper-ready latency profile.
 """
 
 import argparse
 import json
 import os
-import socket
+import queue
 import sys
 import statistics
 import time
+import uuid
 from pathlib import Path
 
 import torch
@@ -64,10 +65,11 @@ _TORCH_DTYPES = {
 }
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def _new_rendezvous_path() -> Path:
+    """Return a unique, not-yet-created FileStore path for one transfer case."""
+    return Path("/tmp") / (
+        f"lmpool-kv-transfer-{os.getpid()}-{uuid.uuid4().hex}.store"
+    )
 
 
 def _fill_source_blocks(kv_cache: torch.Tensor, blocks: list[int]) -> None:
@@ -87,13 +89,17 @@ def _check_target_blocks(kv_cache: torch.Tensor, src_blocks: list[int], dst_bloc
     return True
 
 
-def _worker(rank: int, args, port: int, result_queue) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
+def _worker(rank: int, args, rendezvous_path: str, result_queue) -> None:
+    # Each pair executes one transaction at a time by design, so eager-mode
+    # P2P serialization is expected rather than an accidental concurrency loss.
+    os.environ.setdefault(
+        "TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING",
+        "false",
+    )
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=f"file://{rendezvous_path}",
         world_size=2,
         rank=rank,
         device_id=torch.device(f"cuda:{rank}"),
@@ -180,6 +186,7 @@ def _worker(rank: int, args, port: int, result_queue) -> None:
         "rank": rank,
         "ok": bool(ok),
         "mean_ms": statistics.mean(measured_ms),
+        "p50_ms": statistics.median(measured_ms),
         "p95_ms": max(measured_ms) if len(measured_ms) < 2 else statistics.quantiles(measured_ms, n=20)[18],
         "bytes_per_iter": bytes_per_iter,
     })
@@ -219,6 +226,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--input-json",
+        default="",
+        help="Regenerate --output-figure from an existing result JSON without CUDA.",
+    )
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-figure", default="")
     return parser.parse_args(argv)
@@ -277,9 +289,12 @@ def run_transfer_case(args, num_transfer_blocks: int) -> dict:
     case_args.num_transfer_blocks = int(num_transfer_blocks)
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
-    port = _find_free_port()
+    rendezvous_path = _new_rendezvous_path()
     procs = [
-        ctx.Process(target=_worker, args=(rank, case_args, port, result_queue))
+        ctx.Process(
+            target=_worker,
+            args=(rank, case_args, str(rendezvous_path), result_queue),
+        )
         for rank in range(2)
     ]
     for proc in procs:
@@ -287,29 +302,38 @@ def run_transfer_case(args, num_transfer_blocks: int) -> dict:
 
     results = []
     deadline = time.time() + 300
+    exitcodes: list[int | None] = []
     try:
         while time.time() < deadline and len(results) < 2:
             try:
                 results.append(result_queue.get(timeout=1))
-            except Exception:
-                pass
+            except queue.Empty:
+                if any(
+                    proc.exitcode not in (None, 0)
+                    for proc in procs
+                ):
+                    break
     finally:
         for proc in procs:
             proc.join(timeout=20)
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=20)
+            exitcodes.append(proc.exitcode)
             proc.close()
         result_queue.close()
         result_queue.join_thread()
+        rendezvous_path.unlink(missing_ok=True)
 
     if len(results) != 2 or not all(item["ok"] for item in results):
         raise RuntimeError(
-            f"transfer validation failed for {num_transfer_blocks} blocks: {results}"
+            f"transfer validation failed for {num_transfer_blocks} blocks: "
+            f"results={results}, worker_exitcodes={exitcodes}"
         )
 
     rank1 = next(item for item in results if item["rank"] == 1)
     mean_ms = rank1["mean_ms"]
+    p50_ms = rank1["p50_ms"]
     p95_ms = rank1["p95_ms"]
     bytes_per_iter = rank1["bytes_per_iter"]
     gib = bytes_per_iter / (1024 ** 3)
@@ -319,6 +343,7 @@ def run_transfer_case(args, num_transfer_blocks: int) -> dict:
         "bytes_per_iteration": int(bytes_per_iter),
         "gib_per_iteration": float(gib),
         "mean_latency_ms": float(mean_ms),
+        "p50_latency_ms": float(p50_ms),
         "p95_latency_ms": float(p95_ms),
         "effective_bandwidth_gib_s": float(bandwidth),
         "data_validation": "passed",
@@ -356,26 +381,55 @@ def save_results_figure(
 
     labels = [str(item["num_transfer_blocks"]) for item in results]
     x = list(range(len(results)))
-    width = 0.36
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    width = 0.25
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.8))
     fig.suptitle(title, fontsize=13)
 
     mean_bars = axes[0].bar(
-        [value - width / 2 for value in x],
+        [value - width for value in x],
         [item["mean_latency_ms"] for item in results],
         width,
         label="Mean",
         color="#4477AA",
     )
+    p50_bars = axes[0].bar(
+        x,
+        [
+            item.get("p50_latency_ms", item["mean_latency_ms"])
+            for item in results
+        ],
+        width,
+        label="P50",
+        color="#CCBB44",
+    )
     p95_bars = axes[0].bar(
-        [value + width / 2 for value in x],
+        [value + width for value in x],
         [item["p95_latency_ms"] for item in results],
         width,
         label="P95",
         color="#EE6677",
     )
-    axes[0].bar_label(mean_bars, fmt="%.2f", fontsize=8, padding=2)
-    axes[0].bar_label(p95_bars, fmt="%.2f", fontsize=8, padding=2)
+    # Close mean/P50/P95 values are common after warmup. Stagger labels
+    # vertically instead of rotating them or allowing three values to overlap.
+    for bars, padding in zip(
+        (mean_bars, p50_bars, p95_bars),
+        (2, 11, 20),
+    ):
+        axes[0].bar_label(
+            bars,
+            fmt="%.2f",
+            fontsize=7.5,
+            padding=padding,
+        )
+    max_latency_ms = max(
+        max(
+            item["mean_latency_ms"],
+            item.get("p50_latency_ms", item["mean_latency_ms"]),
+            item["p95_latency_ms"],
+        )
+        for item in results
+    )
+    axes[0].set_ylim(0, max_latency_ms * 1.15)
     axes[0].set_title("KV Transfer Latency")
     axes[0].set_ylabel("Latency (ms)")
     axes[0].set_xticks(x, labels)
@@ -401,8 +455,38 @@ def save_results_figure(
     print(f"saved figure: {output}")
 
 
+def regenerate_figure_from_json(input_path: str, output_path: str) -> None:
+    """Render an existing microbenchmark artifact without rerunning GPUs."""
+    source = Path(input_path)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise ValueError(f"{source} contains no transfer results")
+    model_label = (
+        payload.get("metadata", {})
+        .get("model", {})
+        .get("label", "unknown model")
+    )
+    save_results_figure(
+        results,
+        output_path,
+        title=f"KV Transfer Microbenchmark: {model_label}",
+    )
+
+
 def main() -> None:
     args = parse_args()
+    if args.input_json:
+        if not args.output_figure:
+            raise SystemExit("--input-json requires --output-figure")
+        try:
+            regenerate_figure_from_json(
+                args.input_json,
+                args.output_figure,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot regenerate transfer figure: {exc}") from exc
+        return
     try:
         args, model_metadata, resolved_config = resolve_transfer_contract(args)
     except (OSError, ValueError) as exc:
@@ -436,7 +520,7 @@ def main() -> None:
     print("KV Transfer Benchmark")
     print("=" * 80)
     print(
-        f"{'blocks':>8} {'payload(GiB)':>14} {'mean(ms)':>12} "
+        f"{'blocks':>8} {'payload(GiB)':>14} {'mean(ms)':>12} {'p50(ms)':>12} "
         f"{'p95(ms)':>12} {'bandwidth(GiB/s)':>18} {'validation':>12}"
     )
     for result in results:
@@ -444,6 +528,7 @@ def main() -> None:
             f"{result['num_transfer_blocks']:>8d} "
             f"{result['gib_per_iteration']:>14.3f} "
             f"{result['mean_latency_ms']:>12.3f} "
+            f"{result['p50_latency_ms']:>12.3f} "
             f"{result['p95_latency_ms']:>12.3f} "
             f"{result['effective_bandwidth_gib_s']:>18.2f} "
             f"{result['data_validation']:>12}"

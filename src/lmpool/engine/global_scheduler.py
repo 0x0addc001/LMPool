@@ -68,8 +68,11 @@ class GlobalScheduler:
         self.head_dim = 128
         self.kv_dtype_bytes = 2
         self.transfer_bandwidth_gib_s = 3.5
-        self.transfer_fixed_latency_ms = 2.0
-        self.transfer_interference_multiplier = 1.5
+        # The offline profile measures an idle packed data path. Admission adds
+        # a conservative loaded-serving transaction residual before scaling
+        # only the payload-varying latency. Pair/size observations may raise it.
+        self.transfer_fixed_latency_ms = 40.0
+        self.transfer_interference_multiplier = 1.2
         self.prefill_token_time_ms = 0.02
         self.prefill_observation_discount = 0.5
         self.prefill_observation_ewma_alpha = 0.2
@@ -79,6 +82,22 @@ class GlobalScheduler:
         self.observed_transfer_extra_ms: float | None = None
         self.observed_transfer_extra_ms_by_pair: dict[tuple[int, int], float] = {}
         self.observed_placement_extra_ms_by_pair: dict[tuple[int, int], float] = {}
+        self.transfer_latency_profile_default: list[tuple[int, float]] = []
+        self.transfer_latency_profile_by_pair: dict[
+            tuple[int, int], list[tuple[int, float]]
+        ] = {}
+        self.observed_transfer_extra_ms_by_pair_bucket: dict[
+            tuple[tuple[int, int], int], float
+        ] = {}
+        self.observed_placement_extra_ms_by_pair_bucket: dict[
+            tuple[tuple[int, int], int], float
+        ] = {}
+        self.transfer_observation_count_by_pair_bucket: dict[
+            tuple[tuple[int, int], int], int
+        ] = {}
+        self.placement_observation_count_by_pair_bucket: dict[
+            tuple[tuple[int, int], int], int
+        ] = {}
 
     # ------------------------------------------------------------------
     # 请求路由
@@ -967,40 +986,204 @@ class GlobalScheduler:
     def _pair_key(src_gpu: int, dst_gpu: int) -> tuple[int, int]:
         return tuple(sorted((int(src_gpu), int(dst_gpu))))
 
+    @staticmethod
+    def _normalize_latency_points(raw_points) -> list[tuple[int, float]]:
+        points: list[tuple[int, float]] = []
+        for raw_point in raw_points or []:
+            if isinstance(raw_point, dict):
+                transfer_bytes = int(raw_point.get("bytes", 0))
+                latency_ms = float(raw_point.get("latency_ms", 0.0))
+            else:
+                transfer_bytes = int(raw_point[0])
+                latency_ms = float(raw_point[1])
+            if transfer_bytes <= 0 or latency_ms <= 0:
+                continue
+            points.append((transfer_bytes, latency_ms))
+        points.sort()
+
+        # The calibrated P95 should be non-decreasing with payload size. Keep
+        # the profile conservative when finite benchmark noise violates that
+        # physical constraint.
+        normalized: list[tuple[int, float]] = []
+        max_latency_ms = 0.0
+        for transfer_bytes, latency_ms in points:
+            max_latency_ms = max(max_latency_ms, latency_ms)
+            if normalized and normalized[-1][0] == transfer_bytes:
+                normalized[-1] = (
+                    transfer_bytes,
+                    max(normalized[-1][1], max_latency_ms),
+                )
+            else:
+                normalized.append((transfer_bytes, max_latency_ms))
+        return normalized
+
+    def set_transfer_latency_profile(self, profile: dict | None) -> None:
+        """Install a benchmark-calibrated, logical-pair latency profile."""
+        self.transfer_latency_profile_default = []
+        self.transfer_latency_profile_by_pair.clear()
+        if not profile:
+            return
+
+        self.transfer_latency_profile_default = self._normalize_latency_points(
+            profile.get("default_points", [])
+        )
+        for raw_pair, entry in (profile.get("pairs") or {}).items():
+            if isinstance(raw_pair, str):
+                pair_parts = raw_pair.split(",")
+            else:
+                pair_parts = list(raw_pair)
+            if len(pair_parts) != 2:
+                continue
+            pair = self._pair_key(int(pair_parts[0]), int(pair_parts[1]))
+            raw_points = entry.get("points", []) if isinstance(entry, dict) else entry
+            points = self._normalize_latency_points(raw_points)
+            if points:
+                self.transfer_latency_profile_by_pair[pair] = points
+
+    def _profile_points(
+        self,
+        src_gpu: int | None,
+        dst_gpu: int | None,
+    ) -> list[tuple[int, float]]:
+        if src_gpu is not None and dst_gpu is not None:
+            points = self.transfer_latency_profile_by_pair.get(
+                self._pair_key(src_gpu, dst_gpu)
+            )
+            if points:
+                return points
+        return self.transfer_latency_profile_default
+
+    @staticmethod
+    def _interpolate_latency_ms(
+        transfer_bytes: int,
+        points: list[tuple[int, float]],
+    ) -> float:
+        size = max(0, int(transfer_bytes))
+        if not points or size <= 0:
+            return 0.0
+        if size <= points[0][0]:
+            return points[0][1]
+
+        for (left_bytes, left_ms), (right_bytes, right_ms) in zip(
+            points,
+            points[1:],
+        ):
+            if size <= right_bytes:
+                fraction = (size - left_bytes) / max(1, right_bytes - left_bytes)
+                return left_ms + fraction * (right_ms - left_ms)
+
+        last_bytes, last_ms = points[-1]
+        if len(points) == 1:
+            tail_slope_ms_per_byte = last_ms / last_bytes
+        else:
+            previous_bytes, previous_ms = points[-2]
+            tail_slope_ms_per_byte = max(
+                0.0,
+                (last_ms - previous_ms) / max(1, last_bytes - previous_bytes),
+            )
+            if tail_slope_ms_per_byte == 0.0:
+                tail_slope_ms_per_byte = last_ms / last_bytes
+        return last_ms + (size - last_bytes) * tail_slope_ms_per_byte
+
+    def _transfer_data_path_latency_ms(
+        self,
+        transfer_bytes: int,
+        src_gpu: int | None = None,
+        dst_gpu: int | None = None,
+    ) -> tuple[float, bool]:
+        points = self._profile_points(src_gpu, dst_gpu)
+        if points:
+            return (
+                self._interpolate_latency_ms(transfer_bytes, points),
+                True,
+            )
+        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
+        wire_ms = max(0, int(transfer_bytes)) / bandwidth_bytes_s * 1000.0
+        return wire_ms, False
+
+    def _transfer_size_bucket_blocks(self, transfer_bytes: int) -> int:
+        bytes_per_block = max(1, self._estimate_transfer_bytes(1))
+        block_count = max(
+            1,
+            (max(0, int(transfer_bytes)) + bytes_per_block - 1) // bytes_per_block,
+        )
+        return 1 << (block_count - 1).bit_length()
+
+    def _observation_key(
+        self,
+        transfer_bytes: int,
+        src_gpu: int,
+        dst_gpu: int,
+    ) -> tuple[tuple[int, int], int]:
+        return (
+            self._pair_key(src_gpu, dst_gpu),
+            self._transfer_size_bucket_blocks(transfer_bytes),
+        )
+
+    def _static_transfer_cost_ms(
+        self,
+        transfer_bytes: int,
+        src_gpu: int | None,
+        dst_gpu: int | None,
+    ) -> tuple[float, float, bool]:
+        data_path_ms, has_profile = self._transfer_data_path_latency_ms(
+            transfer_bytes,
+            src_gpu,
+            dst_gpu,
+        )
+        static_cost_ms = (
+            self.transfer_fixed_latency_ms
+            + data_path_ms * self.transfer_interference_multiplier
+        )
+        return static_cost_ms, data_path_ms, has_profile
+
     def _estimate_transfer_cost_ms(
         self,
         transfer_bytes: int,
         src_gpu: int | None = None,
         dst_gpu: int | None = None,
     ) -> float:
-        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
-        wire_ms = max(0, int(transfer_bytes)) / bandwidth_bytes_s * 1000.0
-        static_cost_ms = (
-            self.transfer_fixed_latency_ms
-            + wire_ms * self.transfer_interference_multiplier
-        ) * self.transfer_cost_weight
-        observed_extra_ms = self.observed_transfer_extra_ms
-        if src_gpu is not None and dst_gpu is not None:
-            observed_extra_ms = self.observed_transfer_extra_ms_by_pair.get(
-                self._pair_key(src_gpu, dst_gpu),
-                None,
+        static_cost_ms, data_path_ms, has_profile = self._static_transfer_cost_ms(
+            transfer_bytes,
+            src_gpu,
+            dst_gpu,
+        )
+        observed_extra_ms = None
+        placement_extra_ms = None
+        if src_gpu is not None and dst_gpu is not None and has_profile:
+            observation_key = self._observation_key(
+                transfer_bytes,
+                src_gpu,
+                dst_gpu,
             )
+            observed_extra_ms = (
+                self.observed_transfer_extra_ms_by_pair_bucket.get(observation_key)
+            )
+            placement_extra_ms = (
+                self.observed_placement_extra_ms_by_pair_bucket.get(observation_key)
+            )
+        elif src_gpu is not None and dst_gpu is not None:
+            pair = self._pair_key(src_gpu, dst_gpu)
+            observed_extra_ms = self.observed_transfer_extra_ms_by_pair.get(pair)
+            placement_extra_ms = self.observed_placement_extra_ms_by_pair.get(pair)
+        else:
+            observed_extra_ms = self.observed_transfer_extra_ms
+
         observed_cost_ms = (
-            (wire_ms + observed_extra_ms) * self.transfer_cost_weight
+            (data_path_ms + observed_extra_ms) * self.transfer_cost_weight
             if observed_extra_ms is not None
             else 0.0
         )
-        placement_extra_ms = None
-        if src_gpu is not None and dst_gpu is not None:
-            placement_extra_ms = self.observed_placement_extra_ms_by_pair.get(
-                self._pair_key(src_gpu, dst_gpu)
-            )
         placement_cost_ms = (
-            (wire_ms + placement_extra_ms) * self.transfer_cost_weight
+            (static_cost_ms + placement_extra_ms) * self.transfer_cost_weight
             if placement_extra_ms is not None
             else 0.0
         )
-        return max(static_cost_ms, observed_cost_ms, placement_cost_ms)
+        return max(
+            static_cost_ms * self.transfer_cost_weight,
+            observed_cost_ms,
+            placement_cost_ms,
+        )
 
     def observe_transfer(
         self,
@@ -1012,9 +1195,12 @@ class GlobalScheduler:
         """Update online transfer overhead from a completed source operation."""
         if transfer_bytes <= 0 or elapsed_s <= 0:
             return
-        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
-        wire_ms = transfer_bytes / bandwidth_bytes_s * 1000.0
-        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - wire_ms)
+        data_path_ms, has_profile = self._transfer_data_path_latency_ms(
+            transfer_bytes,
+            src_gpu,
+            dst_gpu,
+        )
+        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - data_path_ms)
         alpha = min(1.0, max(0.0, self.transfer_cost_ewma_alpha))
         if self.observed_transfer_extra_ms is None:
             self.observed_transfer_extra_ms = observed_extra_ms
@@ -1031,6 +1217,27 @@ class GlobalScheduler:
                 if previous is None
                 else alpha * observed_extra_ms + (1.0 - alpha) * previous
             )
+            if has_profile:
+                observation_key = self._observation_key(
+                    transfer_bytes,
+                    src_gpu,
+                    dst_gpu,
+                )
+                previous = self.observed_transfer_extra_ms_by_pair_bucket.get(
+                    observation_key
+                )
+                self.observed_transfer_extra_ms_by_pair_bucket[observation_key] = (
+                    observed_extra_ms
+                    if previous is None
+                    else alpha * observed_extra_ms + (1.0 - alpha) * previous
+                )
+                self.transfer_observation_count_by_pair_bucket[observation_key] = (
+                    self.transfer_observation_count_by_pair_bucket.get(
+                        observation_key,
+                        0,
+                    )
+                    + 1
+                )
 
     def observe_placement(
         self,
@@ -1042,27 +1249,45 @@ class GlobalScheduler:
         """Learn plan cost from dispatch through destination commit."""
         if transfer_bytes <= 0 or elapsed_s <= 0:
             return
-        bandwidth_bytes_s = max(self.transfer_bandwidth_gib_s, 1e-6) * (1024 ** 3)
-        wire_ms = transfer_bytes / bandwidth_bytes_s * 1000.0
-        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - wire_ms)
+        static_cost_ms, _, has_profile = self._static_transfer_cost_ms(
+            transfer_bytes,
+            src_gpu,
+            dst_gpu,
+        )
+        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - static_cost_ms)
         pair = self._pair_key(src_gpu, dst_gpu)
         alpha = min(1.0, max(0.0, self.transfer_cost_ewma_alpha))
         # The first dispatch-to-commit sample includes process wake-up and
         # allocator cold-start jitter. Blend it with the calibrated static
         # prior instead of allowing one outlier to reject the rest of a
         # forecast batch.
-        static_extra_ms = max(
-            0.0,
-            self.transfer_fixed_latency_ms
-            + wire_ms * (self.transfer_interference_multiplier - 1.0),
-        )
         previous = self.observed_placement_extra_ms_by_pair.get(
             pair,
-            static_extra_ms,
+            0.0,
         )
         self.observed_placement_extra_ms_by_pair[pair] = (
             alpha * observed_extra_ms + (1.0 - alpha) * previous
         )
+        if has_profile:
+            observation_key = self._observation_key(
+                transfer_bytes,
+                src_gpu,
+                dst_gpu,
+            )
+            previous = self.observed_placement_extra_ms_by_pair_bucket.get(
+                observation_key,
+                0.0,
+            )
+            self.observed_placement_extra_ms_by_pair_bucket[observation_key] = (
+                alpha * observed_extra_ms + (1.0 - alpha) * previous
+            )
+            self.placement_observation_count_by_pair_bucket[observation_key] = (
+                self.placement_observation_count_by_pair_bucket.get(
+                    observation_key,
+                    0,
+                )
+                + 1
+            )
 
     def observe_prefill(
         self,
