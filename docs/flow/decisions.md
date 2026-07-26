@@ -2470,7 +2470,7 @@ decision demand, decision plan, decision implementation, and decision result.
   and replicated control-plane recovery. Added a 17-frame Beamer deck at
   `docs/slide/lmpool_oral.tex`, a 15-minute slide-by-slide script at
   `docs/script/lmpool_oral_script.md`, and a 35-question defense guide at
-  `docs/faq/lmpool_oral_faq.md`. The materials include the complete request
+  `docs/query/lmpool_oral_qa.md`. The materials include the complete request
   lifecycle, routing and transfer decisions, transaction safety, evidence
   boundaries, and the exact role of the forecast-assisted handoff workload.
 - Decision result: The current-facing documentation no longer presents the
@@ -2479,3 +2479,63 @@ decision demand, decision plan, decision implementation, and decision result.
   and load-skew boundary results. Static checks confirm balanced slide
   environments and existing image dependencies; PDF compilation remains
   unavailable because the workspace has no TeX engine.
+
+## 2026-07-26: Oral QA, Timed Scripts, and Slide Alignment
+
+- Decision demand: The oral materials needed precise follow-up answers for
+  routing, versioning, publication, cost admission, placement leases, and
+  workload semantics. The presentation also needed a realistic ten-minute
+  script, a retained fifteen-minute version, stronger slide-to-script
+  alignment, complete transfer-profile data, and a consistent single-author
+  voice.
+- Decision plan: Trace every technical answer to the current control-plane,
+  block-manager, transfer, benchmark, and result code paths. Preserve the
+  seventeen-slide narrative, write separate timed scripts with explicit
+  pointer cues, and revise the slide deck only where the requested explanation
+  or visual evidence was missing.
+- Decision implementation: Expanded `docs/qa/qa_20260728.md` with the ingress
+  rank sentinel, bounded-spill semantics, four versioning layers, the
+  prepare--publish visibility boundary, pair-and-size EWMA admission, profile
+  interpolation and tail extrapolation, placement leases, rejection and
+  admission boundaries, model-size interpretation, warm-up phases, P2P
+  ordering, publication semantics, and forecast limitations. Rewrote
+  `docs/script/script_20260728.md` as a pointer-aligned ten-minute script and
+  added `docs/script/script_20260728_15min.md` as the detailed fifteen-minute
+  version. Updated `docs/slide/slide_20260728.tex` with a raised footer,
+  complete route-cost symbols, the transfer cost-model and background
+  placement flows, all seven measured block-count rows, and unambiguous bold
+  performance ranges. Current-facing paper and presentation prose now uses
+  `I` and `my` instead of `we` and `our`.
+- Decision result: The short script contains about 859 spoken English words,
+  leaving time for pointer movement and pauses, while the detailed script
+  contains about 1,816 words. The current paper title remains
+  `LMPool: Locality-Aware Routing and NVLink KV-Cache Transfer for Multi-GPU
+  LLM Serving` because it names both design principles, the transport, and the
+  evaluation setting without claiming production-system superiority. Static
+  checks cover LaTeX environment balance, image references, pronoun
+  consistency, and whitespace; PDF rendering remains unavailable because no
+  TeX engine is installed.
+
+## 2026-07-26: Bilingual QA and HKUST Presentation Branding
+
+- Decision demand: The oral-defense guide needed separate English and Chinese
+  files with matching technical coverage. The slide deck also needed an
+  acknowledgment frame and one consistent HKUST blue across the theme and
+  embedded blue diagrams.
+- Decision plan: Preserve the complete Chinese guide as the `_zh` variant,
+  translate all thirty-five questions and follow-ups into an English primary
+  file, use the official HKUST Pantone 285 web value, and keep green reserved
+  for NVLink transfer so that transport remains visually distinct.
+- Decision implementation: Moved the Chinese guide to
+  `docs/qa/qa_20260728_zh.md` and created the corresponding English guide at
+  `docs/qa/qa_20260728.md`. Changed `LMBlue` to HKUST blue `#0074BC`, updated
+  the slide-local architecture and KV lifecycle generators, regenerated their
+  PNG and PDF outputs, and added an eighteenth acknowledgment frame. Both
+  timed scripts now include that final frame without extending their stated
+  durations.
+- Decision result: English and Chinese guides each retain thirty-five numbered
+  questions and the two requested follow-ups. The deck has eighteen balanced
+  frames, the slide theme and blue figure elements use HKUST blue, and the
+  green NVLink path remains distinguishable. Static and visual checks cover
+  structure, generated assets, wording, and file references; PDF compilation
+  remains unavailable because the workspace has no TeX engine.

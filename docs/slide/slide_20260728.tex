@@ -6,9 +6,9 @@
 \usepackage{array}
 \usepackage{xcolor}
 
-\graphicspath{{../paper/figures/}}
+\graphicspath{{figures/}}
 
-\definecolor{LMBlue}{HTML}{315A7D}
+\definecolor{LMBlue}{HTML}{0074BC}
 \definecolor{LMGreen}{HTML}{4F8A70}
 \definecolor{LMGold}{HTML}{C28E52}
 \definecolor{LMPurple}{HTML}{76638A}
@@ -33,13 +33,14 @@
 \setbeamertemplate{footline}{
   \leavevmode
   \hbox{
-    \begin{beamercolorbox}[wd=.82\paperwidth,ht=2.7ex,dp=1.2ex,leftskip=1em]{author in head/foot}
+    \begin{beamercolorbox}[wd=.82\paperwidth,ht=3.0ex,dp=1.7ex,leftskip=1em]{author in head/foot}
       \color{LMMuted}\scriptsize LMPool: Locality-Aware Routing and NVLink KV-Cache Transfer
     \end{beamercolorbox}
-    \begin{beamercolorbox}[wd=.18\paperwidth,ht=2.7ex,dp=1.2ex,rightskip=1em plus1fil]{date in head/foot}
+    \begin{beamercolorbox}[wd=.18\paperwidth,ht=3.0ex,dp=1.7ex,rightskip=1em plus1fil]{date in head/foot}
       \color{LMMuted}\scriptsize \insertframenumber/\inserttotalframenumber
     \end{beamercolorbox}
   }
+  \vskip0.3em
 }
 
 \newcommand{\sys}{LMPool}
@@ -51,7 +52,7 @@
 \subtitle{Locality-Aware Routing and NVLink KV-Cache Transfer for Multi-GPU LLM Serving}
 \author{Jialiang Li}
 \institute{The Hong Kong University of Science and Technology}
-\date{MLSys Oral Presentation}
+\date{July 28th 2026}
 
 \begin{document}
 
@@ -136,7 +137,7 @@
 
 \begin{frame}{KV-Aware Routing}
   \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.52\textwidth}
+    \begin{column}{0.49\textwidth}
       \small
       For candidate GPU $g$:
       \begin{align*}
@@ -145,22 +146,26 @@
         A_g &= \max(0,n_g-F_g),\\
         C_{\mathrm{route}}(g) &= Q_g + w_pM_g + w_eA_gS.
       \end{align*}
-      \begin{itemize}
-        \item $h_g$: longest contiguous ready prefix
-        \item $Q_g$: queued, pending, and running work
-        \item $A_g$: dependency-safe reclamation pressure
-      \end{itemize}
-    \end{column}
-    \begin{column}{0.44\textwidth}
-      \begin{block}{Ingress candidates}
-        All healthy replicas; the request has no initial GPU.
-      \end{block}
-      \begin{block}{Bounded spill}
-        Bypass a prefix owner only when its load is sufficiently higher and extra recomputation remains bounded.
-      \end{block}
-      \begin{alertblock}{Objective}
-        Minimize projected completion cost, not maximize hit rate.
+      \vspace{-0.5em}
+      \begin{alertblock}{Decision}
+        Select the feasible rank with minimum projected token-equivalent work.
       \end{alertblock}
+    \end{column}
+    \begin{column}{0.47\textwidth}
+      \scriptsize
+      \begin{itemize}
+        \item $R$: required prompt blocks; $N$: prompt tokens
+        \item $S$: tokens per block; $h_g$: contiguous ready blocks
+        \item $n_g$: missing blocks; $M_g$: missing prefill tokens
+        \item $F_g$: currently free blocks
+        \item $A_g$: missing blocks beyond $F_g$, hence reclaim pressure
+        \item $Q_g$: queued, pending, and running token-equivalent work
+        \item $w_p,w_e$: prefill and reclaim cost weights
+      \end{itemize}
+      \vspace{0.1em}
+      \begin{block}{Bounded spill}
+        Bypass an overloaded owner only when additional recomputation remains bounded.
+      \end{block}
     \end{column}
   \end{columns}
 \end{frame}
@@ -177,28 +182,14 @@
 \end{frame}
 
 \begin{frame}{Cost-Gated Transfer Admission}
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.56\textwidth}
-      \small
-      \begin{align*}
-        T_{\mathrm{data}}^{p}(X) &= \operatorname{PWL}(X;\mathcal{P}_p),\\
-        T_{\mathrm{static}}^{p}(X) &= (40\text{ ms}+1.2T_{\mathrm{data}}^{p}(X)),\\
-        T_{\mathrm{xfer}} &= \max\{T_{\mathrm{static}},T_{\mathrm{source\ EWMA}},
-          T_{\mathrm{placement\ EWMA}}\},\\
-        \text{admit} &\Longleftrightarrow T_{\mathrm{save}}\geq\rho T_{\mathrm{xfer}}.
-      \end{align*}
-    \end{column}
-    \begin{column}{0.40\textwidth}
-      \begin{itemize}
-        \item Pair-specific P95 profile for 1/2/4/8/16/32/64 blocks
-        \item Separate nonnegative EWMA residuals by pair and size bucket
-        \item Source generation and target capacity revalidated before execution
-      \end{itemize}
-      \begin{alertblock}{Important qualification}
-        40 ms is a conservative manual cold-start prior, not a fitted standalone-pilot result.
-      \end{alertblock}
-    \end{column}
-  \end{columns}
+  \begin{center}
+    \includegraphics[width=0.94\textwidth,height=0.72\textheight,keepaspectratio]{fig_transfer_cost_model.png}
+  \end{center}
+  \vspace{-0.5em}
+  \begin{center}
+    \small Paper setting: $T_{\mathrm{fixed}}=40$ ms and interference $=1.2$.
+    The fixed term is a conservative manual prior.
+  \end{center}
 \end{frame}
 
 \begin{frame}{Evaluation Design}
@@ -254,59 +245,55 @@
 \end{frame}
 
 \begin{frame}{NVLink Data-Path Calibration}
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.54\textwidth}
-      \begin{center}
-        \begin{tabular}{@{}rrrr@{}}
-          \toprule
-          Blocks & Payload & Mean Latency & Bandwidth \\
-          \midrule
-          4 & 0.109 GiB & 4.73--5.34 ms & 20.5--23.1 GiB/s \\
-          8 & 0.219 GiB & 7.27--8.15 ms & 26.8--30.1 GiB/s \\
-          64 & 1.750 GiB & -- & 36.5 GiB/s mean \\
-          \bottomrule
-        \end{tabular}
-      \end{center}
-    \end{column}
-    \begin{column}{0.42\textwidth}
-      \begin{itemize}
-        \item Payload doubles from 4 to 8 blocks.
-        \item Latency rises only 52--54\%.
-        \item Larger plans amortize launch, gather, synchronization, and scatter.
-        \item Destination data validation passes byte for byte.
-      \end{itemize}
-    \end{column}
-  \end{columns}
-  \vspace{0.8em}
+  \scriptsize
+  \begin{center}
+    \begin{tabular}{@{}rrrr@{}}
+      \toprule
+      Blocks & Payload (GiB) & Mean Latency (ms) & Bandwidth (GiB/s) \\
+      \midrule
+       1 & 0.027 &  2.96--3.66 &  7.47--9.23 \\
+       2 & 0.055 &  3.55--5.03 & 10.87--15.40 \\
+       4 & 0.109 &  4.73--5.34 & 20.48--23.14 \\
+       8 & 0.219 &  7.27--8.15 & 26.85--30.08 \\
+      16 & 0.438 & 13.27--13.53 & 32.33--32.98 \\
+      32 & 0.875 & 24.41--24.58 & 35.60--35.84 \\
+      64 & 1.750 & 47.88--48.04 & 36.43--36.55 \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+  \vspace{0.35em}
+  \begin{center}
+    \small Ranges span two models and three NVLink pairs; every destination validation passed.
+  \end{center}
+  \vspace{0.25em}
   \begin{alertblock}{Interpretation}
-    This validates and calibrates the data path; it does not by itself prove serving benefit.
+    Larger plans amortize launch, gather, synchronization, and scatter. This calibrates the data path; it does not by itself prove serving benefit.
   \end{alertblock}
 \end{frame}
 
 \begin{frame}{Forecast-Assisted Session Handoff}
   \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.47\textwidth}
+    \begin{column}{0.39\textwidth}
       \begin{block}{Warm-up phase}
-        32 session prefixes are created on source GPUs.
+        One request for each of 32 prefix groups runs on the source side.
       \end{block}
-      \vspace{0.5em}
       \begin{block}{Placement boundary}
-        The benchmark supplies exact demand for 96 queued reuse requests. \sys{} copies 224 hot blocks in three pair plans.
+        Exact demand for 96 queued reuse requests triggers 224 copied blocks in three pair plans.
       \end{block}
-      \vspace{0.5em}
       \begin{block}{Reuse phase}
         Placement leases distribute matching requests across source and replica.
       \end{block}
     \end{column}
-    \begin{column}{0.48\textwidth}
-      \begin{alertblock}{What this experiment proves}
-        Routing and transfer can compose when future reuse is known early enough.
-      \end{alertblock}
-      \begin{alertblock}{What it does not prove}
-        The current system does not evaluate an online demand predictor.
-      \end{alertblock}
+    \begin{column}{0.58\textwidth}
+      \begin{center}
+        \includegraphics[width=\textwidth,height=0.66\textheight,keepaspectratio]{fig_hot_prefix_decision.png}
+      \end{center}
     \end{column}
   \end{columns}
+  \vspace{0.2em}
+  \begin{alertblock}{Scope}
+    This tests placement under exact future demand; it does not evaluate an online predictor.
+  \end{alertblock}
 \end{frame}
 
 \begin{frame}{End-to-End Handoff Results}
@@ -328,9 +315,9 @@
   \end{center}
   \vspace{0.7em}
   \begin{center}
-    \large Throughput \good{+4.4--7.4\%}\quad
-    TTFT \good{$-32.4$--$-40.4$\%}\quad
-    E2E \good{$-9.3$--$-12.9$\%}
+    \large Throughput: \good{+4.4\% to +7.4\%}\quad
+    TTFT: \good{32.4\% to 40.4\% lower}\quad
+    E2E: \good{9.3\% to 12.9\% lower}
   \end{center}
 \end{frame}
 
@@ -408,6 +395,32 @@
   \vfill
   \begin{center}
     \small Source: \url{https://github.com/0x0addc001/LMPool}
+  \end{center}
+\end{frame}
+
+\begin{frame}[plain]
+  \begin{center}
+    \vspace{1.0em}
+    {\color{LMBlue}\Huge\bfseries Thank You}
+
+    \vspace{1.2em}
+    {\Large Acknowledgments}
+
+    \vspace{0.8em}
+    \begin{minipage}{0.72\textwidth}
+      \centering
+      Thank you for listening and thank Prof. Kai Chen and Yijun Sun for their guidance and feedback.
+    \end{minipage}
+
+    \vspace{1.4em}
+    {\Large\color{LMBlue}\bfseries Questions?}
+
+    \vfill
+    \small
+    Jialiang Li \quad The Hong Kong University of Science and Technology
+
+    \vspace{0.35em}
+    \url{https://github.com/0x0addc001/LMPool}
   \end{center}
 \end{frame}
 
