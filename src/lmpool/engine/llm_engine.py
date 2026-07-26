@@ -68,6 +68,9 @@ class LLMEngine:
 
         self.remote_finished = set()
         self.remote_inflight_seq_ids = set()
+        self.first_token_timestamps: dict[int, float] = {}
+        self.finished_timestamps: dict[int, float] = {}
+        self._timestamp_cleanup_seq_ids: set[int] = set()
 
         if self.world_size > 1 and self.config.get('enable_global_pool', False) and self.config.get('use_control_plane_process', True):
             self.control_plane_request_queue = self._mp_ctx.Queue()
@@ -179,6 +182,10 @@ class LLMEngine:
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
     def _drain_worker_messages(self) -> tuple[list[tuple[int, list[int]]], list[tuple[int, int]], list[dict], list[dict]]:
+        for seq_id in self._timestamp_cleanup_seq_ids:
+            self.first_token_timestamps.pop(seq_id, None)
+            self.finished_timestamps.pop(seq_id, None)
+        self._timestamp_cleanup_seq_ids.clear()
         finished = []
         first_tokens = []
         prefill_stats = []
@@ -196,11 +203,18 @@ class LLMEngine:
                             self.remote_finished.discard(target)
                         continue
                     if msg_type == "finished":
+                        emitted_at = float(msg.get("timestamp", time.perf_counter()))
                         for seq_id, tokens in msg["data"]:
                             finished.append((seq_id, tokens))
+                            self.finished_timestamps[seq_id] = emitted_at
+                            self._timestamp_cleanup_seq_ids.add(seq_id)
                             self.remote_inflight_seq_ids.discard(seq_id)
                     elif msg_type == "first_token":
-                        first_tokens.extend(msg.get("data", []))
+                        emitted_at = float(msg.get("timestamp", time.perf_counter()))
+                        data = msg.get("data", [])
+                        first_tokens.extend(data)
+                        for seq_id, _token in data:
+                            self.first_token_timestamps[seq_id] = emitted_at
                     elif msg_type == "prefill_stats":
                         for item in msg.get("data", []):
                             if "rank" in msg:

@@ -95,7 +95,11 @@ def test_e2e_ingress_route_worker_result_flow(monkeypatch):
     assert queued["type"] == "sequence"
     assert seq.token_ids == [97, 98]
 
-    engine.recv_queues[1].put({"type": "first_token", "data": [(seq.seq_id, 7)]})
+    engine.recv_queues[1].put({
+        "type": "first_token",
+        "timestamp": 20.0,
+        "data": [(seq.seq_id, 7)],
+    })
     engine.recv_queues[1].put({
         "type": "prefill_stats",
         "data": [{"seq_id": seq.seq_id, "prefix_hit": True, "num_cached_tokens": 2}],
@@ -104,7 +108,11 @@ def test_e2e_ingress_route_worker_result_flow(monkeypatch):
         "type": "runtime_stats",
         "data": {"transfer_count": 1, "transfer_copy_count": 1},
     })
-    engine.recv_queues[1].put({"type": "finished", "data": [(seq.seq_id, [7, 8])]})
+    engine.recv_queues[1].put({
+        "type": "finished",
+        "timestamp": 21.0,
+        "data": [(seq.seq_id, [7, 8])],
+    })
 
     finished, first_tokens, prefill_stats, runtime_stats = engine.step()
 
@@ -112,4 +120,6 @@ def test_e2e_ingress_route_worker_result_flow(monkeypatch):
     assert first_tokens == [(seq.seq_id, 7)]
     assert prefill_stats == [{"seq_id": seq.seq_id, "prefix_hit": True, "num_cached_tokens": 2}]
     assert runtime_stats == [{"transfer_count": 1, "transfer_copy_count": 1}]
+    assert engine.first_token_timestamps[seq.seq_id] == 20.0
+    assert engine.finished_timestamps[seq.seq_id] == 21.0
     engine.exit()

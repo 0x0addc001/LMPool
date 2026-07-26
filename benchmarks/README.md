@@ -41,7 +41,11 @@ the 0.6B structure accidentally. After an interrupted run, keep the same
 - `tput(tok/s)`: generated output tokens per second.
 - `goodput`: generated output tokens per second for requests whose end-to-end latency is within `--goodput-e2e-sla-ms`.
 - `ttft(ms)`: mean/average time from request submission to the first generated token event reported by the data-plane worker.
-- `ttpt(ms)`: mean/average per-output-token latency proxy, computed as request E2E latency divided by the number of generated output tokens.
+- `tpot(ms)`: mean decode time per output token. For each request with \(N>1\)
+  output tokens, this is `(worker completion timestamp - worker first-token
+  timestamp) / (N - 1)`. Requests with one output token have no decode interval
+  and are excluded. This metric does not include queueing, prefill, or the first
+  token.
 - `e2e(ms)`: mean/average end-to-end request latency.
 - `p90(e2e)`: p90 end-to-end request latency.
 - `p95(e2e)`: p95 end-to-end request latency.
@@ -197,8 +201,11 @@ not a reusable group: each pressure request has its own distinct prefix.
 - `--repetitions`: number of complete runs per scenario. Results are reported as
   means; JSON retains every raw trial, sample standard deviations, and 95%
   Student-t confidence intervals. Overview figures use the 95% intervals as
-  error bars. Use at least `3` for paper results; the default `1` is intended
-  for development runs.
+  error bars. For repetition values \(x_1,\ldots,x_R\), the half-width is
+  \(t_{0.975,R-1}s/\sqrt{R}\), where \(s\) is the sample standard deviation.
+  Tail-metric intervals are computed across the per-run tail statistics, not
+  by pooling requests. Use at least `3` for paper results; the default `1` is
+  intended for development runs.
 - `--workload`: `locality`, `load-skew`, `memory-skew`, or `session-handoff`.
   `memory-skew` is a
   deterministic three-phase trace: hot-prefix warm-up on source ranks,

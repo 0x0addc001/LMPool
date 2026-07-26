@@ -187,6 +187,8 @@ The benchmark profiles prefix sharing before launching the system. `trace req sh
 
 Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. JSON artifacts store the full counts under `metadata.dataset_profile`.
 
+Latency output now reports decode TPOT rather than the legacy E2E-per-token proxy. For a request with \(N>1\) output tokens, `TPOT = (completion time - first-token time) / (N - 1)`; single-token requests have no decode interval and are excluded. Error bars are two-sided 95% Student-\(t\) intervals across complete scenario repetitions, not request-level latency ranges.
+
 ### Current Paper Batch
 
 Artifacts: [`benchmarks/results/paper/20260725T031840Z`](./benchmarks/results/paper/20260725T031840Z)

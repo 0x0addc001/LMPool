@@ -125,14 +125,14 @@ def main() -> None:
         baseline_reuse,
         width,
         label="Round-robin",
-        color="#4C78A8",
+        color="#2684FC",
     )
     bars_b = axes[0].bar(
         x + width / 2,
         routing_reuse,
         width,
         label="KV-aware routing",
-        color="#F58518",
+        color="#00AC47",
     )
     annotate_bars(axes[0], bars_a, "%")
     annotate_bars(axes[0], bars_b, "%")
@@ -160,14 +160,14 @@ def main() -> None:
         transfer_x,
         transfer_min,
         transfer_max,
-        color="#9ECAE1",
+        color="#D8E8FF",
         alpha=0.45,
         linewidth=0,
     )
     axes[1].plot(
         transfer_x,
         transfer_means,
-        color="#2F6F8F",
+        color="#2684FC",
         linewidth=2.0,
         marker="o",
         markersize=4.5,
@@ -199,14 +199,14 @@ def main() -> None:
         gains[0],
         width,
         label=MODEL_LABELS[0],
-        color="#B279A2",
+        color="#A142F4",
     )
     bars_d = axes[2].bar(
         metric_x + width / 2,
         gains[1],
         width,
         label=MODEL_LABELS[1],
-        color="#72B7B2",
+        color="#00AC47",
     )
     annotate_bars(axes[2], bars_c, "%")
     annotate_bars(axes[2], bars_d, "%")
@@ -273,7 +273,7 @@ def main() -> None:
         routing_labels,
         "throughput_tok_s",
         1.0,
-        ("#4C78A8", "#F58518"),
+        ("#2684FC", "#00AC47"),
         "Throughput (tokens/s)",
     )
     absolute_axes[0, 0].set_title("(a) Routing throughput")
@@ -284,7 +284,7 @@ def main() -> None:
         routing_labels,
         "mean_ttft_s",
         1000.0,
-        ("#72B7B2", "#E45756"),
+        ("#FBBC04", "#EA4335"),
         "Mean TTFT (ms)",
     )
     absolute_axes[0, 1].set_title("(b) Routing latency")
@@ -295,7 +295,7 @@ def main() -> None:
         handoff_labels,
         "throughput_tok_s",
         1.0,
-        ("#59A14F", "#EDC948", "#B07AA1"),
+        ("#2684FC", "#A142F4", "#00AC47"),
         "Throughput (tokens/s)",
     )
     absolute_axes[1, 0].set_title("(c) Session-handoff throughput")
@@ -306,7 +306,7 @@ def main() -> None:
         handoff_labels,
         "mean_ttft_s",
         1000.0,
-        ("#76B7B2", "#FF9DA7", "#9C755F"),
+        ("#00A3A3", "#FBBC04", "#EA4335"),
         "Mean TTFT (ms)",
     )
     absolute_axes[1, 1].set_title("(d) Session-handoff latency")

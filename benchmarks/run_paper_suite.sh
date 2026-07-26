@@ -51,7 +51,9 @@ artifact_complete() {
        and .metadata.model.name_or_path == $expected_model
        and (
          if $expected_type == "object"
-         then .metadata.arguments.repetitions == $expected_repetitions
+         then
+           .metadata.arguments.repetitions == $expected_repetitions
+           and all(.results[]; . == null or has("mean_tpot_s"))
          else true
          end
        )

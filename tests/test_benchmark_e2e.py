@@ -9,6 +9,7 @@ from benchmarks.benchmark_e2e import (
     build_prompts,
     confidence_interval_95,
     compute_sequence_prefix_hashes,
+    decode_tpot_s,
     measure_single_gpu_prefix_hit_rate,
     profile_trace_prefix_sharing,
     prepare_benchmark_rendezvous,
@@ -314,6 +315,18 @@ def test_confidence_interval_uses_repeated_samples():
     assert confidence_interval_95([1.0, 2.0, 4.0]) > 0.0
 
 
+def test_decode_tpot_excludes_ttft_and_first_output_token():
+    assert decode_tpot_s(10.0, 11.5, 4) == pytest.approx(0.5)
+    assert decode_tpot_s(10.0, 11.5, 1) is None
+
+
+def test_confidence_interval_uses_student_t_half_width():
+    samples = [10.0, 12.0, 9.0, 11.0, 13.0]
+    expected = 2.776 * 1.5811388300841898 / (5 ** 0.5)
+
+    assert confidence_interval_95(samples) == pytest.approx(expected)
+
+
 def test_summary_json_keeps_metadata_separate_from_results(tmp_path):
     output = tmp_path / "summary.json"
 
@@ -336,11 +349,11 @@ def test_summary_figures_accept_confidence_intervals(tmp_path):
         throughput_tok_s_ci95=4.0,
         goodput_tok_s_ci95=3.0,
         mean_ttft_s=0.2,
-        mean_ttpt_s=0.03,
+        mean_tpot_s=0.03,
         mean_e2e_s=1.0,
         p90_e2e_s=1.4,
         mean_ttft_s_ci95=0.01,
-        mean_ttpt_s_ci95=0.002,
+        mean_tpot_s_ci95=0.002,
         mean_e2e_s_ci95=0.05,
         p90_e2e_s_ci95=0.08,
         route_hit_rate=0.8,

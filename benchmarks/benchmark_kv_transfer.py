@@ -390,7 +390,7 @@ def save_results_figure(
         [item["mean_latency_ms"] for item in results],
         width,
         label="Mean",
-        color="#4477AA",
+        color="#2684FC",
     )
     p50_bars = axes[0].bar(
         x,
@@ -400,14 +400,14 @@ def save_results_figure(
         ],
         width,
         label="P50",
-        color="#CCBB44",
+        color="#FBBC04",
     )
     p95_bars = axes[0].bar(
         [value + width for value in x],
         [item["p95_latency_ms"] for item in results],
         width,
         label="P95",
-        color="#EE6677",
+        color="#EA4335",
     )
     # Close mean/P50/P95 values are common after warmup. Stagger labels
     # vertically instead of rotating them or allowing three values to overlap.
@@ -440,7 +440,7 @@ def save_results_figure(
     bandwidth_bars = axes[1].bar(
         x,
         [item["effective_bandwidth_gib_s"] for item in results],
-        color="#228833",
+        color="#00AC47",
     )
     axes[1].bar_label(bandwidth_bars, fmt="%.2f", fontsize=8, padding=2)
     axes[1].set_title("Effective KV Transfer Bandwidth")

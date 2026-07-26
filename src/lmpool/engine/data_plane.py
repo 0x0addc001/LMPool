@@ -775,7 +775,12 @@ def data_plane_process(
                 if seq.num_completion_tokens == 1
             ]
             if first_tokens:
-                send_queue.put({"type": "first_token", "rank": rank, "data": first_tokens})
+                send_queue.put({
+                    "type": "first_token",
+                    "rank": rank,
+                    "timestamp": time.perf_counter(),
+                    "data": first_tokens,
+                })
             send_block_state()
             if control_plane_client is not None and committed_route_seq_ids:
                 control_plane_client.acknowledge_route_blocks(committed_route_seq_ids)
@@ -795,4 +800,8 @@ def data_plane_process(
                     "output_tokens": sum(len(tokens) for _, tokens in finished),
                 },
             })
-            send_queue.put({"type": "finished", "data": finished})
+            send_queue.put({
+                "type": "finished",
+                "timestamp": time.perf_counter(),
+                "data": finished,
+            })

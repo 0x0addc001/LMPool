@@ -11,27 +11,27 @@ ROOT = Path(__file__).resolve().parents[3]
 
 LIGHT_BASE = {
     "background": "#FFFFFF",
-    "text": "#293744",
-    "muted": "#667482",
+    "text": "#202124",
+    "muted": "#5F6368",
 }
 DARK_BASE = {
-    "background": "#0E141A",
-    "text": "#F1F5F7",
-    "muted": "#A8B4BF",
+    "background": "#111418",
+    "text": "#F8F9FA",
+    "muted": "#BDC1C6",
 }
 
 PALETTES = {
     "routing": {
-        "light": {**LIGHT_BASE, "accent": "#6F91AE", "fill": "#EAF2F8", "outcome": "#DCEAF4"},
-        "dark": {**DARK_BASE, "accent": "#87AFCC", "fill": "#172A39", "outcome": "#1B3548"},
+        "light": {**LIGHT_BASE, "accent": "#2684FC", "fill": "#E8F1FF", "outcome": "#D8E8FF"},
+        "dark": {**DARK_BASE, "accent": "#5EA0FF", "fill": "#122B4B", "outcome": "#16385F"},
     },
     "placement": {
-        "light": {**LIGHT_BASE, "accent": "#729987", "fill": "#EAF4EF", "outcome": "#DCEDE5"},
-        "dark": {**DARK_BASE, "accent": "#84B49B", "fill": "#172B23", "outcome": "#1B382B"},
+        "light": {**LIGHT_BASE, "accent": "#FBBC04", "fill": "#FFF5CC", "outcome": "#FFED9A"},
+        "dark": {**DARK_BASE, "accent": "#FBBC04", "fill": "#3B3107", "outcome": "#514308"},
     },
     "transfer": {
-        "light": {**LIGHT_BASE, "accent": "#8B7DA4", "fill": "#F0ECF5", "outcome": "#E6DFF0"},
-        "dark": {**DARK_BASE, "accent": "#B19CCA", "fill": "#281F31", "outcome": "#342840"},
+        "light": {**LIGHT_BASE, "accent": "#00AC47", "fill": "#E6F7ED", "outcome": "#CEF0DC"},
+        "dark": {**DARK_BASE, "accent": "#36D477", "fill": "#103522", "outcome": "#15482D"},
     },
 }
 

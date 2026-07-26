@@ -414,5 +414,10 @@ uv run python benchmarks/benchmark_e2e.py \
 timeout、无 NCCL watchdog 错误、实际每-rank KV capacity 等于请求 budget。JSON 顶层为
 `metadata` 和 `results`：前者保存精确命令、Git revision、模型结构/dtype 和解析后的配置；
 后者保存聚合结果及每次 `trial_results`。论文表格报告 mean 和 95% CI，并在附录保留 sample
-standard deviation；延迟同时报告 mean、P90、P95。出现 transfer/rebalance failure 时必须
-结合 failure reason 解释，不能只比较总吞吐。
+standard deviation；延迟同时报告 mean、P90、P95。TPOT 是纯 decode 指标，按每个请求
+`(completion timestamp - first-token timestamp) / (output tokens - 1)` 计算，单 token
+输出不进入 TPOT 分布；不要把旧版 `E2E / output tokens` 字段解释为 TPOT。95% CI 的样本是
+完整场景的独立 repetition，半宽为
+`t(0.975, repetitions - 1) * sample_std / sqrt(repetitions)`。P90 E2E 先在每次 trial 内
+计算，再对 trial-level P90 计算 CI。出现 transfer/rebalance failure 时必须结合 failure
+reason 解释，不能只比较总吞吐。

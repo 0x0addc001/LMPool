@@ -439,10 +439,10 @@ class ScenarioResult:
     p50_ttft_s: float
     p90_ttft_s: float
     p95_ttft_s: float
-    mean_ttpt_s: float
-    p50_ttpt_s: float
-    p90_ttpt_s: float
-    p95_ttpt_s: float
+    mean_tpot_s: float
+    p50_tpot_s: float
+    p90_tpot_s: float
+    p95_tpot_s: float
     mean_e2e_s: float
     p50_e2e_s: float
     p90_e2e_s: float
@@ -490,13 +490,13 @@ class ScenarioResult:
     throughput_tok_s_std: float = 0.0
     goodput_tok_s_std: float = 0.0
     mean_ttft_s_std: float = 0.0
-    mean_ttpt_s_std: float = 0.0
+    mean_tpot_s_std: float = 0.0
     mean_e2e_s_std: float = 0.0
     p90_e2e_s_std: float = 0.0
     throughput_tok_s_ci95: float = 0.0
     goodput_tok_s_ci95: float = 0.0
     mean_ttft_s_ci95: float = 0.0
-    mean_ttpt_s_ci95: float = 0.0
+    mean_tpot_s_ci95: float = 0.0
     mean_e2e_s_ci95: float = 0.0
     p90_e2e_s_ci95: float = 0.0
     trial_results: list[dict] | None = None
@@ -707,6 +707,17 @@ def _mean(values: list[float]) -> float:
 
 def _median(values: list[float]) -> float:
     return statistics.median(values) if values else 0.0
+
+
+def decode_tpot_s(
+    first_token_at: float,
+    finished_at: float,
+    output_tokens: int,
+) -> float | None:
+    """Return decode time per output token, excluding time to first token."""
+    if output_tokens <= 1:
+        return None
+    return max(0.0, finished_at - first_token_at) / (output_tokens - 1)
 
 
 def resolve_memory_skew_source_ranks(config: dict) -> list[int]:
@@ -929,6 +940,8 @@ def _run_independent_worker(
 
     submitted_at: dict[int, float] = {}
     ttfts: list[float] = []
+    first_token_at: dict[int, float] = {}
+    tpots: list[float] = []
     e2es: list[float] = []
     prefix_hits = 0
     total_tokens = 0
@@ -955,11 +968,20 @@ def _run_independent_worker(
         scheduler.postprocess(scheduled, outputs)
         for seq in scheduled:
             latency = now - submitted_at[seq.seq_id]
-            e2es.append(latency)
             if seq.num_completion_tokens == 1:
                 ttfts.append(latency)
-            if latency <= goodput_e2e_sla_s:
-                goodput_tokens += 1
+                first_token_at[seq.seq_id] = now
+            if seq.is_finished:
+                e2es.append(latency)
+                tpot = decode_tpot_s(
+                    first_token_at.get(seq.seq_id, now),
+                    now,
+                    seq.num_completion_tokens,
+                )
+                if tpot is not None:
+                    tpots.append(tpot)
+                if latency <= goodput_e2e_sla_s:
+                    goodput_tokens += seq.num_completion_tokens
         total_tokens += len(outputs)
 
     elapsed = time.perf_counter() - start_wall
@@ -976,6 +998,7 @@ def _run_independent_worker(
             "p90_ttft_s": _percentile(ttfts, 0.90),
             "p95_ttft_s": _percentile(ttfts, 0.95),
             "ttfts": ttfts,
+            "tpots": tpots,
             "prefix_hit_rate": prefix_hits / max(seq_count, 1),
             "mean_e2e_s": _mean(e2es),
             "p50_e2e_s": _median(e2es),
@@ -1039,6 +1062,7 @@ def run_independent_multi_gpu_benchmark(
         total_tokens = sum(item["total_tokens"] for item in results)
         # 汇总各卡结果时，把每个 worker 的 token / latency 样本合并起来
         ttfts = [lat for item in results for lat in item.get("ttfts", [])]
+        tpots = [lat for item in results for lat in item.get("tpots", [])]
         e2es = [lat for item in results for lat in item.get("e2es", [])]
         prefix_hit_rate = sum(
             item["prefix_hit_rate"] * item["total_requests"] for item in results
@@ -1057,10 +1081,10 @@ def run_independent_multi_gpu_benchmark(
             p50_ttft_s=_median(ttfts),
             p90_ttft_s=_percentile(ttfts, 0.90),
             p95_ttft_s=_percentile(ttfts, 0.95),
-            mean_ttpt_s=_mean(ttfts),
-            p50_ttpt_s=_median(ttfts),
-            p90_ttpt_s=_percentile(ttfts, 0.90),
-            p95_ttpt_s=_percentile(ttfts, 0.95),
+            mean_tpot_s=_mean(tpots),
+            p50_tpot_s=_median(tpots),
+            p90_tpot_s=_percentile(tpots, 0.90),
+            p95_tpot_s=_percentile(tpots, 0.95),
             mean_e2e_s=_mean(e2es),
             p50_e2e_s=_median(e2es),
             p90_e2e_s=_percentile(e2es, 0.90),
@@ -1148,7 +1172,8 @@ def run_engine_scenario(
     engine = LLMEngine(config)
     submit_times: dict[int, float] = {}
     ttfts: list[float] = []
-    ttpts: list[float] = []
+    first_token_at: dict[int, float] = {}
+    tpots: list[float] = []
     e2es: list[float] = []
     total_tokens = 0
     goodput_tokens = 0
@@ -1496,8 +1521,10 @@ def run_engine_scenario(
                     )
             for seq_id, _token in first_tokens:
                 if seq_id in submit_times:
-                    ttft = now - submit_times[seq_id]
+                    emitted_at = engine.first_token_timestamps.pop(seq_id, now)
+                    ttft = emitted_at - submit_times[seq_id]
                     ttfts.append(ttft)
+                    first_token_at[seq_id] = emitted_at
                     phase = phase_by_seq.get(seq_id)
                     if phase in phase_ttfts:
                         phase_ttfts[phase].append(ttft)
@@ -1536,16 +1563,22 @@ def run_engine_scenario(
                 inflight.discard(seq_id)
                 finished_count += 1
                 total_tokens += len(tokens)
-                latency = now - submit_times[seq_id]
-                output_tokens = max(len(tokens), 1)
-                ttpts.append(latency / output_tokens)
+                finished_at = engine.finished_timestamps.pop(seq_id, now)
+                latency = finished_at - submit_times[seq_id]
+                tpot = decode_tpot_s(
+                    first_token_at.get(seq_id, finished_at),
+                    finished_at,
+                    len(tokens),
+                )
+                if tpot is not None:
+                    tpots.append(tpot)
                 e2es.append(latency)
                 phase = phase_by_seq.get(seq_id)
                 if phase in phase_e2es:
                     phase_e2es[phase].append(latency)
                     phase_output_tokens[phase] += len(tokens)
-                    phase_finished_at[phase] = now
-                completion_times[seq_id] = now
+                    phase_finished_at[phase] = finished_at
+                completion_times[seq_id] = finished_at
                 completion_token_counts[seq_id] = len(tokens)
             for rank, stats in rank_stats.items():
                 stats["local_prefix_hit_rate"] = (
@@ -1623,10 +1656,10 @@ def run_engine_scenario(
         p50_ttft_s=_median(ttfts),
         p90_ttft_s=_percentile(ttfts, 0.90),
         p95_ttft_s=_percentile(ttfts, 0.95),
-        mean_ttpt_s=_mean(ttpts),
-        p50_ttpt_s=_median(ttpts),
-        p90_ttpt_s=_percentile(ttpts, 0.90),
-        p95_ttpt_s=_percentile(ttpts, 0.95),
+        mean_tpot_s=_mean(tpots),
+        p50_tpot_s=_median(tpots),
+        p90_tpot_s=_percentile(tpots, 0.90),
+        p95_tpot_s=_percentile(tpots, 0.95),
         mean_e2e_s=_mean(e2es),
         p50_e2e_s=_median(e2es),
         p90_e2e_s=_percentile(e2es, 0.90),
@@ -1873,10 +1906,10 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         p50_ttft_s=mean_attr("p50_ttft_s"),
         p90_ttft_s=mean_attr("p90_ttft_s"),
         p95_ttft_s=mean_attr("p95_ttft_s"),
-        mean_ttpt_s=mean_attr("mean_ttpt_s"),
-        p50_ttpt_s=mean_attr("p50_ttpt_s"),
-        p90_ttpt_s=mean_attr("p90_ttpt_s"),
-        p95_ttpt_s=mean_attr("p95_ttpt_s"),
+        mean_tpot_s=mean_attr("mean_tpot_s"),
+        p50_tpot_s=mean_attr("p50_tpot_s"),
+        p90_tpot_s=mean_attr("p90_tpot_s"),
+        p95_tpot_s=mean_attr("p95_tpot_s"),
         mean_e2e_s=mean_attr("mean_e2e_s"),
         p50_e2e_s=mean_attr("p50_e2e_s"),
         p90_e2e_s=mean_attr("p90_e2e_s"),
@@ -1924,7 +1957,7 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         throughput_tok_s_std=statistics.stdev(result.throughput_tok_s for result in trials),
         goodput_tok_s_std=statistics.stdev(result.goodput_tok_s for result in trials),
         mean_ttft_s_std=statistics.stdev(result.mean_ttft_s for result in trials),
-        mean_ttpt_s_std=statistics.stdev(result.mean_ttpt_s for result in trials),
+        mean_tpot_s_std=statistics.stdev(result.mean_tpot_s for result in trials),
         mean_e2e_s_std=statistics.stdev(result.mean_e2e_s for result in trials),
         p90_e2e_s_std=statistics.stdev(result.p90_e2e_s for result in trials),
         throughput_tok_s_ci95=confidence_interval_95(
@@ -1936,8 +1969,8 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         mean_ttft_s_ci95=confidence_interval_95(
             result.mean_ttft_s for result in trials
         ),
-        mean_ttpt_s_ci95=confidence_interval_95(
-            result.mean_ttpt_s for result in trials
+        mean_tpot_s_ci95=confidence_interval_95(
+            result.mean_tpot_s for result in trials
         ),
         mean_e2e_s_ci95=confidence_interval_95(
             result.mean_e2e_s for result in trials
@@ -1990,7 +2023,7 @@ def print_summary_table(
     print(f"\n{title}")
     print("=" * 225)
     print(
-        f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'ttpt(ms)':>12} "
+        f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'tpot(ms)':>12} "
         f"{'e2e(ms)':>12} {'p90(e2e)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
         f"{'CP req hit':>11} {'CP owner':>11} {'DP req hit':>11} {'DP tok reuse':>12} "
         f"{'attempts':>9} {'preempt':>8} {'redund tok':>10} {'sent blk':>9} {'retained':>8} "
@@ -2003,7 +2036,7 @@ def print_summary_table(
             f"{result.throughput_tok_s:>14.2f} "
             f"{result.goodput_tok_s:>12.2f} "
             f"{result.mean_ttft_s * 1000:>12.2f} "
-            f"{result.mean_ttpt_s * 1000:>12.2f} "
+            f"{result.mean_tpot_s * 1000:>12.2f} "
             f"{result.mean_e2e_s * 1000:>12.2f} "
             f"{result.p90_e2e_s * 1000:>12.2f} "
             f"{result.p95_e2e_s * 1000:>12.2f} "
@@ -2174,14 +2207,20 @@ def print_summary_table(
 
     if any(result.repetitions > 1 for result in valid_results):
         print("\nRepeated-run variability (mean +/- 95% CI; sample stddev is in JSON)")
-        print(f"{'scenario':<22} {'throughput(tok/s)':>24} {'goodput(tok/s)':>24} {'TTFT(ms)':>24} {'E2E(ms)':>24}")
+        print(
+            f"{'scenario':<22} {'throughput(tok/s)':>24} {'goodput(tok/s)':>24} "
+            f"{'TTFT(ms)':>24} {'decode TPOT(ms)':>24} {'E2E(ms)':>24} "
+            f"{'P90 E2E(ms)':>24}"
+        )
         for result in valid_results:
             print(
                 f"{result.name:<22} "
                 f"{result.throughput_tok_s:>10.2f} +/- {result.throughput_tok_s_ci95:<8.2f} "
                 f"{result.goodput_tok_s:>10.2f} +/- {result.goodput_tok_s_ci95:<8.2f} "
                 f"{result.mean_ttft_s * 1000:>10.2f} +/- {result.mean_ttft_s_ci95 * 1000:<8.2f} "
-                f"{result.mean_e2e_s * 1000:>10.2f} +/- {result.mean_e2e_s_ci95 * 1000:<8.2f}"
+                f"{result.mean_tpot_s * 1000:>10.2f} +/- {result.mean_tpot_s_ci95 * 1000:<8.2f} "
+                f"{result.mean_e2e_s * 1000:>10.2f} +/- {result.mean_e2e_s_ci95 * 1000:<8.2f} "
+                f"{result.p90_e2e_s * 1000:>10.2f} +/- {result.p90_e2e_s_ci95 * 1000:<8.2f}"
             )
 
 
@@ -2211,11 +2250,11 @@ def save_summary_figure(
     throughput_ci = [result.throughput_tok_s_ci95 for result in valid_results]
     goodput_ci = [result.goodput_tok_s_ci95 for result in valid_results]
     ttft_ms = [result.mean_ttft_s * 1000.0 for result in valid_results]
-    ttpt_ms = [result.mean_ttpt_s * 1000.0 for result in valid_results]
+    tpot_ms = [result.mean_tpot_s * 1000.0 for result in valid_results]
     e2e_ms = [result.mean_e2e_s * 1000.0 for result in valid_results]
     p90_e2e_ms = [result.p90_e2e_s * 1000.0 for result in valid_results]
     ttft_ci_ms = [result.mean_ttft_s_ci95 * 1000.0 for result in valid_results]
-    ttpt_ci_ms = [result.mean_ttpt_s_ci95 * 1000.0 for result in valid_results]
+    tpot_ci_ms = [result.mean_tpot_s_ci95 * 1000.0 for result in valid_results]
     e2e_ci_ms = [result.mean_e2e_s_ci95 * 1000.0 for result in valid_results]
     p90_e2e_ci_ms = [result.p90_e2e_s_ci95 * 1000.0 for result in valid_results]
     route_hit_pct = [result.route_hit_rate * 100.0 for result in valid_results]
@@ -2228,10 +2267,10 @@ def save_summary_figure(
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle(title, fontsize=16)
     palettes = {
-        "throughput": ["#0072B2", "#E69F00"],
-        "latency": ["#009E73", "#D55E00", "#CC79A7", "#56B4E9"],
-        "hit": ["#332288", "#117733", "#DDCC77", "#CC6677"],
-        "util": ["#882255", "#44AA99"],
+        "throughput": ["#2684FC", "#00AC47"],
+        "latency": ["#2684FC", "#00AC47", "#EA4335", "#FBBC04"],
+        "hit": ["#2684FC", "#00AC47", "#FBBC04", "#EA4335"],
+        "util": ["#A142F4", "#00A3A3"],
     }
     bar_style = {"edgecolor": "#333333", "linewidth": 0.45}
     error_style = {"elinewidth": 0.8, "ecolor": "#222222", "capthick": 0.8}
@@ -2302,12 +2341,12 @@ def save_summary_figure(
     annotate_bars(axes[0, 1], bars, decimals=0)
     bars = axes[0, 1].bar(
         [i - 0.5 * latency_width for i in x],
-        ttpt_ms,
-        yerr=ttpt_ci_ms,
+        tpot_ms,
+        yerr=tpot_ci_ms,
         capsize=3,
         error_kw=error_style,
         width=latency_width,
-        label="TTPT mean",
+        label="Decode TPOT mean",
         color=palettes["latency"][1],
         **bar_style,
     )
@@ -2443,10 +2482,10 @@ def save_reuse_phase_figure(
     x = list(range(len(valid_results)))
     reuse_stats = [result.phase_latency_stats["reuse"] for result in valid_results]
     metrics = [
-        ("Reuse Throughput", "tokens/s", "throughput_tok_s", 1.0, "#0072B2"),
-        ("Reuse Mean TTFT", "ms", "mean_ttft_s", 1000.0, "#009E73"),
-        ("Reuse Mean E2E", "ms", "mean_e2e_s", 1000.0, "#D55E00"),
-        ("Reuse P90 E2E", "ms", "p90_e2e_s", 1000.0, "#CC79A7"),
+        ("Reuse Throughput", "tokens/s", "throughput_tok_s", 1.0, "#2684FC"),
+        ("Reuse Mean TTFT", "ms", "mean_ttft_s", 1000.0, "#00AC47"),
+        ("Reuse Mean E2E", "ms", "mean_e2e_s", 1000.0, "#EA4335"),
+        ("Reuse P90 E2E", "ms", "p90_e2e_s", 1000.0, "#FBBC04"),
     ]
     fig, axes = plt.subplots(2, 2, figsize=(16, 9))
     fig.suptitle(f"{title}: Reuse Phase", fontsize=16)
@@ -2528,7 +2567,14 @@ def save_rank_stats_figure(
         squeeze=False,
     )
     fig.suptitle(f"{title}: Per-Rank Diagnostics", fontsize=16)
-    rank_colors = ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377"]
+    rank_colors = [
+        "#2684FC",
+        "#00AC47",
+        "#FBBC04",
+        "#EA4335",
+        "#A142F4",
+        "#00A3A3",
+    ]
 
     def rank_value(result: ScenarioResult, rank: int, key: str, default: float = 0.0) -> float:
         stats = result.rank_stats.get(rank, result.rank_stats.get(str(rank), {}))
@@ -3079,6 +3125,17 @@ def main():
             },
         )
         run_metadata["dataset_profile"] = dataset_profile
+        run_metadata["metric_definitions"] = {
+            "ttft_s": "first token timestamp minus request submission timestamp",
+            "tpot_s": (
+                "completion timestamp minus first token timestamp, divided by "
+                "output_tokens minus one; requests with one output token are excluded"
+            ),
+            "e2e_s": "completion timestamp minus request submission timestamp",
+            "ci95": (
+                "two-sided Student-t half-width across complete scenario repetitions"
+            ),
+        }
         save_summary_json(payload, args.output_json, metadata=run_metadata)
 
 

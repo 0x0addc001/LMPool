@@ -187,6 +187,8 @@ Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`t
 
 运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。JSON 会把完整计数写入 `metadata.dataset_profile`。
 
+延迟输出现在报告纯 decode TPOT，不再使用旧版 E2E-per-token 代理。对于输出 token 数 \(N>1\) 的请求，`TPOT = (完成时刻 - 首 token 时刻) / (N - 1)`；单 token 请求没有 decode 间隔，不进入 TPOT 分布。图中误差线是完整场景多次重复运行之间的双侧 95% Student-\(t\) 置信区间，不是请求级延迟范围。
+
 ### 当前论文实验批次
 
 实验数据：[`benchmarks/results/paper/20260725T031840Z`](./benchmarks/results/paper/20260725T031840Z)

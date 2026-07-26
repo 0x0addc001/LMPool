@@ -399,12 +399,12 @@ decision demand, decision plan, decision implementation, and decision result.
   improves average latency or tail latency.
 - Decision plan: Add P90 latency fields to benchmark results, include
   `p90(e2e)` in the summary table, and draw P90 E2E in the latency subplot
-  alongside mean TTFT, mean TTPT, and mean E2E.
+  alongside mean TTFT, the then-current per-output-token proxy, and mean E2E.
 - Decision implementation: Extended `ScenarioResult` with `p90_ttft_s`,
   `p90_ttpt_s`, and `p90_e2e_s`. Reused the existing `_percentile()` helper for
   both P90 and P95 calculations. Updated the summary table and PNG figure to
-  include `p90(e2e)`, and documented that TTFT/TTPT/E2E columns are
-  mean/average values while P90/P95 are tail-latency metrics.
+  include `p90(e2e)`. The `ttpt` field described here was later found to be an
+  E2E-per-token proxy and was superseded by the decode TPOT decision below.
 - Decision result: Future benchmark JSON, tables, and figures can directly
   compare mean latency against P90/P95 tail latency, which is necessary for
   evaluating load-skew relief and transfer-triggered tail improvements.
@@ -420,7 +420,9 @@ decision demand, decision plan, decision implementation, and decision result.
 - Decision implementation: Updated `save_summary_figure()` in
   `benchmarks/shared_prefix_benchmark.py` with fixed Okabe-Ito / muted academic
   color groups, thin bar outlines, and light horizontal grid lines. The latency
-  subplot keeps TTFT, TTPT, mean E2E, and P90 E2E as separate visible series.
+  subplot keeps TTFT, the legacy per-output-token proxy, mean E2E, and P90 E2E
+  as separate visible series. This palette was superseded by the brighter,
+  synchronized visual palette decision below.
 - Decision result: Future `--output-figure` PNGs are more suitable for paper
   drafts and easier to read when multiple metric groups appear in the same
   summary figure.
@@ -2539,3 +2541,77 @@ decision demand, decision plan, decision implementation, and decision result.
   green NVLink path remains distinguishable. Static and visual checks cover
   structure, generated assets, wording, and file references; PDF compilation
   remains unavailable because the workspace has no TeX engine.
+
+## 2026-07-26: Decode TPOT, Repetition-Level Confidence Intervals, and Bright Visual Palette
+
+- Decision demand: The benchmark column named TTPT needed to represent pure
+  decode time per output token, but it was computed as E2E latency divided by
+  output-token count and therefore included queueing and prefill. The role and
+  calculation of 95% confidence intervals also needed to be explicit. Slides,
+  benchmark plots, and system diagrams used palettes that appeared too dark
+  for presentation.
+- Decision plan: Timestamp first-token and completion events at their
+  data-plane source, compute request TPOT from the decode interval, rename the
+  result schema and plots, document the Student-\(t\) interval, and synchronize
+  light and dark assets around a brighter technology-brand palette without
+  sacrificing text contrast.
+- Decision implementation: Data-plane workers now attach monotonic timestamps
+  to first-token and completion messages. `LLMEngine` stores the timestamps
+  for one consumer step and then clears completed entries, avoiding unbounded
+  metadata growth without changing the public `step()` tuple.
+  `benchmark_e2e.py` computes
+  `TPOT=(completion-first_token)/(output_tokens-1)`, excluding single-token
+  requests. Result fields, summary labels, confidence-interval fields, JSON
+  metric definitions, tests, the paper, the runbook, and the READMEs now use
+  TPOT. The documented 95% interval is
+  \(t_{0.975,R-1}s/\sqrt{R}\) across complete repetitions. Slide colors were
+  renamed to `LMYellow` where appropriate, and generated diagrams and
+  benchmark/report plots now use Google Chat blue `#2684FC`, green `#00AC47`,
+  yellow `#FBBC04`, and red `#EA4335`, with pale fills for paper figures and
+  higher-contrast variants for dark assets.
+- Decision result: Focused benchmark, engine-message, and E2E tests report 32
+  passed tests, and the complete CPU suite reports 192 passed and one skipped.
+  Regenerated architecture, routing, placement, transfer,
+  lifecycle, cost-model, and report figures retain readable text and visibly
+  brighter categorical accents. Existing E2E result JSON cannot reconstruct
+  the request-level TPOT distribution. Paper E2E and routing workloads must
+  therefore be rerun before TPOT values are cited or latency values are mixed
+  with the new worker-event timing boundary. The paper-suite resume check now
+  rejects legacy E2E artifacts that do not contain `mean_tpot_s`; transfer-only
+  microbenchmark artifacts remain reusable because their metric boundary did
+  not change.
+
+## 2026-07-26: Neutral Process Labels in Architecture Figures
+
+- Decision demand: Process names in the architecture figure should use neutral
+  black text instead of blue so that color remains a module-type cue rather
+  than a hierarchy cue.
+- Decision plan: Change only process-band and rank-process title colors while
+  preserving the brighter blue, green, yellow, and red module boundaries.
+- Decision implementation: Updated both paper and slide architecture
+  generators so light figures use `#202124` for Main Process, Control Plane
+  Process, Data Plane Processes, and per-rank process titles. Dark figures use
+  the corresponding high-contrast white `#F8F9FA`.
+- Decision result: Process hierarchy is now visually neutral, while scheduler,
+  block-manager, model-runner, cache, and NVLink colors remain unchanged.
+
+## 2026-07-26: Paper Testbed NVLink Topology Clarification
+
+- Decision demand: The paper named the selected GPU pairs as NV4 but did not
+  distinguish the topology label from the NVLink generation or state whether
+  reported KV bandwidth should be compared with a unidirectional or
+  bidirectional hardware limit.
+- Decision plan: Record the live topology, active link count, logical-to-
+  physical rank mapping, directional peak, and the measurement boundary of the
+  KV transfer microbenchmark in the evaluation section.
+- Decision implementation: `nvidia-smi topo -m`, `nvidia-smi topo -p2p n`, and
+  `nvidia-smi nvlink -s` confirm direct NV4 paths for physical pairs `(0,1)`,
+  `(3,4)`, and `(5,6)`. The paper now explains that RTX 3090 uses third-
+  generation NVLink, that NV4 denotes four bonded 14.0625 GB/s-per-direction
+  links, and that the unidirectional KV workload must be compared with
+  56.25 GB/s rather than the 112.5 GB/s bidirectional aggregate. The official
+  NVIDIA GA102 architecture white paper is included as the hardware source.
+- Decision result: The evaluation now reports the 64-block result as
+  36.5 GiB/s, approximately 39.2 GB/s or 69.7% of the unidirectional peak, and
+  identifies it as end-to-end effective KV bandwidth including gather, NCCL
+  transfer, scatter, and synchronization rather than raw link bandwidth.
