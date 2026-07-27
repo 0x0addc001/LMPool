@@ -24,16 +24,17 @@ class DummyProcess:
         self.target = target
         self.args = args
         self.started = False
-        self.exitcode = 0
+        self.exitcode = None
 
     def start(self):
         self.started = True
 
     def join(self, timeout=None):
+        self.exitcode = 0
         return None
 
     def is_alive(self):
-        return False
+        return self.started and self.exitcode is None
 
 
 class DummyContext:
@@ -97,4 +98,29 @@ def test_llm_engine_add_prompt_and_drain_messages(monkeypatch):
     assert 123 not in engine.finished_timestamps
 
     engine.exit()
+    engine.exit()
+
+
+def test_llm_engine_step_fails_fast_when_worker_exits(monkeypatch):
+    monkeypatch.setattr(llm_engine_module.mp, "get_context", lambda _: DummyContext())
+    monkeypatch.setattr(llm_engine_module.AutoTokenizer, "from_pretrained", lambda _: DummyTokenizer())
+    monkeypatch.setattr(llm_engine_module, "_find_free_port", lambda: 23456)
+
+    engine = llm_engine_module.LLMEngine(
+        {
+            "world_size": 1,
+            "block_size": 2,
+            "model_name_or_path": "dummy",
+            "enable_global_pool": False,
+            "log_level": "ERROR",
+        }
+    )
+    engine.processes[0].exitcode = 1
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"data-plane worker exited unexpectedly: rank 0 exitcode 1",
+    ):
+        engine.step()
+
     engine.exit()

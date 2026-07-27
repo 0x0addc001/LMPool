@@ -1,0 +1,143 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-26T14:26:02.073250+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca --dtype auto --block-size 256 --block-counts 1,2,4,8,16,32,64 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260726T142510Z/qwen3-0.6b/kv_transfer/pair_0-1.json --output-figure benchmarks/results/paper/20260726T142510Z/qwen3-0.6b/kv_transfer/pair_0-1.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "0f56fb89565cf589ddd2801a6bb93bfd820b0398",
+    "git_status": "M README.md\n M README_zh.md\n M benchmarks/PAPER_RUNBOOK.md\n M benchmarks/benchmark_e2e.py\n M benchmarks/build_transfer_profile.py\n M benchmarks/run_paper_suite.sh\n M benchmarks/transfer_profile.py\n M docs/flow/decisions.md\n M docs/script/script_20260728.md\n M docs/script/script_20260728_15min.md\n M docs/slide/slide_20260728.tex\n M src/lmpool/engine/control_plane.py\n M src/lmpool/engine/data_plane.py\n M src/lmpool/engine/global_scheduler.py\n M tests/test_benchmark_e2e.py\n M tests/test_control_plane.py\n M tests/test_global_scheduler.py\n M tests/test_transfer_profile.py\n?? benchmarks/results/paper/20260726T115700Z/\n?? benchmarks/results/paper/20260726T141345Z/\n?? benchmarks/results/paper/20260726T142125Z/\n?? benchmarks/results/paper/20260726T142510Z/",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0,1",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8,16,32,64",
+      "iterations": 100,
+      "warmup": 20,
+      "input_json": "",
+      "output_json": "benchmarks/results/paper/20260726T142510Z/qwen3-0.6b/kv_transfer/pair_0-1.json",
+      "output_figure": "benchmarks/results/paper/20260726T142510Z/qwen3-0.6b/kv_transfer/pair_0-1.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "label": "Qwen/Qwen3-0.6B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 3.4736736892955378,
+      "p50_latency_ms": 3.4541954955784604,
+      "p95_latency_ms": 3.6054005817277357,
+      "effective_bandwidth_gib_s": 7.871709448202465,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 4.147201580635738,
+      "p50_latency_ms": 4.132257017772645,
+      "p95_latency_ms": 4.246021051949356,
+      "effective_bandwidth_gib_s": 13.186602805937582,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 4.710116969945375,
+      "p50_latency_ms": 4.694808987551369,
+      "p95_latency_ms": 4.830975701042917,
+      "effective_bandwidth_gib_s": 23.22129167872204,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 7.394388621905819,
+      "p50_latency_ms": 7.28074049402494,
+      "p95_latency_ms": 7.762216700939462,
+      "effective_bandwidth_gib_s": 29.583243616917137,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 16,
+      "bytes_per_iteration": 469762048,
+      "gib_per_iteration": 0.4375,
+      "mean_latency_ms": 13.259788277791813,
+      "p50_latency_ms": 13.25662000454031,
+      "p95_latency_ms": 13.292226803605445,
+      "effective_bandwidth_gib_s": 32.99449364004913,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 32,
+      "bytes_per_iteration": 939524096,
+      "gib_per_iteration": 0.875,
+      "mean_latency_ms": 24.372706409776583,
+      "p50_latency_ms": 24.369606006075628,
+      "p95_latency_ms": 24.403819315193687,
+      "effective_bandwidth_gib_s": 35.90081402076106,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 64,
+      "bytes_per_iteration": 1879048192,
+      "gib_per_iteration": 1.75,
+      "mean_latency_ms": 47.88016336038709,
+      "p50_latency_ms": 47.875392498099245,
+      "p95_latency_ms": 47.90892485762015,
+      "effective_bandwidth_gib_s": 36.54958289987447,
+      "data_validation": "passed"
+    }
+  ]
+}

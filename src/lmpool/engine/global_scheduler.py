@@ -68,22 +68,31 @@ class GlobalScheduler:
         self.head_dim = 128
         self.kv_dtype_bytes = 2
         self.transfer_bandwidth_gib_s = 3.5
-        # The offline profile measures an idle packed data path. Admission adds
-        # a conservative loaded-serving transaction residual before scaling
-        # only the payload-varying latency. Pair/size observations may raise it.
-        self.transfer_fixed_latency_ms = 40.0
+        # The offline profile measures an idle packed data path. A separately
+        # calibrated transaction-residual profile accounts for control and
+        # publication overhead. The scalar is only a cold-start fallback when
+        # no calibrated residual or complete placement observation is available.
+        self.transfer_fixed_latency_ms = 0.0
         self.transfer_interference_multiplier = 1.2
         self.prefill_token_time_ms = 0.02
         self.prefill_observation_discount = 0.5
         self.prefill_observation_ewma_alpha = 0.2
         self.observed_prefill_token_time_ms_by_gpu: dict[int, float] = {}
         self.future_reuse_discount = 0.5
+        # Ingress may publish an exact snapshot of requests that have not yet
+        # entered worker queues. Foreground admission uses it when available
+        # instead of treating a known hot chain as a speculative future reuse.
+        self.future_prefix_demands: dict[int, int] = {}
         self.transfer_cost_ewma_alpha = 0.25
         self.observed_transfer_extra_ms: float | None = None
         self.observed_transfer_extra_ms_by_pair: dict[tuple[int, int], float] = {}
         self.observed_placement_extra_ms_by_pair: dict[tuple[int, int], float] = {}
         self.transfer_latency_profile_default: list[tuple[int, float]] = []
         self.transfer_latency_profile_by_pair: dict[
+            tuple[int, int], list[tuple[int, float]]
+        ] = {}
+        self.transfer_residual_profile_default: list[tuple[int, float]] = []
+        self.transfer_residual_profile_by_pair: dict[
             tuple[int, int], list[tuple[int, float]]
         ] = {}
         self.observed_transfer_extra_ms_by_pair_bucket: dict[
@@ -946,12 +955,22 @@ class GlobalScheduler:
             ),
             default=1,
         )
-        predicted_reuses = max(0.0, observed_chain_accesses - 1) * self.future_reuse_discount
-        saved_prefill_ms = (
-            predicted_reuses
-            * transferred_blocks
+        historical_reuses = (
+            max(0.0, observed_chain_accesses - 1) * self.future_reuse_discount
+        )
+        forecast_counts = [
+            int(self.future_prefix_demands.get(int(block_hash), 0))
+            for item in transfers
+            for block_hash in item["hashes"]
+            if int(block_hash) >= 0
+        ]
+        forecast_reuses = min(forecast_counts, default=0)
+        predicted_reuses = max(historical_reuses, float(forecast_reuses))
+        saved_prefill_ms = predicted_reuses * sum(
+            len(item["src_blocks"])
             * max(1, int(self.block_size))
-            * self.prefill_token_time_ms
+            * self.estimate_prefill_token_time_ms(int(item["dst_gpu"]))
+            for item in transfers
         )
         plan["estimated_transfer_bytes"] = transfer_bytes
         plan["transfer_pairs"] = sorted({
@@ -959,6 +978,8 @@ class GlobalScheduler:
             for item in transfers
         })
         plan["estimated_future_reuses"] = predicted_reuses
+        plan["estimated_historical_reuses"] = historical_reuses
+        plan["estimated_forecast_reuses"] = forecast_reuses
         plan["estimated_transfer_cost_ms"] = transfer_cost_ms
         plan["estimated_saved_prefill_ms"] = saved_prefill_ms
         # Legacy field names remain in the protocol for older result readers,
@@ -970,6 +991,14 @@ class GlobalScheduler:
             self.last_rebalance_fail_reason = "low_benefit"
             return None
         return plan
+
+    def set_future_prefix_demands(self, prefix_demands: dict[int, int] | None) -> None:
+        """Replace the ingress snapshot used by foreground transfer admission."""
+        self.future_prefix_demands = {
+            int(block_hash): max(0, int(count))
+            for block_hash, count in (prefix_demands or {}).items()
+            if int(count) > 0
+        }
 
     def _estimate_transfer_bytes(self, num_blocks: int) -> int:
         return (
@@ -1021,6 +1050,8 @@ class GlobalScheduler:
         """Install a benchmark-calibrated, logical-pair latency profile."""
         self.transfer_latency_profile_default = []
         self.transfer_latency_profile_by_pair.clear()
+        self.transfer_residual_profile_default = []
+        self.transfer_residual_profile_by_pair.clear()
         if not profile:
             return
 
@@ -1040,6 +1071,38 @@ class GlobalScheduler:
             if points:
                 self.transfer_latency_profile_by_pair[pair] = points
 
+        residual_profile = profile.get("transaction_residual_profile") or {}
+        self.transfer_residual_profile_default = self._normalize_residual_points(
+            residual_profile.get("default_points", [])
+        )
+        for raw_pair, entry in (residual_profile.get("pairs") or {}).items():
+            if isinstance(raw_pair, str):
+                pair_parts = raw_pair.split(",")
+            else:
+                pair_parts = list(raw_pair)
+            if len(pair_parts) != 2:
+                continue
+            pair = self._pair_key(int(pair_parts[0]), int(pair_parts[1]))
+            raw_points = entry.get("points", []) if isinstance(entry, dict) else entry
+            points = self._normalize_residual_points(raw_points)
+            if points:
+                self.transfer_residual_profile_by_pair[pair] = points
+
+    @staticmethod
+    def _normalize_residual_points(raw_points) -> list[tuple[int, float]]:
+        points: dict[int, float] = {}
+        for raw_point in raw_points or []:
+            if isinstance(raw_point, dict):
+                transfer_bytes = int(raw_point.get("bytes", 0))
+                residual_ms = float(raw_point.get("residual_ms", 0.0))
+            else:
+                transfer_bytes = int(raw_point[0])
+                residual_ms = float(raw_point[1])
+            if transfer_bytes <= 0 or residual_ms < 0:
+                continue
+            points[transfer_bytes] = max(points.get(transfer_bytes, 0.0), residual_ms)
+        return sorted(points.items())
+
     def _profile_points(
         self,
         src_gpu: int | None,
@@ -1052,6 +1115,19 @@ class GlobalScheduler:
             if points:
                 return points
         return self.transfer_latency_profile_default
+
+    def _residual_profile_points(
+        self,
+        src_gpu: int | None,
+        dst_gpu: int | None,
+    ) -> list[tuple[int, float]]:
+        if src_gpu is not None and dst_gpu is not None:
+            points = self.transfer_residual_profile_by_pair.get(
+                self._pair_key(src_gpu, dst_gpu)
+            )
+            if points:
+                return points
+        return self.transfer_residual_profile_default
 
     @staticmethod
     def _interpolate_latency_ms(
@@ -1125,17 +1201,29 @@ class GlobalScheduler:
         transfer_bytes: int,
         src_gpu: int | None,
         dst_gpu: int | None,
-    ) -> tuple[float, float, bool]:
+    ) -> tuple[float, float, bool, bool]:
         data_path_ms, has_profile = self._transfer_data_path_latency_ms(
             transfer_bytes,
             src_gpu,
             dst_gpu,
         )
+        residual_points = self._residual_profile_points(src_gpu, dst_gpu)
+        has_calibrated_residual = bool(residual_points)
+        transaction_residual_ms = (
+            self._interpolate_latency_ms(transfer_bytes, residual_points)
+            if residual_points
+            else self.transfer_fixed_latency_ms
+        )
         static_cost_ms = (
-            self.transfer_fixed_latency_ms
+            transaction_residual_ms
             + data_path_ms * self.transfer_interference_multiplier
         )
-        return static_cost_ms, data_path_ms, has_profile
+        return (
+            static_cost_ms,
+            data_path_ms,
+            has_profile,
+            has_calibrated_residual,
+        )
 
     def _estimate_transfer_cost_ms(
         self,
@@ -1143,7 +1231,12 @@ class GlobalScheduler:
         src_gpu: int | None = None,
         dst_gpu: int | None = None,
     ) -> float:
-        static_cost_ms, data_path_ms, has_profile = self._static_transfer_cost_ms(
+        (
+            static_cost_ms,
+            data_path_ms,
+            has_profile,
+            has_calibrated_residual,
+        ) = self._static_transfer_cost_ms(
             transfer_bytes,
             src_gpu,
             dst_gpu,
@@ -1174,13 +1267,23 @@ class GlobalScheduler:
             if observed_extra_ms is not None
             else 0.0
         )
+        scaled_data_path_ms = data_path_ms * self.transfer_interference_multiplier
         placement_cost_ms = (
-            (static_cost_ms + placement_extra_ms) * self.transfer_cost_weight
+            (scaled_data_path_ms + placement_extra_ms) * self.transfer_cost_weight
             if placement_extra_ms is not None
             else 0.0
         )
+        # A scalar fallback is a bootstrap estimate, not a permanent lower
+        # bound. Once a complete dispatch-to-publish sample exists, allow that
+        # observation to correct an overly conservative fallback. A calibrated
+        # P95 residual remains a lower bound.
+        prior_cost_ms = (
+            static_cost_ms * self.transfer_cost_weight
+            if has_calibrated_residual or placement_extra_ms is None
+            else scaled_data_path_ms * self.transfer_cost_weight
+        )
         return max(
-            static_cost_ms * self.transfer_cost_weight,
+            prior_cost_ms,
             observed_cost_ms,
             placement_cost_ms,
         )
@@ -1245,28 +1348,35 @@ class GlobalScheduler:
         elapsed_s: float,
         src_gpu: int,
         dst_gpu: int,
-    ) -> None:
+    ) -> dict | None:
         """Learn plan cost from dispatch through destination commit."""
         if transfer_bytes <= 0 or elapsed_s <= 0:
-            return
-        static_cost_ms, _, has_profile = self._static_transfer_cost_ms(
+            return None
+        predicted_cost_ms = self._estimate_transfer_cost_ms(
             transfer_bytes,
             src_gpu,
             dst_gpu,
         )
-        observed_extra_ms = max(0.0, elapsed_s * 1000.0 - static_cost_ms)
+        (
+            static_cost_ms,
+            data_path_ms,
+            has_profile,
+            has_calibrated_residual,
+        ) = self._static_transfer_cost_ms(
+            transfer_bytes,
+            src_gpu,
+            dst_gpu,
+        )
+        elapsed_ms = elapsed_s * 1000.0
+        scaled_data_path_ms = data_path_ms * self.transfer_interference_multiplier
+        observed_extra_ms = max(0.0, elapsed_ms - scaled_data_path_ms)
         pair = self._pair_key(src_gpu, dst_gpu)
         alpha = min(1.0, max(0.0, self.transfer_cost_ewma_alpha))
-        # The first dispatch-to-commit sample includes process wake-up and
-        # allocator cold-start jitter. Blend it with the calibrated static
-        # prior instead of allowing one outlier to reject the rest of a
-        # forecast batch.
-        previous = self.observed_placement_extra_ms_by_pair.get(
-            pair,
-            0.0,
-        )
+        previous = self.observed_placement_extra_ms_by_pair.get(pair)
         self.observed_placement_extra_ms_by_pair[pair] = (
-            alpha * observed_extra_ms + (1.0 - alpha) * previous
+            observed_extra_ms
+            if previous is None
+            else alpha * observed_extra_ms + (1.0 - alpha) * previous
         )
         if has_profile:
             observation_key = self._observation_key(
@@ -1275,11 +1385,12 @@ class GlobalScheduler:
                 dst_gpu,
             )
             previous = self.observed_placement_extra_ms_by_pair_bucket.get(
-                observation_key,
-                0.0,
+                observation_key
             )
             self.observed_placement_extra_ms_by_pair_bucket[observation_key] = (
-                alpha * observed_extra_ms + (1.0 - alpha) * previous
+                observed_extra_ms
+                if previous is None
+                else alpha * observed_extra_ms + (1.0 - alpha) * previous
             )
             self.placement_observation_count_by_pair_bucket[observation_key] = (
                 self.placement_observation_count_by_pair_bucket.get(
@@ -1288,6 +1399,27 @@ class GlobalScheduler:
                 )
                 + 1
             )
+        bytes_per_block = max(1, self._estimate_transfer_bytes(1))
+        block_count = max(
+            1,
+            (int(transfer_bytes) + bytes_per_block - 1) // bytes_per_block,
+        )
+        return {
+            "src_gpu": int(src_gpu),
+            "dst_gpu": int(dst_gpu),
+            "pair": f"{pair[0]},{pair[1]}",
+            "blocks": block_count,
+            "bucket_blocks": self._transfer_size_bucket_blocks(transfer_bytes),
+            "bytes": int(transfer_bytes),
+            "elapsed_ms": elapsed_ms,
+            "data_path_ms": data_path_ms,
+            "scaled_data_path_ms": scaled_data_path_ms,
+            "residual_ms": observed_extra_ms,
+            "predicted_cost_ms": predicted_cost_ms,
+            "admission_cost_before_observation_ms": static_cost_ms,
+            "has_data_path_profile": has_profile,
+            "has_calibrated_residual": has_calibrated_residual,
+        }
 
     def observe_prefill(
         self,

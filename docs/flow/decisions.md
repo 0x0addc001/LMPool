@@ -2615,3 +2615,322 @@ decision demand, decision plan, decision implementation, and decision result.
   36.5 GiB/s, approximately 39.2 GB/s or 69.7% of the unidirectional peak, and
   identifies it as end-to-end effective KV bandwidth including gather, NCCL
   transfer, scatter, and synchronization rather than raw link bandwidth.
+
+## 2026-07-26: Capacity-Offload Evidence and Calibrated Transaction Prior
+
+- Decision demand: Copy-style session handoff proves cross-instance KV reuse
+  but does not prove capacity offload because it retains every source block.
+  The admission model also used a manually selected 40 ms fixed residual that
+  online nonnegative EWMAs could only increase, so an overestimated cold prior
+  could permanently reject useful plans.
+- Decision plan: Keep session handoff as the copy/reuse experiment, add an
+  independent capacity-offload workload whose success requires source release,
+  and split transfer calibration into an idle payload profile and a serving
+  transaction residual profile collected on a disjoint run.
+- Decision implementation: Added the `capacity-offload` workload and
+  `offload_verified`, which is true only when foreground move-style transfer
+  releases source blocks. Summary output now reports copied and released
+  blocks separately, and rank statistics record the free-block count after
+  source release. The control plane exports bounded per-plan
+  dispatch-to-publish observations containing pair, bytes, size bucket,
+  measured data-path latency, elapsed latency, predicted latency, and
+  nonnegative residual. `build_transfer_profile.py` can aggregate independent
+  E2E calibration JSON files into pair-by-size-bucket P95 residual points. The
+  scheduler computes
+  `residual_P95 + interference * data_path_P95`; the scalar fixed latency now
+  defaults to zero and is only a cold-start fallback. Once a complete placement
+  sample exists, online observations can correct an uncalibrated scalar
+  fallback in either direction. Added scenario filtering so calibration runs
+  only `multi-gpu-lmpool`, and updated the paper runner to use a disjoint seed
+  before formal evaluation. JSON and console diagnostics now report cost MAE,
+  P95 absolute error, and underprediction rate.
+- Decision result: The complete CPU test suite passes with 198 tests and one
+  skip. Static Python compilation, shell syntax validation, and whitespace
+  checks pass. GPU performance and offload effectiveness remain empirical
+  acceptance conditions: the next capacity-offload result must show positive
+  released blocks and foreground success before it can support an offloading
+  claim. Historical `20260725T031840Z` results still use the manual 40 ms prior
+  and must not be mixed with results from the calibrated policy.
+
+## 2026-07-26: Long-Prefix Routing and Canonical Memory-Skew Evaluation
+
+- Decision demand: The latest routing trace reduced uncached prefill work but
+  left decode dominant, so routing did not improve throughput or latency.
+  Capacity-offload admitted no transfer, while session handoff executed copy
+  plans but derived most of its TTFT gain from routing. The paper workload
+  therefore did not isolate either claimed performance mechanism.
+- Decision plan: Make reusable prefill work the independent variable in the
+  routing experiment, make memory skew the single canonical capacity-transfer
+  workload, calibrate transaction cost at plan sizes that match foreground
+  moves, and demote session handoff to optional mechanism evidence.
+- Decision implementation: The paper runner now executes routing with the same
+  192-request, 16-group trace at repeat factors 16, 32, and 48, fixes generation
+  at eight tokens, raises model-length and equal KV-budget limits as needed,
+  and records all three artifacts. `benchmark_kv_routing.py` validates the
+  configured model and batch lengths against the tokenized trace. The canonical
+  `memory-skew` trace now contains 64 warm-up requests over 16 hot prefixes,
+  32 distinct pressure requests, and 64 reuse requests. New phase-size options
+  are recorded in metadata and applied identically to all scenarios.
+  `capacity-offload` remains only as a compatibility alias. Transaction
+  calibration now collects disjoint 4/8/16/32/64-block-limited observations
+  instead of applying one large handoff residual to small foreground plans.
+  The main runner skips session handoff unless
+  `RUN_HANDOFF_ABLATION=1`.
+- Decision result: Qwen3 tokenization gives routing prompt lengths of 1,911,
+  3,783, and 5,655 tokens for the 1x/2x/3x sweep. The trace request-share rate
+  stays fixed at 91.67%, while reusable token volume increases. The revised
+  memory-skew trace contains 160 requests and a 72.96% trace token-share ratio.
+  Focused benchmark tests pass 37 cases, the complete CPU suite passes 200
+  cases with one hardware-gated skip, and Python and shell syntax checks pass.
+  GPU performance remains an explicit acceptance gate: memory skew must report
+  positive source release and foreground success before the paper claims
+  capacity-transfer benefit.
+
+## 2026-07-26: Transfer-Specific Load and Memory Pressure Workloads
+
+- Decision demand: The final paper matrix must give each mechanism a workload
+  that actually activates it. Routing needs long reusable prefixes rather than
+  relying on short generation alone. Load skew must exercise foreground and
+  background transfer under a hot-owner burst. Memory skew must create enough
+  source pressure to verify move-style capacity offload. Session handoff is
+  uncommon and should not remain a primary performance claim. Every main
+  experiment must still run on Qwen3-0.6B and Qwen3-1.7B.
+- Decision plan: Keep the routing 1x/2x/3x prefix sweep, replace the old
+  single-stage load trace with explicit source warm-up and burst reuse phases,
+  strengthen memory pressure with longer prefixes and more one-shot requests,
+  disable session handoff by default, and add an unambiguous per-model
+  completion marker to the dual-model runner.
+- Decision implementation: `load-skew` now warms six 5.7K-token prefix groups
+  with 48 requests on the source sides of three NVLink pairs, exposes the
+  remaining 144 requests as an ingress demand forecast, and submits reuse with
+  window 64. Background copies may pack up to two 24-block chains per
+  transaction, while foreground transfer remains gated by real block shortage
+  and the calibrated cost model. `memory-skew` now uses eight long groups, 64
+  warm-up requests, 64 distinct pressure requests, 64 reuse requests, repeat
+  32, submit window 32, and a common 64-block budget; background copy is
+  disabled so only source release counts as offload. E2E runtime limits are
+  raised automatically when tokenized long prompts exceed the old 2,048-token
+  default. The paper runner executes both local model snapshots and writes
+  `SUITE_COMPLETE` only after each complete model matrix. Session handoff
+  remains available through `RUN_HANDOFF_ABLATION=1` and is still used
+  internally for disjoint transaction calibration, but is not a reported main
+  workload.
+- Decision result: Offline Qwen3 tokenization reports 96.88% request-level and
+  96.56% token-level prefix sharing for revised load skew, and 62.50% and
+  71.01% respectively for revised memory skew. The routing sweep reaches
+  1,911, 3,783, and 5,655 maximum prompt tokens. Focused benchmark tests pass
+  40 cases, the complete CPU suite passes 203 cases with one hardware-gated
+  skip, and Python and shell syntax checks pass. GPU acceptance remains
+  empirical: load skew must show completed background copies and foreground
+  plans before claiming transfer relief; memory skew must additionally report
+  positive source block release and `offload_verified=true`.
+
+## 2026-07-26: Complete Small-Plan Transaction Calibration
+
+- Decision demand: The idle NVLink data-path sweep measured one- and two-block
+  payloads, but the complete dispatch-to-publish calibration started at four
+  blocks. The residual interpolator therefore assigned the four-block
+  transaction residual to every smaller plan. This conservative clamp can
+  overestimate one-block background copies and two-block foreground moves and
+  reject useful plans near the admission boundary.
+- Decision plan: Use the same power-of-two size coverage for the data-path and
+  complete-transaction profiles, and ensure that the control-plane candidate
+  limit cannot silently enlarge a nominal one- or two-block calibration.
+- Decision implementation: Changed
+  `COST_CALIBRATION_BATCH_BLOCKS` to `1 2 4 8 16 32 64`. For each calibration,
+  the per-prefix candidate limit is now `min(4, batch_limit)`, and resume
+  validation checks both limits before reusing an artifact. Updated the
+  automatic and manual commands in `PAPER_RUNBOOK.md`.
+- Decision result: The next generated cost profile will contain measured
+  transaction residuals for the smallest legal background and foreground plan
+  sizes instead of extrapolating them from four blocks. Shell syntax and
+  whitespace validation pass. GPU calibration must be rerun to populate the
+  new points; benefit, topology, generation, and capacity gates still determine
+  whether a transfer is admitted.
+
+## 2026-07-26: Nonempty Long-Prompt Warm-Up and Worker Fail-Fast
+
+- Decision demand: The revised load-skew trace raised `max_model_length` above
+  4,096 tokens. The benchmark updated Scheduler key
+  `max_num_batched_tokens` but left the legacy ModelRunner key
+  `max_num_batch_tokens` at 4,096. Integer division then produced a zero-sized
+  warm-up batch, and the launcher waited for worker capacity messages long
+  after the worker had failed.
+- Decision plan: Make one batch-token limit authoritative, construct warm-up
+  sequences from the exact token budget without allowing an empty batch, and
+  surface unexpected worker exits at the launcher pump boundary.
+- Decision implementation: ModelRunner now normalizes the legacy and canonical
+  batch-token keys, partitions the warm-up budget into nonempty sequences no
+  longer than `max_model_length`, and rejects an empty prefill batch explicitly.
+  The E2E benchmark synchronizes both aliases after resolving long-prompt
+  limits. `LLMEngine.step()` now raises with failed rank and exit code as soon
+  as a data-plane process exits. Unit tests cover a token budget below the
+  sequence limit, a remainder batch, invalid limits, empty prefill, and launcher
+  failure propagation.
+- Decision result: The corrected load-skew configuration warms a nonempty
+  5.7K-token-compatible batch rather than constructing zero sequences, and
+  future initialization failures terminate the benchmark promptly instead of
+  waiting for the capacity deadline. Focused tests pass 51 cases; the complete
+  CPU suite passes 207 cases with one hardware-gated skip. Python compilation,
+  shell syntax, and whitespace validation also pass.
+
+## 2026-07-26: Stronger Locality, Load-Relief, and Capacity-Offload Traces
+
+- Decision demand: The first revised load-skew run executed transfer but
+  round-robin still reached a 97.92% reuse-phase request hit rate after only
+  three partner-side cold prefills. Its aggregate throughput therefore stayed
+  within 1% of the baseline. The memory-skew run verified source release, but
+  equal 64-request warm-up, pressure, and reuse phases diluted the useful reuse
+  interval. Routing also stopped at 3x and stored that point under the
+  ambiguous filename `summary`.
+- Decision plan: Strengthen the workload signal without changing the routing
+  score, transfer admission, transaction protocol, or per-scenario fairness.
+  Extend the default routing sweep to 5x, preserve 10x as an optional
+  context-length sensitivity point, make every routing artifact name its
+  multiplier, increase the number of load-skew prefixes that must cold-prefill
+  on partners, and allocate a larger share of memory-skew requests to the
+  post-pressure reuse phase.
+- Decision implementation: The paper runner now produces
+  `prefix_1x`, `prefix_3x`, and `prefix_5x` routing artifacts; setting
+  `ROUTING_PREFIX_MULTIPLIERS="1 3 5 10"` adds the optional 10x point. Routing
+  output remains fixed at 8 tokens. Load skew now uses 24 5.7K-token groups,
+  48 warm-up requests, 144 reuse requests, 8 output tokens, and a common
+  192-block per-rank budget. Group pairs are striped cyclically across source
+  ranks so ordinary round-robin sends each reuse only to its owner or direct
+  NVLink partner. Memory skew now uses 12 3.8K-token groups, 24 warm-up
+  requests, 64 pressure requests, and 104 reuse requests with the same
+  64-block budget used by all five scenarios. The runbook and benchmark
+  examples use the same values, and tests cover the repeated group-to-pair
+  mapping.
+- Decision result: Offline tokenization gives maximum routing prompt lengths
+  of 1,911, 5,655, 9,399, and 18,759 tokens at 1x, 3x, 5x, and 10x, all below
+  the 40,960-token model limit. A load-skew source holds eight 22-block chains
+  within its 192-block budget; the controlled round-robin reuse expectation
+  falls from 141/144 hits (97.92%) to 132/144 (91.67%). A memory-skew source
+  holds four 14-block hot chains within its 64-block budget before concurrent
+  seven-block pressure requests create shortage. Focused benchmark tests pass
+  38 cases; the complete CPU suite passes 208 cases with one hardware-gated
+  skip. Python compilation, shell syntax, and whitespace validation pass.
+  Fresh GPU results must verify the predicted transfer and offload behavior
+  before these configurations are used for paper claims.
+
+## 2026-07-26: Remove Session Handoff and Isolate Transaction Calibration
+
+- Decision demand: Session handoff is no longer part of the paper claim or
+  desired benchmark surface. The runner had stopped reporting it by default,
+  but complete transfer-cost calibration still depended on the same workload
+  name, prompt arguments, phase helpers, and artifact metadata. Deleting only
+  the optional benchmark block would therefore have broken profile generation.
+- Decision plan: Preserve the minimum two-phase source-build and partner-reuse
+  trace required to observe complete dispatch-to-publish transactions, but
+  classify it exclusively as internal transfer calibration. Remove every
+  handoff workload option, result directory, runner switch, active benchmark
+  document entry, and corresponding test name.
+- Decision implementation: Replaced the internal workload with
+  `transfer-calibration`, renamed its prefix/warm-up arguments and phase
+  helpers, and changed calibration artifact metadata accordingly.
+  `run_paper_suite.sh` now invokes only this calibration trace for the
+  1/2/4/8/16/32/64-block residual matrix and no longer creates or executes a
+  handoff ablation directory. The public serving matrix contains only routing,
+  load skew, and memory skew. Benchmark tests now validate calibration trace
+  construction under calibration-specific names. The active README files and
+  paper runbook no longer present handoff as a current workload or result.
+- Decision result: `benchmark_e2e.py --help` exposes no handoff workload or
+  argument, focused benchmark tests pass 38 cases, and the complete CPU suite
+  passes 208 cases with one hardware-gated skip. Python compilation, shell
+  syntax, and whitespace validation pass. Existing historical result
+  directories and prior decision/review records remain immutable archives;
+  fresh paper data will use `workload=transfer-calibration` only in cost-profile
+  artifacts and will not report its serving metrics. Manual runbook commands
+  now also pass `GPU_SET` through `CUDA_VISIBLE_DEVICES`, so preflight and
+  manual runs preserve the intended physical GPU to logical-rank mapping
+  instead of depending on ambient shell state.
+
+## 2026-07-26: Add a Reproducible Workload Preflight Suite
+
+- Decision demand: The fixed preflight was documented as three manual commands.
+  That left repeated environment setup, physical-to-logical GPU mapping, output
+  isolation, and mechanism acceptance to the operator, even though none of
+  those choices should vary between paper runs.
+- Decision plan: Add one small runner for the minimum Qwen3-0.6B gate. Reuse an
+  existing compatible transfer profile, execute one repetition of 5x routing,
+  memory skew, and load skew, and reject the paper run if the expected
+  mechanisms or all primary performance directions fail.
+- Decision implementation: Added `run_preflight_suite.sh` with fixed current
+  workload parameters, offline model and GPU validation, isolated environment
+  capture, artifact-level `RESUME=1`, and JSON acceptance checks. Routing must
+  reduce uncached prefill without transfer or rank concentration. Memory skew
+  must complete a release-style foreground transfer. Load skew must complete
+  background copy, route to a replica or placement lease, and exceed the
+  measured round-robin reuse-hit rate. It does not require a foreground move:
+  copied blocks are intentionally pinned by reuse requests. Each mechanism
+  check also requires an improvement in throughput, mean TTFT, or P90 E2E
+  latency against the corresponding baseline.
+- Decision result: The paper runbook now has one preflight command and one
+  explicit resume command. A successful run writes `PREFLIGHT_COMPLETE`; a
+  failed mechanism check exits nonzero and prevents an accidental transition
+  to the expensive dual-model suite. Resume validation checks the exact trace,
+  capacity, output, and profile inputs before reusing an artifact. Shell syntax,
+  all three JSON predicates, and the complete CPU suite were validated; the
+  suite reports 208 passed tests and one hardware-gated skip.
+
+## 2026-07-26: Make Foreground Admission Aware of Known Future Reuse
+
+- Decision demand: The first automated preflight passed routing but rejected
+  both transfer workloads. The load-skew artifact already contained 12
+  successful background copies, 528 copied blocks, 72 placement-lease routes,
+  and a 100% reuse-phase hit rate, so its failure came from an incorrect gate
+  that also required foreground transfer. Memory skew was a real mechanism
+  failure: both transfer scenarios reported zero successful foreground plans,
+  while the rejection reasons were `low_benefit` and `no_plan`.
+- Decision plan: Preserve the workload split. Use load skew to validate
+  proactive background replication and load relief. Use memory skew to validate
+  release-style foreground offload. At the memory-skew phase boundary, publish
+  the benchmark ingress queue snapshot to foreground admission even when
+  background copy is disabled, so the cost model can compare transfer cost
+  against known reuse instead of a weak historical-access guess.
+- Decision implementation: Added a synchronous
+  `future_prefix_demands` control-plane message and a scheduler snapshot setter.
+  `benchmark_e2e.py` now publishes exact future block-hash demand before it
+  submits the memory-pressure phase. Foreground planning takes the larger of
+  discounted historical reuse and the ingress forecast, records both estimates
+  in the plan, and values saved prefill work with the observed destination-rank
+  prefill cost. The preflight gate now checks background copy, replica or lease
+  routing, measured reuse-hit improvement, and a primary performance benefit
+  for load skew; foreground release remains mandatory only for memory skew.
+- Decision result: A focused test reproduces the original `low_benefit`
+  rejection and verifies that the same cold chain is admitted after its exact
+  demand snapshot is installed. Control-plane tests cover publication with
+  background copy disabled. The previous load-skew artifact passes the corrected
+  acceptance predicate. The complete CPU suite passes 210 tests with one
+  hardware-gated skip. A fresh GPU preflight is required to validate foreground
+  source release because artifacts from the earlier code revision cannot prove
+  the new path.
+
+## 2026-07-27: Separate Pressure Sufficiency from Reuse Amortization
+
+- Decision demand: The corrected preflight triggered all three mechanisms, but
+  whole-trace memory-skew and load-skew improvements appeared small and the
+  10-second goodput SLA admitted every multi-GPU request. Phase-level results
+  showed that pressure was already sufficient: memory skew completed 12
+  foreground moves and released 96 blocks, while load skew completed 12
+  background plans and copied 528 blocks. The reuse phases contained the useful
+  signal, which preparation work diluted in whole-trace averages.
+- Decision plan: Do not add more cold pressure or weaken transfer admission.
+  Keep 24 memory warm-up and 64 pressure requests, extend only the reuse horizon,
+  and pre-register model-specific primary goodput SLAs. Report a fixed SLA
+  sensitivity set from each run so the paper does not depend on one
+  retrospectively selected threshold.
+- Decision implementation: Increased memory-skew requests from 192 to 256,
+  changing the final phase from 104 to 168 reuse requests while preserving all
+  pressure and capacity parameters. The paper runner now uses a 3-second primary
+  SLA for Qwen3-0.6B and a 5-second primary SLA for Qwen3-1.7B. Both runners pass
+  `2/3/5/10`-second sensitivity thresholds. `benchmark_e2e.py` computes every
+  threshold from the same completion timestamps and output-token counts, and
+  stores per-threshold goodput means and 95% Student-t confidence intervals.
+- Decision result: The revised 256-request memory trace contains 847,456 prompt
+  tokens, a 70.31% request prefix-share rate, and a 76.12% token prefix-share
+  ratio. SLA sensitivity adds no GPU work and does not affect routing or
+  transfer decisions. Because the trace and primary SLA changed, the previous
+  preflight remains a mechanism diagnostic but cannot authorize the revised
+  formal suite; a fresh Qwen3-0.6B preflight is required.

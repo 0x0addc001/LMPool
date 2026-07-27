@@ -14,14 +14,16 @@ Example:
   uv run python benchmarks/benchmark_kv_routing.py \
     --model-name-or-path /path/to/Qwen3-0.6B \
     --world-size 6 \
-    --num-prompts 128 \
-    --prompt-repeat 16 \
-    --max-tokens 64 \
+    --num-prompts 192 \
+    --prompt-repeat 80 \
+    --max-tokens 8 \
+    --max-model-length 10240 \
+    --max-num-batched-tokens 10240 \
     --locality-prefix-groups 16 \
     --nvlink-pairs "0,1;2,3;4,5" \
     --submit-window 16 \
-    --kv-block-budget 128 \
-    --gpu-memory-utilization 0.5 \
+    --kv-block-budget 384 \
+    --gpu-memory-utilization 0.7 \
     --repetitions 5 \
     --output-json benchmarks/results/routing.json \
     --output-figure benchmarks/results/routing.png
@@ -39,6 +41,7 @@ try:
         SamplingParams,
         build_prompts,
         make_config,
+        parse_goodput_sla_sweep_ms,
         parse_pairs,
         profile_trace_prefix_sharing,
         print_summary_table,
@@ -54,6 +57,7 @@ except ImportError:
         SamplingParams,
         build_prompts,
         make_config,
+        parse_goodput_sla_sweep_ms,
         parse_pairs,
         profile_trace_prefix_sharing,
         print_summary_table,
@@ -99,8 +103,25 @@ def parse_args():
         type=float,
         default=MODEL_CONFIG["gpu_memory_utilization"],
     )
+    parser.add_argument(
+        "--max-model-length",
+        type=int,
+        default=MODEL_CONFIG["max_model_length"],
+        help="Maximum prompt-plus-output length used by the routing workload.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=MODEL_CONFIG["max_num_batched_tokens"],
+        help="Maximum prefill/decode tokens scheduled in one model batch.",
+    )
     parser.add_argument("--submit-window", type=int, default=16)
     parser.add_argument("--goodput-e2e-sla-ms", type=float, default=10000.0)
+    parser.add_argument(
+        "--goodput-e2e-sla-sweep-ms",
+        default="2000,3000,5000,10000",
+        help="Comma-separated E2E SLA sensitivity thresholds in milliseconds.",
+    )
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-figure", default="")
     parser.add_argument(
@@ -162,18 +183,38 @@ def _validate_args(args) -> None:
         raise SystemExit("--kv-block-budget must be >= 1")
     if not 0.0 < args.gpu_memory_utilization <= 1.0:
         raise SystemExit("--gpu-memory-utilization must be in (0, 1]")
+    if args.max_model_length < 1:
+        raise SystemExit("--max-model-length must be >= 1")
+    if args.max_num_batched_tokens < args.max_model_length:
+        raise SystemExit(
+            "--max-num-batched-tokens must be >= --max-model-length"
+        )
     if not 1 <= args.locality_prefix_groups <= args.num_prompts:
         raise SystemExit(
             "--locality-prefix-groups must be between 1 and --num-prompts"
         )
+    try:
+        parse_goodput_sla_sweep_ms(
+            args.goodput_e2e_sla_sweep_ms,
+            args.goodput_e2e_sla_ms,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _configure(config: dict, args) -> dict:
     config["model_name_or_path"] = args.model_name_or_path
     config["max_cached_blocks"] = args.kv_block_budget
     config["gpu_memory_utilization"] = args.gpu_memory_utilization
+    config["max_model_length"] = args.max_model_length
+    config["max_num_batch_tokens"] = args.max_num_batched_tokens
+    config["max_num_batched_tokens"] = args.max_num_batched_tokens
     config["require_exact_kv_block_budget"] = True
     config["random_seed"] = args.seed
+    config["benchmark_goodput_sla_sweep_s"] = parse_goodput_sla_sweep_ms(
+        args.goodput_e2e_sla_sweep_ms,
+        args.goodput_e2e_sla_ms,
+    )
     return config
 
 
@@ -211,6 +252,14 @@ def main():
         raise SystemExit(
             f"cannot resolve model config for {args.model_name_or_path}: {exc}"
         ) from exc
+    if args.max_model_length > int(runtime_model_config["max_position"]):
+        raise SystemExit(
+            f"--max-model-length {args.max_model_length} exceeds model limit "
+            f"{runtime_model_config['max_position']}"
+        )
+    runtime_model_config["max_model_length"] = args.max_model_length
+    runtime_model_config["max_num_batch_tokens"] = args.max_num_batched_tokens
+    runtime_model_config["max_num_batched_tokens"] = args.max_num_batched_tokens
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     prompts = build_prompts(
         tokenizer,
@@ -220,6 +269,13 @@ def main():
         locality_prefix_groups=args.locality_prefix_groups,
         seed=args.seed,
     )
+    max_prompt_tokens = max(len(tokenizer.encode(prompt)) for prompt in prompts)
+    if max_prompt_tokens + args.max_tokens > args.max_model_length:
+        raise SystemExit(
+            f"longest prompt ({max_prompt_tokens} tokens) plus --max-tokens "
+            f"({args.max_tokens}) exceeds --max-model-length "
+            f"({args.max_model_length})"
+        )
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
@@ -287,7 +343,8 @@ def main():
             trial["theoretical_prefix_hit_rate"] = trace_request_share_rate
 
     summary_title = (
-        f"KV-Aware Routing Benchmark Summary ({model_metadata['label']})"
+        f"KV-Aware Routing Benchmark Summary ({model_metadata['label']}, "
+        f"{max_prompt_tokens}-token prefix workload)"
     )
     print_summary_table(results, title=summary_title)
     if args.output_figure:
@@ -301,10 +358,20 @@ def main():
             resolved_config={
                 **runtime_model_config,
                 "resolved_kv_block_budget": args.kv_block_budget,
+                "resolved_max_prompt_tokens": max_prompt_tokens,
                 "resolved_nvlink_pairs": pairs or [],
             },
         )
         metadata["dataset_profile"] = dataset_profile
+        metadata["metric_definitions"] = {
+            "goodput_sla_sweep_tok_s": (
+                "output-token throughput for requests meeting each E2E SLA; "
+                "JSON keys are SLA thresholds in milliseconds"
+            ),
+            "ci95": (
+                "two-sided Student-t half-width across complete scenario repetitions"
+            ),
+        }
         save_summary_json(
             {result.name: asdict(result) for result in results},
             args.output_json,

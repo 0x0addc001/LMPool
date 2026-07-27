@@ -378,7 +378,12 @@ def data_plane_process(
                 send_queue.put({
                     "type": "runtime_stats",
                     "rank": rank,
-                    "data": {"transfer_release_count": len(release_source_blocks)},
+                    "data": {
+                        "transfer_release_count": len(release_source_blocks),
+                        "free_blocks_after_release": len(
+                            scheduler.block_manager.free_block_ids
+                        ),
+                    },
                 })
             send_block_state()
             return cache_phase_result(

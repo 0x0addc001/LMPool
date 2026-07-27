@@ -10,23 +10,35 @@ specific evaluation question and is a complete executable script:
 - `benchmark_kv_transfer.py`: does the NCCL/NVLink data path move the configured
   KV payload correctly and at competitive latency/bandwidth? It contains no
   model serving or routing work.
-- `benchmark_e2e.py`: does full LMPool outperform the routing-only and
-  transfer-only ablations in the controlled session-handoff workload? It runs
-  all five system configurations and reports warm-up and reuse phases
-  separately.
+- `benchmark_e2e.py`: can transfer relieve load and memory-placement skew?
+  `load-skew` uses source warm-up followed by a high-concurrency reuse burst to
+  exercise forecast-driven background copy and replica-aware routing.
+  `memory-skew` disables background copy and requires foreground transfer to
+  release source blocks. Its phase boundary publishes the exact remaining
+  reuse demand before pressure so foreground admission can value retained KV.
 
 `build_transfer_profile.py` is a calibration utility rather than a fourth
 benchmark. It combines per-physical-pair microbenchmark JSON files into the
-logical-pair, size-aware latency profile consumed by `benchmark_e2e.py`.
+logical-pair, size-aware latency profile consumed by `benchmark_e2e.py`. The
+paper runner additionally invokes the internal `transfer-calibration` trace to
+measure complete dispatch-to-publish transaction residuals. This trace is not
+a serving workload and its latency/throughput are not paper performance data.
 
 The complete six-GPU paper command matrix, environment capture, acceptance
 criteria, and test commands are in [`PAPER_RUNBOOK.md`](./PAPER_RUNBOOK.md).
+[`run_preflight_suite.sh`](./run_preflight_suite.sh) first runs one
+Qwen3-0.6B repetition of 5x routing, memory skew, and load skew, then checks
+that locality, foreground offload, background copy, route balance, and at
+least one primary performance direction are valid. Reusing the same
+`PREFLIGHT_ID` with `RESUME=1` skips complete workload artifacts.
 [`run_paper_suite.sh`](./run_paper_suite.sh) executes that matrix for both
 Qwen3-0.6B and Qwen3-1.7B. It resolves each model's architecture, KV geometry,
 and dtype from `config.json`, so changing `--model-name-or-path` does not reuse
 the 0.6B structure accidentally. After an interrupted run, keep the same
 `OUT` and rerun with `RESUME=1`; only nonempty JSON artifacts containing both
 `metadata` and the expected 7 transfer, 3 routing, or 5 E2E results are reused.
+The paper runner evaluates routing at 1x, 3x, and 5x prefix length. A model is
+complete only after its output directory contains `SUITE_COMPLETE`.
 
 ## Scenarios
 
@@ -39,7 +51,11 @@ the 0.6B structure accidentally. After an interrupted run, keep the same
 ## Metrics
 
 - `tput(tok/s)`: generated output tokens per second.
-- `goodput`: generated output tokens per second for requests whose end-to-end latency is within `--goodput-e2e-sla-ms`.
+- `goodput`: generated output tokens per second for requests whose end-to-end latency is within `--goodput-e2e-sla-ms`. Formal runs use 3 seconds for Qwen3-0.6B and 5 seconds for Qwen3-1.7B.
+- `goodput_sla_sweep_tok_s`: goodput at each threshold from
+  `--goodput-e2e-sla-sweep-ms`, computed from the same completion samples
+  without rerunning inference. Repeated runs also report a 95% confidence
+  interval for every threshold.
 - `ttft(ms)`: mean/average time from request submission to the first generated token event reported by the data-plane worker.
 - `tpot(ms)`: mean decode time per output token. For each request with \(N>1\)
   output tokens, this is `(worker completion timestamp - worker first-token
@@ -99,12 +115,10 @@ the 0.6B structure accidentally. After an interrupted run, keep the same
   all sent blocks. A high release count with a low hot ratio relieves capacity
   but does not preserve the data reused in the final phase.
 - `reuse req hit` / `reuse tok ratio`: request hit rate and cached-token ratio
-  in the final reuse phase of `memory-skew` or `session-handoff`; other
-  workloads report zero.
+  in the final reuse phase of a transfer workload; other workloads report zero.
 - `lease route`: requests routed to a committed replica through a forecast-bound
-  placement lease. A completed handoff assigns half of each prefix's forecast
-  demand to each valid copy; odd remainders alternate across adjacent prefixes
-  so both sides of the NVLink pair serve reuse from the first submit window.
+  placement lease. A completed placement assigns forecast demand across valid
+  copies so both sides of the NVLink pair can serve reuse.
 - `place cand` / `place done`: accepted and completed prefix candidates.
   `plan run` / `plan done` count actual pair-level protocol transactions; one
   plan can contain several candidates and one contiguous KV payload.
@@ -134,34 +148,45 @@ If physical GPU 0 and 2 are NVLink-connected, expose them as two logical devices
 ```bash
 CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_kv_routing.py \
   --world-size 2 \
-  --num-prompts 128 \
-  --prompt-repeat 16 \
-  --max-tokens 64 \
+  --num-prompts 192 \
+  --prompt-repeat 48 \
+  --max-tokens 8 \
+  --max-model-length 6144 \
+  --max-num-batched-tokens 6144 \
   --temperature 0.6 \
   --ignore-eos \
   --seed 0 \
   --repetitions 5 \
   --locality-prefix-groups 16 \
   --nvlink-pairs 0,1 \
-  --kv-block-budget 128 \
-  --gpu-memory-utilization 0.5 \
+  --kv-block-budget 384 \
+  --gpu-memory-utilization 0.7 \
   --submit-window 16 \
-  --goodput-e2e-sla-ms 120000 \
+  --goodput-e2e-sla-ms 3000 \
+  --goodput-e2e-sla-sweep-ms 2000,3000,5000,10000 \
   --output-json /tmp/routing.json \
   --output-figure /tmp/routing.png
 ```
 
 This experiment supports the routing claim only if routing-only improves
 throughput or latency while increasing data-plane token reuse over multi-GPU.
-Transfer counters must remain zero.
+Transfer counters must remain zero. The formal suite repeats the experiment at
+`--prompt-repeat 16,48,80` with `--max-tokens 8`; shortening decode is only a
+control, while the increasing prefix length is the independent variable.
 
 ## End-to-End Experiment
 
-Use `benchmark_e2e.py --workload session-handoff` for the five-configuration
-system comparison. Set `--handoff-warmup-prompts` equal to
-`--handoff-prefix-groups` so one cache-building round is followed by multiple
-reuse rounds. LMPool must exceed both routing-only and transfer-only; otherwise
-the result supports the individual mechanisms but not their composition.
+Use `benchmark_e2e.py --workload load-skew` for the background-transfer load
+relief experiment. Its warm-up phase places 24 long hot prefixes on source
+ranks, and its reuse phase submits a large burst after the control plane sees
+exact future-prefix demand. Use
+`benchmark_e2e.py --workload memory-skew --disable-background-copy` for the
+five-configuration offload experiment. A publishable offload result requires
+`offload_verified=true`, positive `transfer_release_count`, and successful
+foreground plans; sent blocks retained at the source prove replication, not
+capacity relief. `capacity-offload` is a compatibility alias for this same
+trace. The exact remaining reuse demand is also published before pressure so
+foreground admission does not undervalue the retained hot chains.
 
 All scripts print `saved json: ...` and `saved figure: ...` after successful
 export. Parent directories are created automatically.
@@ -176,17 +201,21 @@ traces have the following intrinsic reuse potential:
 
 | Workload | Requests | Exact prefix construction | Prompt tokens | Request prefix share | Token prefix share |
 | --- | ---: | --- | ---: | ---: | ---: |
-| Locality/routing | 192 | 16 recurring long-prefix groups, 12 requests per group | 365,880 | 91.67% | 86.20% |
-| Load skew | 192 | 1 long hot group with 144 requests, plus 4 shorter recurring cold groups with 12 requests each | 320,232 | 97.40% | 90.57% |
-| Memory skew | 128 | 15 reusable long hot groups, plus 32 shorter one-shot pressure prefixes | 214,064 | 63.28% | 67.81% |
-| Session handoff | 128 | 32 session-prefix groups, each with 1 warm-up request and 3 reuse requests | 244,048 | 75.00% | 70.49% |
+| Locality/routing 1x | 192 | 16 recurring prefix groups, 12 requests per group, repeat 16 | 365,880 | 91.67% | 86.20% |
+| Locality/routing 3x | 192 | same groups and request order, repeat 48 | 1,084,728 | 91.67% | 91.38% |
+| Locality/routing 5x | 192 | same groups and request order, repeat 80 | 1,803,576 | 91.67% | 89.93% |
+| Load skew | 192 | 48 source warm-up and 144 burst reuse requests over 24 long groups, repeat 48 | 1,084,920 | 87.50% | 87.21% |
+| Memory skew | 256 | 24 warm-up requests over 12 long groups, 64 one-shot pressure prefixes, and 168 hot-prefix reuse requests, repeat 32 | 847,456 | 70.31% | 76.12% |
 
 These are trace-level upper bounds under ordered replay, unlimited cache, and
 perfect placement. Compare them with runtime `DP req hit` and `DP tok reuse` to
 quantify losses from finite capacity, dispatch, eviction, and transfer policy.
-For memory skew, the 128 requests are explicitly split into 32 warm-up, 32
-one-shot pressure, and 64 hot-prefix reuse requests. The pressure prefixes are
-not a reusable group: each pressure request has its own distinct prefix.
+For load skew, each of the 24 hot groups is observed twice before a 144-request
+reuse burst. For memory skew, the 256 requests are explicitly split into 24
+warm-up, 64 one-shot pressure, and 168 hot-prefix reuse requests. Each of the
+12 hot groups is observed twice before pressure. The
+pressure prefixes are not a reusable group: each pressure request has its own
+distinct prefix.
 
 ## Parameters
 
@@ -206,7 +235,13 @@ not a reusable group: each pressure request has its own distinct prefix.
   Tail-metric intervals are computed across the per-run tail statistics, not
   by pooling requests. Use at least `3` for paper results; the default `1` is
   intended for development runs.
-- `--workload`: `locality`, `load-skew`, `memory-skew`, or `session-handoff`.
+- `--workload`: `locality`, `load-skew`, `memory-skew`, or the internal
+  `transfer-calibration` trace.
+  `load-skew` is a deterministic two-phase trace: repeated source-side warm-up
+  builds access counts and KV ownership, then a high-concurrency reuse burst
+  creates owner load pressure. The phase boundary provides exact remaining
+  demand to background admission; foreground transfer remains gated by an
+  actual block shortage and the same calibrated cost model.
   `memory-skew` is a
   deterministic three-phase trace: hot-prefix warm-up on source ranks,
   unique-prefix pressure on those ranks, then hot-prefix reuse. For
@@ -219,28 +254,36 @@ not a reusable group: each pressure request has its own distinct prefix.
   topology-aware policy decisions.
   Per-rank JSON diagnostics expose `warmup_submitted`, `pressure_submitted`,
   and `reuse_submitted` so placement fairness can be checked directly.
-  `session-handoff` builds prefixes only on source ranks, then continues the
-  same sessions on their NVLink partners. Its warm-up/reuse ratio is explicit.
-  Use it to isolate copy benefit; use `memory-skew` for capacity pressure.
+  `capacity-offload` is a deprecated compatibility alias for the same
+  `memory-skew` trace. `transfer-calibration` builds synthetic prefixes on
+  source ranks and reuses them on direct partners solely to produce complete
+  transaction observations for the cost profile.
 - `--locality-prefix-groups`: number of distinct long shared-prefix groups in
   the `locality` workload (default `16`). Requests are balanced across groups
   and deterministically shuffled with `--seed`, preventing prefix IDs from
   accidentally aligning with round-robin ranks. More groups expose redundant
   per-GPU caching without routing; keep the value no larger than
   `--num-prompts`.
+- `--load-skew-prefix-groups`: number of long hot prefixes initially assigned
+  to NVLink source ranks. The paper setting is `24`, eight per physical pair.
+- `--load-skew-warmup-prompts`: size of the source warm-up phase. `0` selects
+  one quarter of the trace while covering every group. The paper setting is
+  `48`, followed by `144` reuse requests at submit window `64`.
 - `--memory-skew-prefix-groups`: number of long hot prefixes preserved across
   the three memory-skew phases. `0` automatically chooses the largest odd value
   up to `15` that fits both warm-up and reuse. Each group is warmed repeatedly
   on one source rank; the reuse phase interleaves groups so round-robin cannot
   saturate its cache after one miss to a single global hotspot.
-- `--handoff-prefix-groups`: independent session prefixes shared by the two
-  `session-handoff` phases. `0` selects up to `32`; the maximum must fit both
-  phases. A value equal to the warm-up request count removes destination
-  self-warmup from the baseline.
-- `--handoff-warmup-prompts`: requests used to build source-side KV before the
-  handoff. `0` preserves the original 50/50 split. Set it to the prefix-group
-  count to measure several reuse rounds after one cache-building round, e.g.
-  `32` warm-up and `96` reuse requests for `--num-prompts 128`.
+- `--memory-skew-warmup-prompts`: explicit number of requests that establish
+  hot KV on source ranks. `0` uses one quarter of the trace. The paper setting
+  is `24`, which observes each of 12 groups twice before pressure.
+- `--memory-skew-pressure-prompts`: explicit number of distinct one-shot
+  prefixes sent to source ranks to create block shortage. `0` uses one quarter
+  of the trace. The paper setting is `64` with `--prompt-repeat 32`.
+- `--calibration-prefix-groups`: synthetic prefix groups represented in both
+  phases of the internal transaction calibration trace.
+- `--calibration-warmup-prompts`: requests that build source-side KV before
+  the calibration trace reuses those prefixes on direct partners.
 - `--output-json`: write a schema-v2 artifact with top-level `metadata` and
   `results`. Metadata records the exact command, Git state, model structure,
   dtype, and resolved runtime config; repeated scenario results include all raw
@@ -262,6 +305,8 @@ not a reusable group: each pressure request has its own distinct prefix.
   `--kv-block-budget`; increase this only when the requested budget cannot be
   realized.
 - `--goodput-e2e-sla-ms`: end-to-end latency SLA for counting goodput tokens.
+- `--goodput-e2e-sla-sweep-ms`: comma-separated SLA thresholds reported from
+  the same request samples. JSON keys are milliseconds; values are tokens/s.
 - `--skip-pool`: skip `multi-gpu-lmpool`.
 - `--output-figure`: write the summary figure to PNG. Parent directories are created automatically, and the script prints `saved figure: ...` on success.
 - `--submit-window`: maximum in-flight requests. Use `4` or `8` to let earlier requests populate the global page table before later routing decisions; use `0` or a negative value for burst submission of all requests.
@@ -269,6 +314,11 @@ not a reusable group: each pressure request has its own distinct prefix.
 - `--background-copy-max-blocks`: maximum prefix blocks contributed by one
   candidate chain. Candidates for the same directed NVLink pair are internally
   coalesced into a bounded plan, amortizing protocol and payload setup.
+- `--background-copy-batch-max-blocks`: maximum total blocks in one coalesced
+  directed-pair transaction. It is a transaction bound, not a fixed serving
+  batch size.
+- `--background-copy-batch-max-candidates`: maximum candidate chains examined
+  while building one coalesced directed-pair transaction.
 - `--background-copy-cooldown-s`: cooldown before the same prefix can trigger another copy on the same source-target pair. Try `0.5` when evaluating background copy impact.
 - `--background-copy-hot-threshold`: minimum worker-reported access count for every block in a maximal hot prefix chain. Larger values reduce speculative placement.
 - `--background-copy-min-load-skew`: minimum owner-to-partner sequence-pressure gap for route-originated candidate discovery. Phase-boundary ingress forecasts use observed placement skew instead of this transient load gap.
@@ -284,11 +334,10 @@ not a reusable group: each pressure request has its own distinct prefix.
 - `--foreground-transfer-min-benefit-ratio`: minimum predicted saved-prefill-ms / transfer-ms ratio required for foreground transfer.
 - `--foreground-transfer-bandwidth-gib-s`: scalar compatibility fallback used only when no size-aware profile is supplied.
 - `--foreground-transfer-profile-json`: logical-pair latency profile generated by `build_transfer_profile.py`; the E2E runner validates KV bytes per block before starting workers.
-- `--foreground-transfer-fixed-latency-ms`: fixed per-plan loaded-serving
-  prior outside the idle data-path profile. The paper default is a manually
-  selected conservative 40 ms cold-start setting rather than a parameter
-  fitted by a standalone pilot; it represents scheduling, NCCL queuing, target
-  publication, and block registration.
+- `--foreground-transfer-fixed-latency-ms`: scalar cold-start fallback used
+  only when neither a size-matched transaction residual nor an online
+  observation is available. The paper runner sets it to `0` and calibrates
+  dispatch-to-publish residuals at 4/8/16/32/64-block transaction limits.
 - `--foreground-transfer-interference-multiplier`: multiplier applied only to
   the payload-varying idle profile latency. The paper default is 1.2. Keeping
   fixed transaction work in the preceding additive term avoids overpricing
@@ -362,8 +411,9 @@ Routing cost-model defaults are set in `MODEL_CONFIG` inside `benchmark_e2e.py`:
 - For publishable comparisons, keep `--ignore-eos`, set an explicit `--seed`,
   and use `--repetitions 3` or more. A repeated JSON result includes
   raw `trial_results`, sample standard deviations, and `*_ci95` half-widths.
-- `multi-gpu` is an online round-robin baseline except for memory-skew's
-  explicitly defined cross-pair reuse phase; it is not static offline sharding.
+- `multi-gpu` is an online round-robin baseline except for the explicitly
+  phased cross-pair reuse in load-skew and memory-skew;
+  it is not static offline sharding.
 - `multi-gpu-kv-transfer` uses the same ingress placement as `multi-gpu` and
   enables foreground transfer. All scenarios retain the same block budget.
 - Rebalance requests are based on the actual block shortage, not the full
@@ -385,8 +435,10 @@ Routing cost-model defaults are set in `MODEL_CONFIG` inside `benchmark_e2e.py`:
   `--kv-block-budget` fixed and vary only workload pressure and background-copy
   parameters. A very small common budget is useful for failure analysis, but it
   often leaves too little target space for copy replication to improve hits.
-  In `memory-skew`, the ingress forecasts hashes from the not-yet-submitted reuse
-  phase after warm-up. The control plane drains accepted low-load placement
+  In `load-skew`, the ingress forecast supplies hashes from the not-yet-submitted
+  reuse burst after warm-up. `memory-skew` deliberately disables background
+  copy so source release cannot be confused with replication. The control plane
+  drains accepted low-load placement
   plans before the next phase, and this drain time is included in benchmark
   elapsed time. `Prefill Compute Diagnostics` separates prompt, cached, and
   actually executed uncached tokens and reports the explicit placement wait.

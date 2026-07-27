@@ -623,7 +623,33 @@ def test_plan_rebalance_accepts_hot_transfer_and_reports_cost():
     assert plan["estimated_saved_prefill_ms"] > plan["estimated_transfer_cost_ms"]
 
 
-def test_transfer_cost_smooths_end_to_end_placement_observation_per_pair():
+def test_plan_rebalance_uses_exact_ingress_forecast_for_cold_chain():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_hash[0] = {0: 11}
+    gbm.block_access_time[0] = {0: 1.0}
+    gbm.block_access_count[0] = {0: 1}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 100.0
+    scheduler.transfer_fixed_latency_ms = 100.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.prefill_token_time_ms = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 1.5
+
+    assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=1) is None
+    assert scheduler.last_rebalance_fail_reason == "low_benefit"
+
+    scheduler.set_future_prefix_demands({11: 100})
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    assert plan["estimated_historical_reuses"] == 0.0
+    assert plan["estimated_forecast_reuses"] == 100
+    assert plan["estimated_future_reuses"] == 100.0
+    assert plan["estimated_saved_prefill_ms"] > plan["estimated_transfer_cost_ms"]
+
+
+def test_first_complete_placement_observation_is_installed_per_pair():
     gbm = GlobalBlockManager(rank=0, world_size=4, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1), (2, 3)])
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
     scheduler.transfer_bandwidth_gib_s = 10.0
@@ -635,7 +661,7 @@ def test_transfer_cost_smooths_end_to_end_placement_observation_per_pair():
 
     scheduler.observe_placement(transfer_bytes, 0.5, 0, 1)
 
-    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 0, 1) == 200.0
+    assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 0, 1) == 500.0
     assert scheduler._estimate_transfer_cost_ms(transfer_bytes, 2, 3) == 100.0
 
 
@@ -714,6 +740,65 @@ def test_transfer_latency_profile_interpolates_per_pair():
     assert scheduler._estimate_transfer_cost_ms(200, 2, 3) == 40.0
     assert scheduler._estimate_transfer_cost_ms(50, 0, 1) == 10.0
     assert scheduler._estimate_transfer_cost_ms(400, 0, 1) == 40.0
+
+
+def test_transaction_residual_profile_replaces_scalar_fallback_by_pair_and_size():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 40.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.set_transfer_latency_profile({
+        "default_points": [
+            {"bytes": 100, "latency_ms": 10.0},
+            {"bytes": 300, "latency_ms": 30.0},
+        ],
+        "pairs": {
+            "0,1": {
+                "points": [
+                    {"bytes": 100, "latency_ms": 5.0},
+                    {"bytes": 300, "latency_ms": 15.0},
+                ],
+            },
+        },
+        "transaction_residual_profile": {
+            "default_points": [
+                {"bytes": 100, "residual_ms": 8.0},
+                {"bytes": 300, "residual_ms": 12.0},
+            ],
+            "pairs": {
+                "0,1": {
+                    "points": [
+                        {"bytes": 100, "residual_ms": 2.0},
+                        {"bytes": 300, "residual_ms": 6.0},
+                    ],
+                },
+            },
+        },
+    })
+
+    assert scheduler._estimate_transfer_cost_ms(200, 0, 1) == 14.0
+    assert scheduler._estimate_transfer_cost_ms(200, 2, 3) == 30.0
+
+
+def test_complete_placement_observation_can_correct_manual_fallback_downward():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 40.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.transfer_cost_ewma_alpha = 1.0
+    scheduler.set_transfer_latency_profile({
+        "pairs": {
+            "0,1": {
+                "points": [{"bytes": 100, "latency_ms": 10.0}],
+            },
+        },
+    })
+
+    assert scheduler._estimate_transfer_cost_ms(100, 0, 1) == 50.0
+    observation = scheduler.observe_placement(100, 0.025, 0, 1)
+
+    assert observation is not None
+    assert observation["residual_ms"] == 15.0
+    assert observation["has_calibrated_residual"] is False
+    assert scheduler._estimate_transfer_cost_ms(100, 0, 1) == 25.0
 
 
 def test_loaded_profile_prior_rejects_small_plan_but_keeps_amortized_large_plan():

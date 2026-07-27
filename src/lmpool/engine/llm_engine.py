@@ -151,6 +151,26 @@ class LLMEngine:
             self._control_plane_restart_count += 1
             self._start_control_plane_process()
 
+    def _ensure_worker_processes(self) -> None:
+        with self._lifecycle_lock:
+            if self._exiting or self._exited:
+                return
+            failures = []
+            for rank, process in enumerate(self.processes):
+                if process.is_alive():
+                    continue
+                exitcode = process.exitcode
+                if exitcode is not None:
+                    failures.append((rank, exitcode))
+            if failures:
+                details = ", ".join(
+                    f"rank {rank} exitcode {exitcode}"
+                    for rank, exitcode in failures
+                )
+                raise RuntimeError(
+                    f"data-plane worker exited unexpectedly: {details}"
+                )
+
 
     def exit(self):
         with self._lifecycle_lock:
@@ -237,6 +257,7 @@ class LLMEngine:
     def step(self) -> tuple[list[tuple[int, list[int]]], list[tuple[int, int]], list[dict], list[dict]]:
         """Pump worker messages once and return any newly finished sequences."""
         with self._pump_lock:
+            self._ensure_worker_processes()
             self._ensure_control_plane_process()
             finished, first_tokens, prefill_stats, runtime_stats = self._drain_worker_messages()
             if not finished:

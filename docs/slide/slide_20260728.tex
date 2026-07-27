@@ -202,7 +202,7 @@
         \item Qwen3-0.6B and Qwen3-1.7B, BF16
         \item Same per-worker KV budget
         \item 5 trials, fixed seed, fixed 64-token output
-        \item Controlled Mini-vLLM ablations
+        \item Controlled internal ablations
       \end{itemize}
     \end{column}
     \begin{column}{0.52\textwidth}
@@ -370,7 +370,7 @@
   \small
   \begin{itemize}
     \item Synthetic traces; exact future-demand signal in the positive handoff workload
-    \item Internal Mini-vLLM ablations rather than production-engine comparisons
+    \item Internal ablations rather than production-engine comparisons
     \item Six RTX 3090 GPUs, two sub-2B models with identical KV geometry
     \item Fixed 256-token block size; no block-size sensitivity study
     \item Manual 40 ms transaction prior; no held-out cost-prediction error or policy ablation

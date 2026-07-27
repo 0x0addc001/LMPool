@@ -105,7 +105,7 @@ Foreground transfer requests only the actual shortage, not an entire sequence. B
 
 ![LMPool transfer cost and benefit model](./assets/fig_transfer_cost_model_dark.png)
 
-The static estimate interpolates the plan payload on a measured P95 latency curve for each logical NVLink pair, scales only that payload-varying term for loaded inference interference, and adds a fixed full-transaction prior. The paper setting uses `40 ms + 1.2 x profile_P95(plan_bytes)`: 40 ms is a manually selected conservative cold-start setting for scheduling, NCCL queuing, target publication, and block registration outside the idle microbenchmark, not a parameter fitted by a standalone pilot. The runner measures 1/2/4/8/16/32/64 blocks and validates that the profile matches the serving model's KV bytes per block. Runtime source-transfer and dispatch-to-publish observations update independent pair-by-size-bucket EWMAs; admission takes the maximum of the static and observed estimates. Foreground benefit uses discounted chain reuse, while background benefit counts at most one avoidable cold prefill because the destination self-warms after its first miss. A plan is admitted only when saved prefill time clears the configured safety ratio and all source-validity and target-capacity gates.
+The static estimate interpolates the plan payload on a measured P95 latency curve for each logical NVLink pair and scales that payload-varying term for loaded inference interference. A disjoint calibration run measures complete dispatch-to-publish transactions and stores the P95 nonnegative residual, grouped by pair and plan-size bucket. The resulting model is `residual_P95(pair,size) + interference x data_path_P95(pair,bytes)`. The scalar fixed-latency option is now only a cold-start fallback and defaults to zero; after a complete placement observation, the online estimate can correct that fallback upward or downward. The runner measures 1/2/4/8/16/32/64 blocks and validates that the profile matches the serving model's KV bytes per block. Runtime source-transfer and dispatch-to-publish observations update independent pair-by-size-bucket EWMAs. Foreground benefit uses discounted chain reuse, while background benefit counts at most one avoidable cold prefill because the destination self-warms after its first miss. A plan is admitted only when saved prefill time clears the configured safety ratio and all source-validity and target-capacity gates.
 
 Each plan follows an idempotent transaction:
 
@@ -170,7 +170,7 @@ Three complete benchmark entry points are retained:
 | --- | --- |
 | `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload correctness and the pair/plan-size latency profile used by transfer admission |
 | `benchmarks/benchmark_kv_routing.py` | Routing-only locality and prefill-reuse benefit |
-| `benchmarks/benchmark_e2e.py` | Five-way system comparison under load-skew, memory-skew, and session-handoff workloads |
+| `benchmarks/benchmark_e2e.py` | Five-way comparisons for load-skew background transfer and memory-skew foreground capacity offload |
 
 The exact dual-model paper matrix, fixed variables, offline model paths, acceptance criteria, and commands are in [benchmarks/PAPER_RUNBOOK.md](./benchmarks/PAPER_RUNBOOK.md). Metric and workload definitions are in [benchmarks/README.md](./benchmarks/README.md).
 
@@ -180,31 +180,31 @@ The benchmark profiles prefix sharing before launching the system. `trace req sh
 
 | Workload | Exact prefix construction | Request/token sharing |
 | --- | --- | ---: |
-| Locality/routing | 192 requests across 16 recurring long-prefix groups, 12 requests per group | 91.67% / 86.20% |
-| Load skew | 1 long hot group with 144 requests, plus 4 shorter recurring cold groups with 12 requests each | 97.40% / 90.57% |
-| Memory skew | 32 warm-up requests over 15 reusable long hot groups, 32 distinct one-shot shorter pressure prefixes, then 64 hot-prefix reuse requests | 63.28% / 67.81% |
-| Session handoff | 32 session-prefix groups, each with 1 source warm-up request and 3 partner-side reuse requests | 75.00% / 70.49% |
+| Locality/routing | 192 requests across 16 recurring groups; 1x/3x/5x prefixes contain up to 1,911/5,655/9,399 tokens | 91.67% / 86.20-91.38% |
+| Load skew | 48 source warm-up requests and 144 burst reuse requests across 24 recurring 5.7K-token groups | 87.50% / 87.21% |
+| Memory skew | 24 warm-up requests over 12 reusable 3.8K-token groups, 64 distinct 1.9K-token pressure prefixes, then 168 hot-prefix reuse requests | 70.31% / 76.12% |
 
 Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. JSON artifacts store the full counts under `metadata.dataset_profile`.
 
 Latency output now reports decode TPOT rather than the legacy E2E-per-token proxy. For a request with \(N>1\) output tokens, `TPOT = (completion time - first-token time) / (N - 1)`; single-token requests have no decode interval and are excluded. Error bars are two-sided 95% Student-\(t\) intervals across complete scenario repetitions, not request-level latency ranges.
 
-### Current Paper Batch
+### Paper Experiment Matrix
 
-Artifacts: [`benchmarks/results/paper/20260725T031840Z`](./benchmarks/results/paper/20260725T031840Z)
+The current suite uses five repetitions, six RTX 3090 GPUs arranged as three
+NV4 pairs, BF16 Qwen3-0.6B/Qwen3-1.7B, 256-token KV blocks, and equal
+per-worker block budgets. It evaluates a 1x/3x/5x routing sweep, load-skew
+background transfer, and memory-skew foreground capacity offload. The internal
+`transfer-calibration` trace only produces transaction residuals for the cost
+profile and is not reported as serving performance. Earlier result directories
+remain archived, but a fresh run is required because the current workload
+definitions and routing artifact names have changed.
 
-The batch uses five repetitions, six RTX 3090 GPUs arranged as three NV4 pairs, BF16 Qwen3-0.6B/Qwen3-1.7B, 256-token KV blocks, and equal per-worker block budgets.
-
-- **Transfer microbenchmark:** the 1/2/4/8/16/32/64-block sweep validates every payload and provides the P95 latency samples used by the online cost model. Four-block batches sustain 20.5-23.1 GiB/s, eight-block batches sustain 26.8-30.1 GiB/s, and mean bandwidth reaches 36.5 GiB/s at 64 blocks.
-- **Routing workload:** routing raises cached prompt-token ratio from 44.1% to 71.3-72.2% and reduces uncached prefill tokens by 48.6-50.2%. Throughput remains within 1.4% of round-robin. Mean TTFT is 7.4% higher on Qwen3-0.6B and 10.2% lower on Qwen3-1.7B, so this experiment supports locality improvement rather than a universal latency claim.
-- **Session handoff:** full LMPool improves throughput by 4.4%/7.4%, lowers mean TTFT by 32.4%/40.4%, lowers mean E2E latency by 9.3%/12.9%, and lowers P90 E2E by 7.4%/7.6% for Qwen3-0.6B/Qwen3-1.7B relative to round-robin multi-GPU.
-- **Boundary results:** steady load skew admits no transfer and remains within 0.6% throughput of round-robin. Memory skew admits no transfer for Qwen3-1.7B and only seven blocks in one Qwen3-0.6B trial; neither case improves throughput.
-
-The paper reports all four observations. Session handoff is the main end-to-end transfer result; memory/load skew are not silently omitted.
-
-![Latest paper-result summary](./docs/paper/figures/fig_results_summary.png)
-
-The transfer microbenchmark proves that the packed all-layer K/V path is byte-correct and measures the latency available to the admission model for each direct pair and plan size. It does not prove that serving will improve merely because data can move quickly. The session-handoff result supplies that end-to-end evidence by showing a workload in which copied KV is reused often enough to repay transfer and control overhead.
+The transfer microbenchmark proves that the packed all-layer K/V path is
+byte-correct and measures latency for each direct pair and plan size. It does
+not by itself prove serving benefit. Load skew must show successful copy and
+replica/lease routing before comparing against routing-only; memory skew must
+show successful foreground plans, positive source-block release, and improved
+throughput or latency over the corresponding no-transfer baseline.
 
 ## Tests
 
@@ -230,7 +230,8 @@ See [tests/README.md](./tests/README.md) for the test-to-module map and hardware
 - Current transfer decisions use direct same-node NVLink pairs only; no PCIe/NUMA fallback is scored.
 - The global page table coordinates metadata; it does not provide transparent remote block addressing.
 - The paper workloads are deterministic synthetic traces, not production datasets.
-- The current evidence supports routing and session handoff. It does not show that transfer improves every memory- or request-skew workload.
+- Transfer claims require successful plans and measured serving improvement;
+  memory-skew additionally requires positive source-block release.
 - The prototype has heartbeat and control-process restart but no replicated controller or launcher HA.
 - Cross-node RDMA, CPU/SSD cache tiers, persistent KV cache, and heterogeneous model replicas are out of scope.
 

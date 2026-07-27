@@ -26,7 +26,10 @@ The coverage is organized around the runtime structure:
 - `tests/test_benchmark_e2e.py`
   - balanced multi-prefix locality workload generation
   - deterministic seeded request ordering
-  - memory-skew and two-phase session-handoff trace construction
+  - source warm-up and high-concurrency reuse construction for load skew
+  - explicit memory-skew warm-up/pressure/reuse phase construction and
+    compatibility alias behavior
+  - internal two-phase transfer transaction calibration trace construction
   - common KV-budget and transfer-placement validation
   - schema-v2 JSON output and repeated-run confidence intervals
 
@@ -38,6 +41,7 @@ The coverage is organized around the runtime structure:
 - `tests/test_benchmark_kv_routing.py`
   - routing benchmark's independent argument surface
   - exact shared KV-budget propagation
+  - long-prompt model-length and batch-token propagation
   - routing-only transfer-path isolation
 
 - `tests/test_benchmark_kv_transfer.py`

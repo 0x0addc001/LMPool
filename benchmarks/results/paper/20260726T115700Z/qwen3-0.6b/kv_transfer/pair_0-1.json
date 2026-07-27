@@ -1,0 +1,143 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-26T11:57:51.833515+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca --dtype auto --block-size 256 --block-counts 1,2,4,8,16,32,64 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260726T115700Z/qwen3-0.6b/kv_transfer/pair_0-1.json --output-figure benchmarks/results/paper/20260726T115700Z/qwen3-0.6b/kv_transfer/pair_0-1.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "0f56fb89565cf589ddd2801a6bb93bfd820b0398",
+    "git_status": "?? benchmarks/results/paper/20260726T115700Z/",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0,1",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8,16,32,64",
+      "iterations": 100,
+      "warmup": 20,
+      "input_json": "",
+      "output_json": "benchmarks/results/paper/20260726T115700Z/qwen3-0.6b/kv_transfer/pair_0-1.json",
+      "output_figure": "benchmarks/results/paper/20260726T115700Z/qwen3-0.6b/kv_transfer/pair_0-1.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "label": "Qwen/Qwen3-0.6B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 3.1072741700336337,
+      "p50_latency_ms": 2.916594996349886,
+      "p95_latency_ms": 3.6483395553659648,
+      "effective_bandwidth_gib_s": 8.79991545763856,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 4.239954270306043,
+      "p50_latency_ms": 4.22811099269893,
+      "p95_latency_ms": 4.321756080025807,
+      "effective_bandwidth_gib_s": 12.898134393334534,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 5.500572671007831,
+      "p50_latency_ms": 5.688384509994648,
+      "p95_latency_ms": 5.725579448335338,
+      "effective_bandwidth_gib_s": 19.88429324395418,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 7.601370349584613,
+      "p50_latency_ms": 7.579012497444637,
+      "p95_latency_ms": 7.7133201019023545,
+      "effective_bandwidth_gib_s": 28.777705852991875,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 16,
+      "bytes_per_iteration": 469762048,
+      "gib_per_iteration": 0.4375,
+      "mean_latency_ms": 13.296961598680355,
+      "p50_latency_ms": 13.294527016114444,
+      "p95_latency_ms": 13.325477304169908,
+      "effective_bandwidth_gib_s": 32.90225340226743,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 32,
+      "bytes_per_iteration": 939524096,
+      "gib_per_iteration": 0.875,
+      "mean_latency_ms": 24.39753487095004,
+      "p50_latency_ms": 24.395791508140974,
+      "p95_latency_ms": 24.428088197601028,
+      "effective_bandwidth_gib_s": 35.86427910148643,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 64,
+      "bytes_per_iteration": 1879048192,
+      "gib_per_iteration": 1.75,
+      "mean_latency_ms": 47.86618875863496,
+      "p50_latency_ms": 47.85242899379227,
+      "p95_latency_ms": 47.89629230508581,
+      "effective_bandwidth_gib_s": 36.56025360248268,
+      "data_validation": "passed"
+    }
+  ]
+}

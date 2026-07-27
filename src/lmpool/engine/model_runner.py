@@ -73,6 +73,25 @@ def _resolve_model_family(config: dict) -> str:
     )
 
 
+def _warmup_sequence_lengths(
+    max_num_batched_tokens: int,
+    max_model_length: int,
+) -> list[int]:
+    """Partition the warm-up token budget into valid, nonempty sequences."""
+    token_budget = int(max_num_batched_tokens)
+    sequence_limit = int(max_model_length)
+    if token_budget < 1:
+        raise ValueError("max_num_batched_tokens must be >= 1")
+    if sequence_limit < 1:
+        raise ValueError("max_model_length must be >= 1")
+
+    full_sequences, remainder = divmod(token_budget, sequence_limit)
+    lengths = [sequence_limit] * full_sequences
+    if remainder:
+        lengths.append(remainder)
+    return lengths
+
+
 class ModelRunner:
     """
     模型执行器
@@ -87,6 +106,17 @@ class ModelRunner:
     def __init__(self, config: dict, rank: int, gbm: GlobalBlockManager = None):
         
         self.config = config
+        batch_token_limit = int(
+            config.get(
+                "max_num_batched_tokens",
+                config.get("max_num_batch_tokens", 0),
+            )
+        )
+        if batch_token_limit < 1:
+            raise ValueError("max_num_batched_tokens must be >= 1")
+        # Keep the legacy singular alias synchronized until all callers migrate.
+        self.config["max_num_batched_tokens"] = batch_token_limit
+        self.config["max_num_batch_tokens"] = batch_token_limit
         # self.event = event
 
         # set distributed config
@@ -300,10 +330,17 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_tokens = self.config['max_num_batch_tokens']
-        max_model_length = self.config['max_model_length']
-        batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        sequence_lengths = _warmup_sequence_lengths(
+            self.config["max_num_batched_tokens"],
+            self.config["max_model_length"],
+        )
+        seqs = [
+            Sequence(
+                token_ids=[0] * sequence_length,
+                block_size=self.config["block_size"],
+            )
+            for sequence_length in sequence_lengths
+        ]
         # Warmup runs before KV cache allocation and bypasses Scheduler, so no
         # BlockManager has populated block_table yet. Attention will not store
         # into KV cache at this point, but prepare_prefill still needs a valid
@@ -379,6 +416,8 @@ class ModelRunner:
     #               │  └─────── end of seq1 (position 3)
     #               └────────── start (position 0)
     def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
+        if not seqs:
+            raise ValueError("prepare_prefill requires at least one sequence")
         # length: sum of all input_ids after prefix cache
         input_ids = []
         # length: sum of all input_ids after prefix cache

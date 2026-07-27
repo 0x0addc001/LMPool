@@ -5,25 +5,27 @@
    CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_e2e.py
 
 2. 显式指定参数：
-    CUDA_VISIBLE_DEVICES=0,2 UV_CACHE_DIR=/tmp/uvcache uv run python benchmarks/benchmark_e2e.py \
-    --num-prompts 32 \
-    --prompt-repeat 10 \
-    --max-tokens 16 \
+    CUDA_VISIBLE_DEVICES=0,1,3,4,5,6 UV_CACHE_DIR=/tmp/uvcache \
+    uv run python benchmarks/benchmark_e2e.py \
+    --num-prompts 192 \
+    --prompt-repeat 48 \
+    --max-tokens 8 \
     --temperature 0.6 \
     --ignore-eos \
     --seed 0 \
     --repetitions 3 \
-    --workload session-handoff \
+    --workload load-skew \
     --locality-prefix-groups 16 \
-    --memory-skew-prefix-groups 15 \
-    --handoff-prefix-groups 32 \
-    --handoff-warmup-prompts 32 \
-    --world-size 2 \
-    --nvlink-pairs "0,1" \
-    --kv-block-budget 64 \
-    --gpu-memory-utilization 0.20 \
-    --submit-window 5 \
-    --background-copy-max-blocks 8 \
+    --load-skew-prefix-groups 24 \
+    --load-skew-warmup-prompts 48 \
+    --world-size 6 \
+    --nvlink-pairs "0,1;2,3;4,5" \
+    --kv-block-budget 192 \
+    --gpu-memory-utilization 0.70 \
+    --submit-window 64 \
+    --background-copy-max-blocks 24 \
+    --background-copy-batch-max-blocks 48 \
+    --background-copy-batch-max-candidates 4 \
     --background-copy-cooldown-s 2.0 \
     --background-copy-hot-threshold 3 \
     --route-load-weight 0.03 \
@@ -34,12 +36,14 @@
     --foreground-transfer-min-benefit-ratio 1.5 \
     --foreground-transfer-bandwidth-gib-s 3.5 \
     --foreground-transfer-profile-json ./benchmarks/results/kv_transfer/latency_profile.json \
-    --foreground-transfer-fixed-latency-ms 40.0 \
+    --foreground-transfer-fixed-latency-ms 0.0 \
     --foreground-transfer-interference-multiplier 1.2 \
+    --scenarios single-gpu,multi-gpu,multi-gpu-kv-routing,multi-gpu-kv-transfer,multi-gpu-lmpool \
     --foreground-prefill-token-time-ms 0.02 \
     --foreground-future-reuse-discount 0.5 \
     --route-cache-queue-slack 256 \
-    --goodput-e2e-sla-ms 10000 \
+    --goodput-e2e-sla-ms 3000 \
+    --goodput-e2e-sla-sweep-ms 2000,3000,5000,10000 \
     --output-json ./benchmarks/results/e2e.json \
     --output-figure ./benchmarks/results/e2e.png
 
@@ -70,11 +74,14 @@
 
 8. `--workload`：
   workload 类型。`locality` 用多组长共享前缀验证 KVCache-aware routing；
-  `load-skew` 用一个热点前缀加少量冷前缀制造请求负载倾斜；
+  `load-skew` 先在每个 NVLink pair 的 source 预热多条长前缀，再以高 submit window
+  提交热点复用 burst，用于观察 forecast-driven background copy 和 replica-aware routing；
   `memory-skew` 依次执行热点前缀预热、源端一次性前缀施压、热点前缀复用三个阶段，
   用于验证 foreground transfer 是否既释放源端容量，又在 NVLink 伙伴保留可复用前缀。
-  `session-handoff` 把 warmup/reuse 两阶段固定到 NVLink pair 两侧，专门验证
-  proactive copy 能否避免 partner 的首次重算，并通过 placement lease 服务后续请求。
+  `capacity-offload` 是 `memory-skew` 的兼容别名，不再作为独立论文 workload；两者都只有在
+  `offload_verified=true` 且 `transfer_release_count>0` 时才能证明 transfer 产生容量缓解。
+  `transfer-calibration` 是 runner 内部使用的两阶段 transaction calibration trace，不是
+  论文 workload，也不用于报告 serving 性能。
   对 topology-blind baseline 和 transfer-only，复用阶段会确定性地跨到对应 NVLink partner：
   baseline 必须在 partner 重算，只有已经完成 transfer 的前缀才能直接命中。
 
@@ -83,162 +90,198 @@
   打乱提交顺序，避免前缀组编号与 round-robin rank 周期重合。组数必须在 1 和
   `--num-prompts` 之间；组数越多，未启用 routing 时跨 GPU 重复缓存和 cache churn 越明显。
 
-10. `--memory-skew-prefix-groups`：
+10. `--load-skew-prefix-groups`：
+  `load-skew` 中固定在 NVLink source rank 上预热的长热点前缀数量。论文配置使用 24 组，
+  使三个 NVLink pair 的每个 source 持有 8 组前缀，而 partner 在 reuse burst 前保持空闲。
+  组到 source 的映射按 NVLink pair 周期交错，使普通 round-robin 的 reuse 请求只会落到
+  对应前缀的 owner 或 direct NVLink partner，而不会误落到无直连关系的 rank。
+
+11. `--load-skew-warmup-prompts`：
+  `load-skew` 的预热请求数。默认 0 使用总请求数的四分之一且至少覆盖每个热点一次；
+  论文配置使用 48 个 warm-up 和 144 个 reuse 请求，让每组前缀先获得 2 次真实访问，
+  再为后台 forecast 提供明确的后续需求。
+
+12. `--memory-skew-prefix-groups`：
   `memory-skew` workload 中需要跨阶段保留的长热点前缀数量。默认 0 表示自动选择不超过 15
   的最大奇数，使其适配 warmup/reuse 阶段长度。每个热点在 warmup
   阶段固定到一个 source rank，reuse 阶段交错重放；使用多个热点可防止 round-robin 在第一次
   miss 后自然把唯一热点复制到所有 GPU。该值不能超过 warmup 或 reuse 阶段请求数。
 
-11. `--handoff-prefix-groups`：
-  `session-handoff` 两个阶段共享的会话前缀组数。默认 0 自动取两个阶段请求数与 32 的较小值；
-  最大不能超过任一阶段的请求数。值越接近 warmup 请求数，partner 在 baseline 中自行预热的
-  机会越少，越能直接测量 transfer 避免的首次 prefill。
+13. `--memory-skew-warmup-prompts`：
+  `memory-skew` 中建立热点 KV 和访问频率的请求数。默认 0 使用总请求数的四分之一。论文配置
+  使用 24 个请求覆盖 12 个长热点组两次，使 block 达到热点阈值，同时把更多请求留给
+  最终 reuse 阶段，避免准备阶段稀释 offload 的端到端收益。
 
-12. `--handoff-warmup-prompts`：
-  `session-handoff` 中用于在 source 建立 KV 的请求数。默认 0 表示使用总请求的一半，以兼容
-  原有等长两阶段实验。论文中的多轮复用实验建议设为 prefix group 数，例如总请求 128、
-  prefix group 32 时设为 32，形成 32 个 warmup 和 96 个 reuse 请求，避免一次建缓存成本
-  稀释 transfer 的后续复用收益。该值必须小于 `--num-prompts`。
+14. `--memory-skew-pressure-prompts`：
+  `memory-skew` 中使用互不共享的短前缀挤压 source KV 容量的请求数。默认 0 使用总请求数的
+  四分之一。论文配置将其提高到 64，并将共享前缀扩大到 `--prompt-repeat 32`；该阶段不提供
+  未来复用，只负责在每个 source 形成真实 block shortage。
 
-13. `--output-json`：
+15. `--calibration-prefix-groups`：
+  仅供 `transfer-calibration` 使用的不同前缀组数。每个组必须同时出现在 source-build 和
+  partner-reuse 阶段，用于产生完整 transfer transaction observation。
+
+16. `--calibration-warmup-prompts`：
+  `transfer-calibration` 中固定在 NVLink source 侧建立 KV 的请求数。其余请求固定到对应
+  partner；该参数只用于生成成本 profile，不进入论文 serving 性能对比。
+
+17. `--output-json`：
   将各场景统计结果导出到指定 JSON 文件。脚本会自动创建父目录，并在成功后打印
   `saved json: ...`。
 
-14. `--model-name-or-path`：
+18. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
-15. `--dtype`：
+19. `--dtype`：
   模型权重与 KV cache 的运行 dtype。`auto` 从模型 `config.json` 读取；也可显式指定
   `float16`、`bfloat16` 或 `float32`。构建和加载 transfer profile 时 dtype 必须一致。
 
-16. `--nvlink-pairs`：
+20. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
   可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
   例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-17. `--world-size`：
+21. `--world-size`：
   多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
   该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
 
-18. `--kv-block-budget`：
+22. `--kv-block-budget`：
   每个 rank 请求使用的 KV block 数。五个场景必须使用同一个值，避免把容量差异误判成
   routing / transfer 收益。显式设置后采用严格语义：worker 实际容量不足时会在提交请求前报错，
   不再静默缩小预算。
 
-19. `--gpu-memory-utilization`：
+23. `--gpu-memory-utilization`：
   ModelRunner 推导可用 KV cache 容量时可使用的空闲显存比例，范围 `(0, 1]`，benchmark
   默认 0.20。最终分配仍受 `--kv-block-budget` 限制；提高该值只是让显式 block budget
   能够实现，不会越过该上限。
 
-20. `--goodput-e2e-sla-ms`：
+24. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-21. `--skip-pool`：
+25. `--goodput-e2e-sla-sweep-ms`：
+  用逗号分隔的多个端到端 SLA 门槛。脚本使用同一批请求完成时间计算每个门槛下的
+  goodput，不会重新执行推理；JSON 同时保存各门槛的均值和 95% 置信区间。
+
+26. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-22. `--output-figure`：
+27. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-23. `--submit-window`：
+28. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
-24. `--disable-background-copy`：
+29. `--disable-background-copy`：
   关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
   伙伴，服务后续请求；关闭后只保留因当前请求容量不足而同步触发的 foreground transfer。
 
-25. `--background-copy-max-blocks`：
+30. `--background-copy-max-blocks`：
   每条后台候选前缀链最多贡献多少个 prefix block。相同方向、相同 NVLink pair 的多条候选
   会在内部合并成一个有界 plan，以摊薄控制协议和 payload 启动开销。
 
-26. `--background-copy-cooldown-s`：
+31. `--background-copy-batch-max-blocks`：
+  同一 `src -> dst` 事务合并后的总 block 上限。它限制一次 packed transfer 的 payload，
+  不改变单条候选链的 `--background-copy-max-blocks` 上限。
+
+32. `--background-copy-batch-max-candidates`：
+  一个 pair 在构造一次 packed transfer 时最多检查的候选链数。该参数与总 block 上限共同
+  约束事务大小，主要用于成本校准和控制面开销保护。
+
+33. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
-27. `--background-copy-hot-threshold`：
+34. `--background-copy-hot-threshold`：
   最大热点前缀链中每个 block 至少需要达到的 worker 上报访问次数。值越大越保守，能减少
   无效 copy；该统计来自真实数据面访问，不再使用路由请求次数代替。
 
-28. `--background-copy-min-load-skew`：
+35. `--background-copy-min-load-skew`：
   route-originated 候选发现要求 prefix owner 与 NVLink partner 至少相差多少队列压力，默认 2；
   phase 边界的 ingress forecast 使用已观测的数据放置偏斜，不受该瞬时负载差限制。
 
-29. `--background-copy-expected-reuses`：
+36. `--background-copy-expected-reuses`：
   预测未来复用次数的保守上限，默认 4。实际预测来自 ingress 尚未提交请求的逐前缀计数；
   没有 forecast 时才使用折扣后的 worker 历史访问次数，不再固定假设一定有 4 次复用。
 
-30. `--route-load-weight`：
+37. `--route-load-weight`：
   旧 prefix score 中 token-aware load 的 tie-break 权重。主路由决策现在使用统一预计完成成本；
   该参数只在成本相同时参与稳定排序，通常保持默认值。
 
-31. `--route-decode-token-weight`：
+38. `--route-decode-token-weight`：
   一个预计 decode token 在路由负载快照中的权重，默认 8，用于避免长输出请求集中到单一 owner。
 
-32. `--route-owner-spill-sequence-skew`：
+39. `--route-owner-spill-sequence-skew`：
   prefix owner 比 NVLink partner 多出的序列压力达到该值时允许 pair 内 spill，默认 2。
 
-33. `--route-owner-spill-max-extra-cost`：
+40. `--route-owner-spill-max-extra-cost`：
   pair spill 相比留在 owner 最多允许增加的 token-equivalent 重算成本，默认 2048。
 
-34. `--route-load-bypass-threshold`：
+41. `--route-load-bypass-threshold`：
   冷目标的预计总成本必须比 prefix owner 至少低多少 token-equivalent cost，才允许绕过
   owner。值越小越激进，越容易牺牲 locality 换并行度。
 
-35. `--route-prefill-cost-weight`：
+42. `--route-prefill-cost-weight`：
   缺失 prefix token 的重算成本权重。默认 1.0，使一个缺失 token 与一个 waiting token
   使用相同成本单位；增大后路由更偏向已有 prefix 的 owner。
 
-36. `--route-reclaim-cost-weight`：
+43. `--route-reclaim-cost-weight`：
   使用 reclaimable capacity 时，每个待回收 block 按 `block_size * weight` 计入的附加成本。
   默认 0.5，用于反映回收元数据操作及未来 cache miss 风险。
 
-37. `--foreground-transfer-cost-weight`：
+44. `--foreground-transfer-cost-weight`：
   对时间模型算出的 transfer 成本施加的整体倍率，默认 1.0。大于 1 会更保守；通常保持
   1.0，优先校准下面的带宽、固定延迟和干扰系数。
 
-38. `--foreground-transfer-min-benefit-ratio`：
+45. `--foreground-transfer-min-benefit-ratio`：
   foreground transfer 预计节省的 prefill 毫秒数与预计 transfer 毫秒数的最小比值。
   默认 1.5；未达到门槛时跳过 transfer，直接使用本地回收。
 
-39. `--foreground-transfer-bandwidth-gib-s`：
+46. `--foreground-transfer-bandwidth-gib-s`：
   未提供 size-aware profile 时的兼容回退带宽，单位 GiB/s，默认 3.5。正式实验应优先使用
   下一项 profile，不再用单一带宽代表所有 plan 大小。
 
-40. `--foreground-transfer-profile-json`：
+47. `--foreground-transfer-profile-json`：
   `build_transfer_profile.py` 生成的分段延迟 profile。它按逻辑 NVLink pair 保存
   1/2/4/8/16/32/64-block 的实测延迟；运行时按实际 payload 插值，并严格校验模型、dtype
-  对应的每 block 字节数。未提供时才回退到上一项标量带宽。
+  对应的每 block 字节数。若构建时提供独立 E2E calibration JSON，同一文件还包含
+  pair × size-bucket 的 dispatch-to-publish P95 transaction residual。未提供数据路径
+  profile 时才回退到上一项标量带宽。
 
-41. `--foreground-transfer-fixed-latency-ms`：
-  每个在线 transfer plan 在空载数据通路之外的固定事务残差，单位毫秒，默认 40.0。
-  它覆盖调度、协调、NCCL 排队、目标端发布与 block 注册等完整 serving 路径开销；
-  当前 40.0 是人工选择的保守 cold-start prior，并非独立 pilot 的拟合结果。后续若有
-  独立校准实验，应使用 `目标端完整耗时 - 干扰倍率 × 同尺寸 microbenchmark P95`
-  按成功 plan 数归一化，并在 held-out 运行上报告预测误差。
+48. `--foreground-transfer-fixed-latency-ms`：
+  没有 transaction residual profile 时的冷启动 fallback，单位毫秒，默认 0.0。它不再是
+  永久下界：取得一次完整 dispatch-to-publish 观测后，在线 EWMA 可以向上或向下纠正该值。
+  正式实验应通过独立 calibration run 生成 P95 residual profile，而不是手工填写 40 ms。
 
-42. `--foreground-transfer-interference-multiplier`：
+49. `--foreground-transfer-interference-multiplier`：
   对空载 transfer microbenchmark 的分段数据通路 P95 施加的加载态干扰倍率，
   默认 1.2，且不能小于 1。它只表示随 payload 变化的模型执行竞争、打包和解包干扰；
-  完整 serving 事务中不随 payload 线性变化的部分由上一项固定残差表示。
+  完整 serving 事务中不随 payload 线性变化的部分由 residual profile 表示。
 
-43. `--foreground-prefill-token-time-ms`：
+50. `--scenarios`：
+  逗号分隔的场景子集。默认运行五个场景；成本校准时可设置
+  `--scenarios multi-gpu-lmpool`，只运行完整系统，避免把基线重复执行。
+
+51. `--foreground-prefill-token-time-ms`：
   重算一个未缓存 prompt token 的预计耗时，单位毫秒，默认 0.02。该值应由目标模型的
   prefill 统计校准。
 
-44. `--foreground-future-reuse-discount`：
+52. `--foreground-future-reuse-discount`：
   将历史叶前缀访问次数折算成未来复用次数的折扣，范围 `[0, 1]`，默认 0.5。成本模型不会
-  再把前缀链上每个 block 的访问次数相加，从而避免将一条请求重复计算多次。
+  再把前缀链上每个 block 的访问次数相加，从而避免将一条请求重复计算多次。Ingress 已经
+  发布尚未提交请求的精确 prefix-demand snapshot 时，foreground admission 直接使用该计数，
+  不再对它应用历史折扣。
 
-45. `--kv-transfer-prewarm-blocks`：
+53. `--kv-transfer-prewarm-blocks`：
   serving 开始前，每个 NVLink pair 使用真实 KV 形状预热的 block 数，默认 2。预热会循环
   使用与线上一致的单个 all-layer 连续 payload，并把测得的 pair-specific 成本送入控制面，
   但不计入 throughput 或 latency。
 
-46. `--route-cache-queue-slack`：
+54. `--route-cache-queue-slack`：
   route cache 命中时允许 cached owner 相比最低成本候选多出的 token-equivalent cost。
   值越小，缓存路由越容易被负载不均打破。
 
@@ -250,9 +293,9 @@
 4. 表里的 prefix hit 是 worker 在 prefill 时实际观察到的本地 prefix cache 命中率，
    round-robin 基线也会统计，因此可横向对比。它不是控制面路由命中率。
 5. `multi-gpu-lmpool` 需要至少 2 张可见 CUDA GPU。
-6. 如果要专门验证后台 copy-style transfer，所有场景仍应使用相同的
-   `--kv-block-budget`；优先使用 `session-handoff` 明确制造跨 pair 复用，使用
-   `memory-skew` 验证容量压力。不要通过缩小某一个场景的容量制造不公平结果。
+6. 所有场景仍应使用相同的 `--kv-block-budget`；使用 `memory-skew` 验证源端容量释放。
+   `capacity-offload` 只是同一 trace 的兼容别名。不要通过缩小某一个场景的容量制造
+   不公平结果。`transfer-calibration` 仅生成成本 profile，不属于上述公平性比较。
 """
 
 import argparse
@@ -363,7 +406,7 @@ MODEL_CONFIG = {
     # part. Pair/size EWMAs can raise the estimate after complete observations.
     "foreground_transfer_bandwidth_gib_s": 3.5,
     "foreground_transfer_latency_profile": None,
-    "foreground_transfer_fixed_latency_ms": 40.0,
+    "foreground_transfer_fixed_latency_ms": 0.0,
     "foreground_transfer_interference_multiplier": 1.2,
     "foreground_prefill_token_time_ms": 0.02,
     "foreground_future_reuse_discount": 0.5,
@@ -391,10 +434,19 @@ MODEL_CONFIG = {
 
 WORKLOAD_SUMMARY_TITLES = {
     "locality": "KV Locality End-to-End Benchmark Summary",
-    "load-skew": "Load-Skew End-to-End Benchmark Summary",
-    "memory-skew": "Memory-Skew KV Transfer Benchmark Summary",
-    "session-handoff": "Session-Handoff End-to-End Benchmark Summary",
+    "load-skew": "Load-Skew Transfer-Relief Benchmark Summary",
+    "memory-skew": "Memory-Skew Capacity-Offload Benchmark Summary",
+    "capacity-offload": "Memory-Skew Capacity-Offload Benchmark Summary",
+    "transfer-calibration": "KV Transfer Transaction Calibration Summary",
 }
+
+SCENARIO_NAMES = (
+    "single-gpu",
+    "multi-gpu",
+    "multi-gpu-kv-routing",
+    "multi-gpu-kv-transfer",
+    "multi-gpu-lmpool",
+)
 
 
 def workload_summary_title(workload: str) -> str:
@@ -510,6 +562,14 @@ class ScenarioResult:
     prefill_cached_tokens: int = 0
     prefill_uncached_tokens: int = 0
     placement_wait_s: float = 0.0
+    transfer_placement_observations: list[dict] | None = None
+    offload_verified: bool = False
+    transfer_cost_observation_count: int = 0
+    transfer_cost_mae_ms: float = 0.0
+    transfer_cost_p95_abs_error_ms: float = 0.0
+    transfer_cost_underprediction_rate: float = 0.0
+    goodput_sla_sweep_tok_s: dict[str, float] | None = None
+    goodput_sla_sweep_tok_s_ci95: dict[str, float] | None = None
 
 
 def build_shared_prefix(prompt_repeat: int, prefix_group: str = "shared") -> str:
@@ -537,17 +597,22 @@ def build_prompts(
     workload: str = "locality",
     locality_prefix_groups: int = 16,
     memory_skew_prefix_groups: int = 15,
-    handoff_prefix_groups: int = 32,
-    handoff_warmup_prompts: int = 0,
+    memory_skew_warmup_prompts: int = 0,
+    memory_skew_pressure_prompts: int = 0,
+    calibration_prefix_groups: int = 32,
+    calibration_warmup_prompts: int = 0,
+    load_skew_prefix_groups: int = 6,
+    load_skew_warmup_prompts: int = 0,
     seed: int = 0,
 ) -> list[str]:
     # locality: 多组长共享前缀，主要验证 KVCache-aware routing，避免单一前缀被每卡复制后
     # round-robin 也自然获得接近 100% 的本地命中。
-    # load-skew: 多数请求共享热点前缀，少数请求落到冷前缀，观察 routing 是否能兼顾 locality 和 load。
+    # load-skew: 先在每个 NVLink pair 的 source 预热多条长前缀，再提交高并发复用 burst。
+    # 它让 forecast-driven background copy 和 replica-aware routing 面对同一组真实热点。
     # memory-skew: 依次执行热点预热、一次性前缀施压、热点复用三个阶段，验证 transfer
     # 是否能在释放源端容量的同时，把完整可复用前缀链保留到 NVLink 伙伴。
-    # session-handoff: 前半段在 source 建立多条会话前缀，后半段在 NVLink partner 继续
-    # 同一批会话。它避免 partner 在测量阶段前自行预热，是 transfer 的主验证 workload。
+    # transfer-calibration: source-build 和 partner-reuse 两阶段只用于采集完整
+    # dispatch-to-publish transfer transaction，不是 serving 性能 workload。
     if workload == "locality":
         locality_prefixes = [
             build_shared_prefix(prompt_repeat, f"locality-{group:04d}")
@@ -556,15 +621,16 @@ def build_prompts(
         locality_group_order = [i % locality_prefix_groups for i in range(num_prompts)]
         random.Random(seed).shuffle(locality_group_order)
     elif workload == "load-skew":
-        hot_prefix = build_shared_prefix(
-            prompt_repeat,
-            "hot",
-        )
-        cold_prefixes = [
-            build_shared_prefix(max(1, prompt_repeat // 2), f"cold-{group:04d}")
-            for group in range(4)
+        hot_prefixes = [
+            build_shared_prefix(prompt_repeat, f"load-hot-{group:04d}")
+            for group in range(load_skew_prefix_groups)
         ]
-    elif workload == "memory-skew":
+        warmup_end, _ = resolve_load_skew_phases(
+            num_prompts,
+            load_skew_prefix_groups,
+            load_skew_warmup_prompts,
+        )
+    elif workload in {"memory-skew", "capacity-offload"}:
         # Multiple hot chains prevent round-robin from learning the only hot
         # prefix locally after one miss. Each group is warmed on one source and
         # revisited in an interleaved reuse phase.
@@ -572,14 +638,20 @@ def build_prompts(
             build_shared_prefix(prompt_repeat, f"transfer-hot-{group:04d}")
             for group in range(memory_skew_prefix_groups)
         ]
-        warmup_end = max(1, num_prompts // 4)
-        pressure_end = max(warmup_end + 1, num_prompts // 2)
-    elif workload == "session-handoff":
+        warmup_prompts, pressure_prompts, _ = resolve_memory_skew_phases(
+            num_prompts,
+            memory_skew_prefix_groups,
+            memory_skew_warmup_prompts,
+            memory_skew_pressure_prompts,
+        )
+        warmup_end = warmup_prompts
+        pressure_end = warmup_prompts + pressure_prompts
+    elif workload == "transfer-calibration":
         hot_prefixes = [
-            build_shared_prefix(prompt_repeat, f"handoff-{group:04d}")
-            for group in range(handoff_prefix_groups)
+            build_shared_prefix(prompt_repeat, f"calibration-{group:04d}")
+            for group in range(calibration_prefix_groups)
         ]
-        warmup_end = handoff_warmup_prompts or num_prompts // 2
+        warmup_end = calibration_warmup_prompts or num_prompts // 2
     else:
         raise ValueError(f"unknown workload: {workload}")
     prompts = []
@@ -588,8 +660,9 @@ def build_prompts(
         if workload == "locality":
             shared_prefix = locality_prefixes[locality_group_order[i]]
         elif workload == "load-skew":
-            shared_prefix = hot_prefix if i % 4 != 0 else cold_prefixes[(i // 4) % len(cold_prefixes)]
-        elif workload == "memory-skew":
+            phase_index = i if i < warmup_end else i - warmup_end
+            shared_prefix = hot_prefixes[phase_index % load_skew_prefix_groups]
+        elif workload in {"memory-skew", "capacity-offload"}:
             if i < warmup_end:
                 shared_prefix = hot_prefixes[i % memory_skew_prefix_groups]
             elif i >= pressure_end:
@@ -599,9 +672,9 @@ def build_prompts(
                     max(1, prompt_repeat // 2),
                     f"pressure-{i - warmup_end:04d}",
                 )
-        elif workload == "session-handoff":
+        elif workload == "transfer-calibration":
             phase_index = i if i < warmup_end else i - warmup_end
-            shared_prefix = hot_prefixes[phase_index % handoff_prefix_groups]
+            shared_prefix = hot_prefixes[phase_index % calibration_prefix_groups]
         else:
             raise ValueError(f"unknown workload: {workload}")
         prompt = f"{shared_prefix} Now answer the following request: {suffix}"
@@ -720,6 +793,26 @@ def decode_tpot_s(
     return max(0.0, finished_at - first_token_at) / (output_tokens - 1)
 
 
+def compute_goodput_sla_sweep(
+    completion_times: dict[int, float],
+    submit_times: dict[int, float],
+    completion_token_counts: dict[int, int],
+    elapsed_s: float,
+    sla_thresholds_s: Iterable[float],
+) -> dict[str, float]:
+    """Compute several goodput thresholds from one set of request samples."""
+    result = {}
+    for sla_s in sla_thresholds_s:
+        sla_ms_key = f"{float(sla_s) * 1000.0:g}"
+        sla_tokens = sum(
+            completion_token_counts[seq_id]
+            for seq_id, done_at in completion_times.items()
+            if done_at - submit_times[seq_id] <= float(sla_s)
+        )
+        result[sla_ms_key] = sla_tokens / max(elapsed_s, 1e-9)
+    return result
+
+
 def resolve_memory_skew_source_ranks(config: dict) -> list[int]:
     """Resolve benchmark placement without granting topology to a baseline policy."""
     explicit = [
@@ -744,10 +837,66 @@ def resolve_memory_skew_target_by_source(config: dict) -> dict[int, int]:
     }
 
 
-def resolve_memory_skew_prefix_groups(num_prompts: int, requested: int) -> int:
+def resolve_load_skew_phases(
+    num_prompts: int,
+    prefix_groups: int,
+    requested_warmup_prompts: int = 0,
+) -> tuple[int, int]:
+    """Resolve source warm-up and burst reuse sizes for load skew."""
+    if num_prompts < 2:
+        raise ValueError("load-skew requires --num-prompts >= 2")
+    if prefix_groups < 1:
+        raise ValueError("--load-skew-prefix-groups must be >= 1")
+    warmup_prompts = requested_warmup_prompts or max(
+        prefix_groups,
+        num_prompts // 4,
+    )
+    reuse_prompts = num_prompts - warmup_prompts
+    if warmup_prompts < prefix_groups:
+        raise ValueError(
+            "load-skew warm-up phase must cover every prefix group"
+        )
+    if reuse_prompts < prefix_groups:
+        raise ValueError(
+            "load-skew reuse phase must cover every prefix group"
+        )
+    return warmup_prompts, reuse_prompts
+
+
+def resolve_load_skew_source_rank(
+    prefix_group: int,
+    prefix_groups: int,
+    source_ranks: list[int],
+) -> int:
+    """Stripe pairs of hot groups across NVLink source ranks.
+
+    With round-robin reuse on a topology ``(0,1);(2,3);...``, group indices
+    ``2k`` and ``2k+1`` land on the owner and its direct partner. Repeating
+    this mapping for larger group counts preserves that controlled placement
+    instead of sending groups to unrelated ranks.
+    """
+    if prefix_groups < 1 or not source_ranks:
+        raise ValueError("load-skew placement requires groups and source ranks")
+    source_index = (int(prefix_group) // 2) % len(source_ranks)
+    return int(source_ranks[source_index])
+
+
+def resolve_memory_skew_prefix_groups(
+    num_prompts: int,
+    requested: int,
+    warmup_prompts: int = 0,
+    pressure_prompts: int = 0,
+) -> int:
     """Resolve enough hot groups to avoid one-prefix baseline saturation."""
-    warmup_requests = max(1, num_prompts // 4)
-    reuse_requests = num_prompts - max(warmup_requests + 1, num_prompts // 2)
+    warmup_requests = (
+        int(warmup_prompts) if int(warmup_prompts) > 0 else max(1, num_prompts // 4)
+    )
+    pressure_requests = (
+        int(pressure_prompts)
+        if int(pressure_prompts) > 0
+        else max(1, num_prompts // 4)
+    )
+    reuse_requests = num_prompts - warmup_requests - pressure_requests
     maximum = min(warmup_requests, reuse_requests)
     if requested > 0:
         if requested > maximum:
@@ -759,38 +908,74 @@ def resolve_memory_skew_prefix_groups(num_prompts: int, requested: int) -> int:
     return automatic if automatic % 2 == 1 else max(1, automatic - 1)
 
 
-def resolve_handoff_warmup_prompts(num_prompts: int, requested: int) -> int:
-    """Resolve the cache-building prefix of a session-handoff trace."""
+def resolve_memory_skew_phases(
+    num_prompts: int,
+    prefix_groups: int,
+    warmup_prompts: int,
+    pressure_prompts: int,
+) -> tuple[int, int, int]:
+    """Resolve explicit warm-up, pressure, and reuse phase lengths."""
+    warmup = (
+        int(warmup_prompts)
+        if int(warmup_prompts) > 0
+        else max(1, int(num_prompts) // 4)
+    )
+    pressure = (
+        int(pressure_prompts)
+        if int(pressure_prompts) > 0
+        else max(1, int(num_prompts) // 4)
+    )
+    reuse = int(num_prompts) - warmup - pressure
+    if min(warmup, pressure, reuse) < 1:
+        raise ValueError(
+            "memory-skew requires non-empty warm-up, pressure, and reuse phases"
+        )
+    if warmup < int(prefix_groups):
+        raise ValueError(
+            "memory-skew warm-up phase must cover every prefix group"
+        )
+    if reuse < int(prefix_groups):
+        raise ValueError(
+            "memory-skew reuse phase must cover every prefix group"
+        )
+    return warmup, pressure, reuse
+
+
+def resolve_transfer_calibration_warmup_prompts(
+    num_prompts: int,
+    requested: int,
+) -> int:
+    """Resolve the source-build phase of a transaction calibration trace."""
     if num_prompts < 2:
-        raise ValueError("session-handoff requires --num-prompts >= 2")
+        raise ValueError("transfer-calibration requires --num-prompts >= 2")
     if requested <= 0:
         if num_prompts % 2:
             raise ValueError(
-                "session-handoff requires even --num-prompts when "
-                "--handoff-warmup-prompts is 0"
+                "transfer-calibration requires even --num-prompts when "
+                "--calibration-warmup-prompts is 0"
             )
         return num_prompts // 2
     if requested >= num_prompts:
         raise ValueError(
-            "--handoff-warmup-prompts must be smaller than --num-prompts"
+            "--calibration-warmup-prompts must be smaller than --num-prompts"
         )
     return requested
 
 
-def resolve_handoff_prefix_groups(
+def resolve_transfer_calibration_prefix_groups(
     num_prompts: int,
     requested: int,
     warmup_prompts: int | None = None,
 ) -> int:
-    """Resolve session groups represented in both handoff phases."""
-    warmup_requests = resolve_handoff_warmup_prompts(
+    """Resolve prefix groups represented in both calibration phases."""
+    warmup_requests = resolve_transfer_calibration_warmup_prompts(
         num_prompts,
         0 if warmup_prompts is None else warmup_prompts,
     )
     maximum = min(warmup_requests, num_prompts - warmup_requests)
     if requested > maximum:
         raise ValueError(
-            "--handoff-prefix-groups must fit in both handoff phases"
+            "--calibration-prefix-groups must fit in both calibration phases"
         )
     return requested if requested > 0 else min(32, maximum)
 
@@ -1280,6 +1465,7 @@ def run_engine_scenario(
                 "background_copy_success": 0,
                 "background_copy_fail": 0,
                 "max_cached_blocks": 0,
+                "free_blocks_after_release": -1,
             },
         )
 
@@ -1315,15 +1501,37 @@ def run_engine_scenario(
         completion_token_counts: dict[int, int] = {}
         inflight: set[int] = set()
         effective_submit_window = len(prompts) if submit_window <= 0 else max(1, submit_window)
-        transfer_workload = workload in {"memory-skew", "session-handoff"}
+        transfer_workload = workload in {
+            "load-skew",
+            "memory-skew",
+            "capacity-offload",
+            "transfer-calibration",
+        }
         if transfer_workload:
-            if workload == "memory-skew":
-                warmup_end = max(1, len(prompts) // 4)
-                pressure_end = max(warmup_end + 1, len(prompts) // 2)
+            if workload == "load-skew":
+                warmup_end, _ = resolve_load_skew_phases(
+                    len(prompts),
+                    int(config["benchmark_transfer_prefix_groups"]),
+                    int(config.get("benchmark_load_skew_warmup_prompts", 0)),
+                )
+                pressure_end = warmup_end
+                phase_ends = [warmup_end, len(prompts)]
+            elif workload in {"memory-skew", "capacity-offload"}:
+                warmup_prompts, pressure_prompts, _ = resolve_memory_skew_phases(
+                    len(prompts),
+                    int(config["benchmark_transfer_prefix_groups"]),
+                    int(config.get("benchmark_memory_skew_warmup_prompts", 0)),
+                    int(config.get("benchmark_memory_skew_pressure_prompts", 0)),
+                )
+                warmup_end = warmup_prompts
+                pressure_end = warmup_prompts + pressure_prompts
                 phase_ends = [warmup_end, pressure_end, len(prompts)]
             else:
                 warmup_end = int(
-                    config.get("benchmark_handoff_warmup_prompts", len(prompts) // 2)
+                    config.get(
+                        "benchmark_calibration_warmup_prompts",
+                        len(prompts) // 2,
+                    )
                 )
                 pressure_end = warmup_end
                 phase_ends = [warmup_end, len(prompts)]
@@ -1344,7 +1552,7 @@ def run_engine_scenario(
             hot_prefix_hashes = {
                 block_hash
                 for block_hash, frequency in warmup_hash_frequency.items()
-                if frequency >= (1 if workload == "session-handoff" else 2)
+                if frequency >= (1 if workload == "transfer-calibration" else 2)
             }
             future_prefix_demands: dict[int, int] = {}
             for index in range(pressure_end, len(prompts)):
@@ -1390,14 +1598,25 @@ def run_engine_scenario(
                 # use only the source side of each NVLink pair. Reuse returns to
                 # the scenario's normal routing/round-robin policy.
                 prefix_group = prompt_index % transfer_prefix_groups
-                target_rank = source_ranks[prefix_group % len(source_ranks)]
-            elif workload == "memory-skew" and prompt_index < pressure_end:
+                if workload == "load-skew":
+                    target_rank = resolve_load_skew_source_rank(
+                        prefix_group,
+                        transfer_prefix_groups,
+                        source_ranks,
+                    )
+                else:
+                    target_rank = source_ranks[prefix_group % len(source_ranks)]
+            elif workload in {"memory-skew", "capacity-offload"} and prompt_index < pressure_end:
                 target_rank = source_ranks[(prompt_index - warmup_end) % len(source_ranks)]
-            elif transfer_workload and route_mode == "round_robin":
+            elif (
+                workload
+                in {"memory-skew", "capacity-offload", "transfer-calibration"}
+                and route_mode == "round_robin"
+            ):
                 # The reuse phase deliberately crosses each NVLink pair for
-                # both the multi-GPU baseline and transfer-only scenario. The
-                # baseline must recompute on the partner; a successful transfer
-                # can serve the first partner-side reuse immediately.
+                # memory offload and transaction calibration. Load skew retains ordinary
+                # round-robin so its baseline does not receive a favorable or
+                # adverse topology hint.
                 prefix_group = (prompt_index - pressure_end) % transfer_prefix_groups
                 source_rank = source_ranks[prefix_group % len(source_ranks)]
                 target_rank = target_by_source.get(source_rank, source_rank)
@@ -1497,6 +1716,11 @@ def run_engine_scenario(
                 rank_data["background_copy_success"] += int(item.get("background_copy_success", 0))
                 rank_data["background_copy_fail"] += int(item.get("background_copy_fail", 0))
                 rank_data["preemption_count"] += int(item.get("preemption_count", 0))
+                if "free_blocks_after_release" in item:
+                    rank_data["free_blocks_after_release"] = max(
+                        int(rank_data.get("free_blocks_after_release", -1)),
+                        int(item["free_blocks_after_release"]),
+                    )
                 rank_data["prefill_tokens"] += int(item.get("prefill_tokens", 0))
                 rank_data["prefill_prompt_tokens"] += int(
                     item.get("prefill_prompt_tokens", item.get("prefill_tokens", 0))
@@ -1614,6 +1838,17 @@ def run_engine_scenario(
                             "placement_pair_stats", {}
                         ).items()
                     }
+                elif engine.control_plane_client is not None:
+                    # Foreground admission still needs the exact remaining
+                    # ingress demand when proactive background placement is
+                    # disabled. The synchronous acknowledgement establishes
+                    # visibility before pressure requests reach workers.
+                    engine.control_plane_client.publish_future_prefix_demands(
+                        future_prefix_demands,
+                        timeout_s=float(
+                            config.get("background_copy_flush_timeout_s", 600.0)
+                        ),
+                    )
                 current_phase_index += 1
                 current_phase_end = phase_ends[current_phase_index]
             while next_prompt_idx < current_phase_end and len(inflight) < effective_submit_window:
@@ -1628,6 +1863,11 @@ def run_engine_scenario(
                     flush=True,
                 )
                 last_progress_report = now
+        transfer_placement_observations = []
+        if engine.control_plane_client is not None:
+            transfer_placement_observations = (
+                engine.control_plane_client.get_transfer_cost_observations()
+            )
         elapsed = time.perf_counter() - start_wall
     finally:
         if sampler_started:
@@ -1643,6 +1883,13 @@ def run_engine_scenario(
     goodput_tokens = sum(
         completion_token_counts[seq_id] for seq_id, done_at in completion_times.items()
         if done_at - submit_times[seq_id] <= goodput_e2e_sla_s
+    )
+    goodput_sla_sweep_tok_s = compute_goodput_sla_sweep(
+        completion_times,
+        submit_times,
+        completion_token_counts,
+        elapsed,
+        config.get("benchmark_goodput_sla_sweep_s", []),
     )
 
     return ScenarioResult(
@@ -1749,6 +1996,35 @@ def run_engine_scenario(
             int(stats["prefill_uncached_tokens"]) for stats in rank_stats.values()
         ),
         placement_wait_s=placement_wait_s,
+        transfer_placement_observations=transfer_placement_observations,
+        offload_verified=(
+            workload in {"memory-skew", "capacity-offload"}
+            and transfer_release_count > 0
+        ),
+        transfer_cost_observation_count=len(transfer_placement_observations),
+        transfer_cost_mae_ms=_mean([
+            abs(
+                float(observation["predicted_cost_ms"])
+                - float(observation["elapsed_ms"])
+            )
+            for observation in transfer_placement_observations
+        ]),
+        transfer_cost_p95_abs_error_ms=_percentile([
+            abs(
+                float(observation["predicted_cost_ms"])
+                - float(observation["elapsed_ms"])
+            )
+            for observation in transfer_placement_observations
+        ], 0.95),
+        transfer_cost_underprediction_rate=(
+            sum(
+                float(observation["predicted_cost_ms"])
+                < float(observation["elapsed_ms"])
+                for observation in transfer_placement_observations
+            )
+            / max(len(transfer_placement_observations), 1)
+        ),
+        goodput_sla_sweep_tok_s=goodput_sla_sweep_tok_s,
     )
 
 
@@ -1823,6 +2099,10 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         raise ValueError("at least one scenario trial is required")
     if len(trials) == 1:
         trials[0].repetitions = 1
+        trials[0].goodput_sla_sweep_tok_s_ci95 = {
+            key: 0.0
+            for key in (trials[0].goodput_sla_sweep_tok_s or {})
+        }
         trials[0].trial_results = [_trial_payload(trials[0])]
         return trials[0]
 
@@ -1856,6 +2136,21 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
                 for inner_key in inner_keys
             }
         return aggregated
+
+    def aggregate_float_map(name: str) -> tuple[dict[str, float], dict[str, float]]:
+        keys = set().union(*(
+            (getattr(result, name) or {}).keys() for result in trials
+        ))
+        means = {}
+        ci95 = {}
+        for key in keys:
+            values = [
+                float((getattr(result, name) or {}).get(key, 0.0))
+                for result in trials
+            ]
+            means[key] = statistics.fmean(values)
+            ci95[key] = confidence_interval_95(values)
+        return means, ci95
 
     rank_ids = sorted(set().union(*(result.rank_stats.keys() for result in trials)))
     rank_stats = {}
@@ -1894,6 +2189,10 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
             if metric in phase_uncertainty_metrics:
                 phase_latency_stats[phase][f"{metric}_std"] = statistics.stdev(values)
                 phase_latency_stats[phase][f"{metric}_ci95"] = confidence_interval_95(values)
+
+    goodput_sla_sweep, goodput_sla_sweep_ci95 = aggregate_float_map(
+        "goodput_sla_sweep_tok_s"
+    )
 
     return ScenarioResult(
         name=trials[0].name,
@@ -1991,6 +2290,24 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         prefill_cached_tokens=round(mean_attr("prefill_cached_tokens")),
         prefill_uncached_tokens=round(mean_attr("prefill_uncached_tokens")),
         placement_wait_s=mean_attr("placement_wait_s"),
+        transfer_placement_observations=[
+            dict(observation)
+            for trial in trials
+            for observation in (trial.transfer_placement_observations or [])
+        ],
+        offload_verified=all(result.offload_verified for result in trials),
+        transfer_cost_observation_count=round(
+            mean_attr("transfer_cost_observation_count")
+        ),
+        transfer_cost_mae_ms=mean_attr("transfer_cost_mae_ms"),
+        transfer_cost_p95_abs_error_ms=mean_attr(
+            "transfer_cost_p95_abs_error_ms"
+        ),
+        transfer_cost_underprediction_rate=mean_attr(
+            "transfer_cost_underprediction_rate"
+        ),
+        goodput_sla_sweep_tok_s=goodput_sla_sweep,
+        goodput_sla_sweep_tok_s_ci95=goodput_sla_sweep_ci95,
     )
 
 
@@ -2026,7 +2343,8 @@ def print_summary_table(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'tpot(ms)':>12} "
         f"{'e2e(ms)':>12} {'p90(e2e)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
         f"{'CP req hit':>11} {'CP owner':>11} {'DP req hit':>11} {'DP tok reuse':>12} "
-        f"{'attempts':>9} {'preempt':>8} {'redund tok':>10} {'sent blk':>9} {'retained':>8} "
+        f"{'attempts':>9} {'preempt':>8} {'redund tok':>10} {'sent blk':>9} "
+        f"{'copied':>8} {'released':>9} "
         f"{'fg ok':>7} {'fg fail':>8} {'bg ok':>7} {'bg fail':>8} "
         f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'low value':>9} {'bg space':>8}"
     )
@@ -2051,6 +2369,7 @@ def print_summary_table(
             f"{result.redundant_prefill_tokens:>10} "
             f"{result.transfer_count:>9} "
             f"{result.transfer_copy_count:>8} "
+            f"{result.transfer_release_count:>9} "
             f"{result.rebalance_success:>7} "
             f"{result.rebalance_fail:>8} "
             f"{result.background_copy_success:>7} "
@@ -2126,6 +2445,28 @@ def print_summary_table(
             f"{(result.background_placement_stats or {}).get('plans_dispatched', 0):>9} "
             f"{(result.background_placement_stats or {}).get('plans_completed', 0):>10}"
         )
+
+    observed_results = [
+        result
+        for result in valid_results
+        if result.transfer_cost_observation_count > 0
+    ]
+    if observed_results:
+        print("\nTransfer Cost Prediction")
+        print("=" * 98)
+        print(
+            f"{'scenario':<22} {'observations':>14} {'MAE(ms)':>12} "
+            f"{'P95 abs err(ms)':>17} {'underpredict':>15} {'offload':>10}"
+        )
+        for result in observed_results:
+            print(
+                f"{result.name:<22} "
+                f"{result.transfer_cost_observation_count:>14} "
+                f"{result.transfer_cost_mae_ms:>12.2f} "
+                f"{result.transfer_cost_p95_abs_error_ms:>17.2f} "
+                f"{fmt_pct(result.transfer_cost_underprediction_rate):>15} "
+                f"{str(result.offload_verified):>10}"
+            )
 
     print("\nPrefill Compute Diagnostics")
     print("=" * 118)
@@ -2459,7 +2800,7 @@ def save_reuse_phase_figure(
     output_path: str,
     title: str = "Benchmark",
 ) -> None:
-    """Plot the handoff/reuse phase separately from cold warmup traffic."""
+    """Plot the reuse phase separately from source-build and pressure traffic."""
     valid_results = [
         result
         for result in results
@@ -2651,13 +2992,23 @@ def parse_args():
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument(
         "--workload",
-        choices=["locality", "load-skew", "memory-skew", "session-handoff"],
-        default="session-handoff",
+        choices=[
+            "locality",
+            "load-skew",
+            "memory-skew",
+            "capacity-offload",
+            "transfer-calibration",
+        ],
+        default="locality",
     )
     parser.add_argument("--locality-prefix-groups", type=int, default=16)
+    parser.add_argument("--load-skew-prefix-groups", type=int, default=6)
+    parser.add_argument("--load-skew-warmup-prompts", type=int, default=0)
     parser.add_argument("--memory-skew-prefix-groups", type=int, default=0)
-    parser.add_argument("--handoff-prefix-groups", type=int, default=0)
-    parser.add_argument("--handoff-warmup-prompts", type=int, default=0)
+    parser.add_argument("--memory-skew-warmup-prompts", type=int, default=0)
+    parser.add_argument("--memory-skew-pressure-prompts", type=int, default=0)
+    parser.add_argument("--calibration-prefix-groups", type=int, default=0)
+    parser.add_argument("--calibration-warmup-prompts", type=int, default=0)
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--model-name-or-path", type=str, default=MODEL_CONFIG["model_name_or_path"])
     parser.add_argument(
@@ -2675,11 +3026,29 @@ def parse_args():
         default=MODEL_CONFIG["gpu_memory_utilization"],
     )
     parser.add_argument("--goodput-e2e-sla-ms", type=float, default=2000.0)
+    parser.add_argument(
+        "--goodput-e2e-sla-sweep-ms",
+        default="2000,3000,5000,10000",
+        help=(
+            "Comma-separated E2E SLA thresholds reported from the same latency "
+            "samples; this does not rerun inference."
+        ),
+    )
     parser.add_argument("--skip-pool", action="store_true")
     parser.add_argument("--output-figure", type=str, default="")
     parser.add_argument("--submit-window", type=int, default=8)
     parser.add_argument("--disable-background-copy", action="store_true")
     parser.add_argument("--background-copy-max-blocks", type=int, default=MODEL_CONFIG["background_copy_max_blocks"])
+    parser.add_argument(
+        "--background-copy-batch-max-blocks",
+        type=int,
+        default=MODEL_CONFIG["background_copy_batch_max_blocks"],
+    )
+    parser.add_argument(
+        "--background-copy-batch-max-candidates",
+        type=int,
+        default=MODEL_CONFIG["background_copy_batch_max_candidates"],
+    )
     parser.add_argument("--background-copy-cooldown-s", type=float, default=MODEL_CONFIG["background_copy_cooldown_s"])
     parser.add_argument("--background-copy-hot-threshold", type=int, default=MODEL_CONFIG["background_copy_hot_threshold"])
     parser.add_argument("--background-copy-min-load-skew", type=float, default=MODEL_CONFIG["background_copy_min_load_skew"])
@@ -2739,6 +3108,14 @@ def parse_args():
         default=MODEL_CONFIG["foreground_transfer_interference_multiplier"],
     )
     parser.add_argument(
+        "--scenarios",
+        default=",".join(SCENARIO_NAMES),
+        help=(
+            "Comma-separated scenario subset. This is useful for disjoint cost "
+            "calibration runs, for example --scenarios multi-gpu-lmpool."
+        ),
+    )
+    parser.add_argument(
         "--foreground-prefill-token-time-ms",
         type=float,
         default=MODEL_CONFIG["foreground_prefill_token_time_ms"],
@@ -2781,9 +3158,33 @@ def parse_pairs(raw: str) -> list[tuple[int, int]]:
     return pairs
 
 
+def parse_goodput_sla_sweep_ms(raw: str, primary_ms: float) -> list[float]:
+    """Return sorted unique positive SLA thresholds in seconds."""
+    try:
+        values_ms = [
+            float(item.strip())
+            for item in str(raw).split(",")
+            if item.strip()
+        ]
+    except ValueError as exc:
+        raise ValueError(
+            "--goodput-e2e-sla-sweep-ms must be a comma-separated number list"
+        ) from exc
+    values_ms.append(float(primary_ms))
+    if any(value <= 0 for value in values_ms):
+        raise ValueError("goodput E2E SLA thresholds must be positive")
+    return sorted({value / 1000.0 for value in values_ms})
+
+
 def apply_background_copy_args(config: dict, args) -> None:
     config["enable_background_copy"] = not args.disable_background_copy
     config["background_copy_max_blocks"] = args.background_copy_max_blocks
+    config["background_copy_batch_max_blocks"] = (
+        args.background_copy_batch_max_blocks
+    )
+    config["background_copy_batch_max_candidates"] = (
+        args.background_copy_batch_max_candidates
+    )
     config["background_copy_cooldown_s"] = args.background_copy_cooldown_s
     config["background_copy_hot_threshold"] = args.background_copy_hot_threshold
     config["background_copy_min_load_skew"] = args.background_copy_min_load_skew
@@ -2832,8 +3233,25 @@ def main():
         raise SystemExit("--world-size must be >= 1")
     if args.repetitions < 1:
         raise SystemExit("--repetitions must be >= 1")
+    requested_scenarios = {
+        name.strip() for name in args.scenarios.split(",") if name.strip()
+    }
+    unknown_scenarios = requested_scenarios - set(SCENARIO_NAMES)
+    if not requested_scenarios or unknown_scenarios:
+        raise SystemExit(
+            f"--scenarios must select from {','.join(SCENARIO_NAMES)}; "
+            f"unknown={sorted(unknown_scenarios)}"
+        )
     if not 0.0 < args.gpu_memory_utilization <= 1.0:
         raise SystemExit("--gpu-memory-utilization must be in (0, 1]")
+    if (
+        args.workload in {"memory-skew", "capacity-offload"}
+        and not args.disable_background_copy
+    ):
+        raise SystemExit(
+            "memory-skew capacity offload requires --disable-background-copy "
+            "so copied blocks cannot be mistaken for source-capacity release"
+        )
     try:
         kv_block_budget = resolve_kv_block_budget(args)
     except ValueError as exc:
@@ -2841,27 +3259,47 @@ def main():
     if args.workload == "locality" and not 1 <= args.locality_prefix_groups <= args.num_prompts:
         raise SystemExit("--locality-prefix-groups must be between 1 and --num-prompts")
     try:
+        load_skew_warmup_prompts, _ = resolve_load_skew_phases(
+            args.num_prompts,
+            args.load_skew_prefix_groups,
+            args.load_skew_warmup_prompts,
+        )
+    except ValueError as exc:
+        if args.workload == "load-skew":
+            raise SystemExit(str(exc)) from exc
+        load_skew_warmup_prompts = max(1, args.num_prompts // 4)
+    try:
         memory_skew_prefix_groups = resolve_memory_skew_prefix_groups(
             args.num_prompts,
             args.memory_skew_prefix_groups,
+            args.memory_skew_warmup_prompts,
+            args.memory_skew_pressure_prompts,
+        )
+        memory_skew_warmup_prompts, memory_skew_pressure_prompts, _ = (
+            resolve_memory_skew_phases(
+                args.num_prompts,
+                memory_skew_prefix_groups,
+                args.memory_skew_warmup_prompts,
+                args.memory_skew_pressure_prompts,
+            )
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     try:
-        handoff_warmup_prompts = resolve_handoff_warmup_prompts(
+        calibration_warmup_prompts = resolve_transfer_calibration_warmup_prompts(
             args.num_prompts,
-            args.handoff_warmup_prompts,
+            args.calibration_warmup_prompts,
         )
-        handoff_prefix_groups = resolve_handoff_prefix_groups(
+        calibration_prefix_groups = resolve_transfer_calibration_prefix_groups(
             args.num_prompts,
-            args.handoff_prefix_groups,
-            handoff_warmup_prompts,
+            args.calibration_prefix_groups,
+            calibration_warmup_prompts,
         )
     except ValueError as exc:
-        if args.workload == "session-handoff":
+        if args.workload == "transfer-calibration":
             raise SystemExit(str(exc)) from exc
-        handoff_warmup_prompts = max(1, args.num_prompts // 2)
-        handoff_prefix_groups = max(1, args.num_prompts // 2)
+        calibration_warmup_prompts = max(1, args.num_prompts // 2)
+        calibration_prefix_groups = max(1, args.num_prompts // 2)
     visible_gpus = torch.cuda.device_count()
     if args.world_size > visible_gpus:
         raise SystemExit(
@@ -2885,10 +3323,36 @@ def main():
         args.prompt_repeat,
         args.workload,
         locality_prefix_groups=args.locality_prefix_groups,
+        load_skew_prefix_groups=args.load_skew_prefix_groups,
+        load_skew_warmup_prompts=load_skew_warmup_prompts,
         memory_skew_prefix_groups=memory_skew_prefix_groups,
-        handoff_prefix_groups=handoff_prefix_groups,
-        handoff_warmup_prompts=handoff_warmup_prompts,
+        memory_skew_warmup_prompts=memory_skew_warmup_prompts,
+        memory_skew_pressure_prompts=memory_skew_pressure_prompts,
+        calibration_prefix_groups=calibration_prefix_groups,
+        calibration_warmup_prompts=calibration_warmup_prompts,
         seed=args.seed,
+    )
+
+    max_prompt_tokens = max(len(tokenizer.encode(prompt)) for prompt in prompts)
+    required_model_length = max_prompt_tokens + args.max_tokens
+    model_position_limit = int(runtime_model_config.get("max_position", 0))
+    if model_position_limit and required_model_length > model_position_limit:
+        raise SystemExit(
+            f"tokenized prompt plus output requires {required_model_length} tokens, "
+            f"but the model supports only {model_position_limit}"
+        )
+    runtime_model_config["max_model_length"] = max(
+        int(runtime_model_config["max_model_length"]),
+        required_model_length,
+    )
+    runtime_model_config["max_num_batched_tokens"] = max(
+        int(runtime_model_config["max_num_batched_tokens"]),
+        int(runtime_model_config["max_model_length"]),
+    )
+    # ModelRunner historically consumed the singular alias while Scheduler
+    # consumed the plural key. Keep both synchronized for long-prompt workloads.
+    runtime_model_config["max_num_batch_tokens"] = int(
+        runtime_model_config["max_num_batched_tokens"]
     )
 
     sampling_params = SamplingParams(
@@ -2898,6 +3362,13 @@ def main():
         max_model_length=runtime_model_config["max_model_length"],
     )
     goodput_e2e_sla_s = args.goodput_e2e_sla_ms / 1000.0
+    try:
+        goodput_sla_sweep_s = parse_goodput_sla_sweep_ms(
+            args.goodput_e2e_sla_sweep_ms,
+            args.goodput_e2e_sla_ms,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     nvlink_pairs = parse_pairs(args.nvlink_pairs) if args.nvlink_pairs else []
     transfer_latency_profile = None
     if args.foreground_transfer_profile_json:
@@ -2933,60 +3404,82 @@ def main():
             {} if config["world_size"] == 1 else memory_skew_target_by_source
         )
         config["memory_skew_prefix_groups"] = memory_skew_prefix_groups
-        config["benchmark_transfer_prefix_groups"] = (
-            handoff_prefix_groups
-            if args.workload == "session-handoff"
-            else memory_skew_prefix_groups
+        config["benchmark_memory_skew_warmup_prompts"] = (
+            memory_skew_warmup_prompts
         )
-        config["benchmark_handoff_warmup_prompts"] = handoff_warmup_prompts
+        config["benchmark_memory_skew_pressure_prompts"] = (
+            memory_skew_pressure_prompts
+        )
+        config["benchmark_transfer_prefix_groups"] = (
+            calibration_prefix_groups
+            if args.workload == "transfer-calibration"
+            else (
+                args.load_skew_prefix_groups
+                if args.workload == "load-skew"
+                else memory_skew_prefix_groups
+            )
+        )
+        config["benchmark_load_skew_warmup_prompts"] = (
+            load_skew_warmup_prompts
+        )
+        config["benchmark_calibration_warmup_prompts"] = (
+            calibration_warmup_prompts
+        )
         config["gpu_memory_utilization"] = args.gpu_memory_utilization
         config["require_exact_kv_block_budget"] = args.kv_block_budget is not None
+        config["benchmark_goodput_sla_sweep_s"] = goodput_sla_sweep_s
+
+    dataset_profile = profile_trace_prefix_sharing(
+        tokenizer,
+        prompts,
+        block_size=int(runtime_model_config["block_size"]),
+    )
+    trace_request_share_rate = float(dataset_profile["request_prefix_share_rate"])
+    trace_token_share_ratio = float(dataset_profile["token_prefix_share_ratio"])
 
     # single-gpu baseline：单卡独立执行，不启用全局池
+    baseline = None
     baseline_config = make_config(1, False, None, runtime_model_config)
     baseline_config["model_name_or_path"] = model_name
     baseline_config["max_cached_blocks"] = kv_block_budget
     baseline_config["random_seed"] = args.seed
     apply_transfer_placement(baseline_config)
-    baseline = run_repeated_engine_scenario(
-        args.repetitions,
-        name="single-gpu",
-        config=baseline_config,
-        prompts=prompts,
-        sampling_params=sampling_params,
-        tokenizer=tokenizer,
-        goodput_e2e_sla_s=goodput_e2e_sla_s,
-        submit_window=args.submit_window,
-        workload=args.workload,
-    )
-    dataset_profile = profile_trace_prefix_sharing(
-        tokenizer,
-        prompts,
-        block_size=baseline_config["block_size"],
-    )
-    trace_request_share_rate = float(dataset_profile["request_prefix_share_rate"])
-    trace_token_share_ratio = float(dataset_profile["token_prefix_share_ratio"])
+    if "single-gpu" in requested_scenarios:
+        baseline = run_repeated_engine_scenario(
+            args.repetitions,
+            name="single-gpu",
+            config=baseline_config,
+            prompts=prompts,
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+            goodput_e2e_sla_s=goodput_e2e_sla_s,
+            submit_window=args.submit_window,
+            workload=args.workload,
+        )
 
     # multi-gpu baseline：不共享 KV、不走控制面路由，但请求通过 round-robin 分发到多张卡
+    independent_result = None
     multi_gpu_config = make_config(args.world_size, False, None, runtime_model_config)
     multi_gpu_config["model_name_or_path"] = model_name
     multi_gpu_config["max_cached_blocks"] = kv_block_budget
     multi_gpu_config["random_seed"] = args.seed
     apply_transfer_placement(multi_gpu_config)
-    independent_result = run_repeated_engine_scenario(
-        args.repetitions,
-        name="multi-gpu",
-        config=multi_gpu_config,
-        prompts=prompts,
-        sampling_params=sampling_params,
-        tokenizer=tokenizer,
-        route_mode="round_robin",
-        goodput_e2e_sla_s=goodput_e2e_sla_s,
-        submit_window=args.submit_window,
-        workload=args.workload,
-    )
+    if "multi-gpu" in requested_scenarios:
+        independent_result = run_repeated_engine_scenario(
+            args.repetitions,
+            name="multi-gpu",
+            config=multi_gpu_config,
+            prompts=prompts,
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+            route_mode="round_robin",
+            goodput_e2e_sla_s=goodput_e2e_sla_s,
+            submit_window=args.submit_window,
+            workload=args.workload,
+        )
 
     # multi-gpu-kv-routing：走控制面路由，用来测 prefix 命中带来的收益
+    kv_routing = None
     routing_config = make_config(
         args.world_size,
         True,
@@ -3000,20 +3493,22 @@ def main():
     routing_config["random_seed"] = args.seed
     apply_transfer_placement(routing_config)
     apply_route_args(routing_config, args, transfer_latency_profile)
-    kv_routing = run_repeated_engine_scenario(
-        args.repetitions,
-        name="multi-gpu-kv-routing",
-        config=routing_config,
-        prompts=prompts,
-        sampling_params=sampling_params,
-        tokenizer=tokenizer,
-        route_mode="control_plane",
-        goodput_e2e_sla_s=goodput_e2e_sla_s,
-        submit_window=args.submit_window,
-        workload=args.workload,
-    )
+    if "multi-gpu-kv-routing" in requested_scenarios:
+        kv_routing = run_repeated_engine_scenario(
+            args.repetitions,
+            name="multi-gpu-kv-routing",
+            config=routing_config,
+            prompts=prompts,
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+            route_mode="control_plane",
+            goodput_e2e_sla_s=goodput_e2e_sla_s,
+            submit_window=args.submit_window,
+            workload=args.workload,
+        )
 
     # multi-gpu-kv-transfer：用 round-robin 分发，尽量隔离出 transfer / rebalance 的开销
+    kv_eviction = None
     eviction_config = make_config(
         args.world_size,
         True,
@@ -3025,26 +3520,29 @@ def main():
     eviction_config["random_seed"] = args.seed
     apply_transfer_placement(eviction_config)
     eviction_config["preserve_cache_via_transfer"] = args.workload in {
-        "memory-skew",
-        "session-handoff",
+            "load-skew",
+            "memory-skew",
+            "capacity-offload",
+            "transfer-calibration",
     }
     apply_background_copy_args(eviction_config, args)
     apply_route_args(eviction_config, args, transfer_latency_profile)
-    kv_eviction = run_repeated_engine_scenario(
-        args.repetitions,
-        name="multi-gpu-kv-transfer",
-        config=eviction_config,
-        prompts=prompts,
-        sampling_params=sampling_params,
-        tokenizer=tokenizer,
-        route_mode="round_robin",
-        goodput_e2e_sla_s=goodput_e2e_sla_s,
-        submit_window=args.submit_window,
-        workload=args.workload,
-    )
+    if "multi-gpu-kv-transfer" in requested_scenarios:
+        kv_eviction = run_repeated_engine_scenario(
+            args.repetitions,
+            name="multi-gpu-kv-transfer",
+            config=eviction_config,
+            prompts=prompts,
+            sampling_params=sampling_params,
+            tokenizer=tokenizer,
+            route_mode="round_robin",
+            goodput_e2e_sla_s=goodput_e2e_sla_s,
+            submit_window=args.submit_window,
+            workload=args.workload,
+        )
 
     pool_result = None
-    if not args.skip_pool:
+    if "multi-gpu-lmpool" in requested_scenarios and not args.skip_pool:
         if visible_gpus < args.world_size:
             print(f"pool scenario skipped: need {args.world_size} CUDA devices")
         else:
@@ -3061,8 +3559,10 @@ def main():
             pool_config["random_seed"] = args.seed
             apply_transfer_placement(pool_config)
             pool_config["preserve_cache_via_transfer"] = args.workload in {
+                "load-skew",
                 "memory-skew",
-                "session-handoff",
+                "capacity-offload",
+                "transfer-calibration",
             }
             apply_background_copy_args(pool_config, args)
             apply_route_args(pool_config, args, transfer_latency_profile)
@@ -3105,7 +3605,7 @@ def main():
         save_rank_stats_figure(all_results, args.output_figure, title=summary_title)
     if args.output_json:
         payload = {
-            "single-gpu": asdict(baseline),
+            "single-gpu": asdict(baseline) if baseline is not None else None,
             "multi-gpu": asdict(independent_result) if independent_result is not None else None,
             "multi-gpu-kv-routing": asdict(kv_routing) if kv_routing is not None else None,
             "multi-gpu-kv-transfer": asdict(kv_eviction) if kv_eviction is not None else None,
@@ -3118,9 +3618,22 @@ def main():
             resolved_config={
                 **runtime_model_config,
                 "resolved_kv_block_budget": kv_block_budget,
+                "resolved_load_skew_prefix_groups": args.load_skew_prefix_groups,
+                "resolved_load_skew_warmup_prompts": (
+                    load_skew_warmup_prompts
+                ),
+                "resolved_max_prompt_tokens": max_prompt_tokens,
                 "resolved_memory_skew_prefix_groups": memory_skew_prefix_groups,
-                "resolved_handoff_prefix_groups": handoff_prefix_groups,
-                "resolved_handoff_warmup_prompts": handoff_warmup_prompts,
+                "resolved_memory_skew_warmup_prompts": (
+                    memory_skew_warmup_prompts
+                ),
+                "resolved_memory_skew_pressure_prompts": (
+                    memory_skew_pressure_prompts
+                ),
+                "resolved_calibration_prefix_groups": calibration_prefix_groups,
+                "resolved_calibration_warmup_prompts": (
+                    calibration_warmup_prompts
+                ),
                 "resolved_nvlink_pairs": nvlink_pairs,
             },
         )
@@ -3132,6 +3645,10 @@ def main():
                 "output_tokens minus one; requests with one output token are excluded"
             ),
             "e2e_s": "completion timestamp minus request submission timestamp",
+            "goodput_sla_sweep_tok_s": (
+                "output-token throughput for requests meeting each E2E SLA; "
+                "JSON keys are SLA thresholds in milliseconds"
+            ),
             "ci95": (
                 "two-sided Student-t half-width across complete scenario repetitions"
             ),

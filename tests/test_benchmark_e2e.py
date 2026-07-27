@@ -8,14 +8,19 @@ from benchmarks.benchmark_e2e import (
     MODEL_CONFIG,
     build_prompts,
     confidence_interval_95,
+    compute_goodput_sla_sweep,
     compute_sequence_prefix_hashes,
     decode_tpot_s,
     measure_single_gpu_prefix_hit_rate,
     profile_trace_prefix_sharing,
+    parse_goodput_sla_sweep_ms,
     prepare_benchmark_rendezvous,
+    resolve_load_skew_phases,
+    resolve_load_skew_source_rank,
+    resolve_memory_skew_phases,
     resolve_memory_skew_prefix_groups,
-    resolve_handoff_prefix_groups,
-    resolve_handoff_warmup_prompts,
+    resolve_transfer_calibration_prefix_groups,
+    resolve_transfer_calibration_warmup_prompts,
     resolve_memory_skew_source_ranks,
     resolve_memory_skew_target_by_source,
     resolve_kv_block_budget,
@@ -99,6 +104,52 @@ def test_locality_workload_order_is_seeded():
     assert first != different
 
 
+def test_load_skew_workload_has_source_warmup_and_hot_reuse_phases():
+    prompts = build_prompts(
+        IdentityChatTokenizer(),
+        num_prompts=18,
+        prompt_repeat=4,
+        workload="load-skew",
+        load_skew_prefix_groups=3,
+        load_skew_warmup_prompts=6,
+        seed=0,
+    )
+
+    groups = [_prefix_group(prompt) for prompt in prompts]
+    expected = [f"load-hot-{group:04d}" for group in range(3)]
+    assert groups[:6] == expected * 2
+    assert groups[6:] == expected * 4
+
+
+def test_load_skew_phases_require_hot_group_coverage():
+    assert resolve_load_skew_phases(192, 6, 48) == (48, 144)
+    assert resolve_load_skew_phases(32, 4, 0) == (8, 24)
+
+    with pytest.raises(ValueError, match="warm-up phase"):
+        resolve_load_skew_phases(16, 5, 4)
+    with pytest.raises(ValueError, match="reuse phase"):
+        resolve_load_skew_phases(16, 9, 9)
+
+
+def test_load_skew_stripes_group_pairs_across_nvlink_sources():
+    sources = [0, 2, 4]
+
+    assert [
+        resolve_load_skew_source_rank(group, 12, sources)
+        for group in range(12)
+    ] == [0, 0, 2, 2, 4, 4, 0, 0, 2, 2, 4, 4]
+
+
+def test_load_skew_round_robin_reuse_stays_with_owner_or_direct_partner():
+    sources = [0, 2, 4]
+    partner_by_source = {0: 1, 2: 3, 4: 5}
+
+    for group in range(24):
+        source = resolve_load_skew_source_rank(group, 24, sources)
+        round_robin_target = group % 6
+        assert round_robin_target in {source, partner_by_source[source]}
+
+
 def test_memory_skew_workload_has_warmup_pressure_and_reuse_phases():
     prompts = build_prompts(
         IdentityChatTokenizer(),
@@ -129,54 +180,100 @@ def test_memory_skew_workload_has_warmup_pressure_and_reuse_phases():
     ]
 
 
-def test_session_handoff_repeats_the_same_groups_in_two_equal_phases():
+def test_memory_skew_workload_accepts_explicit_phase_sizes():
+    prompts = build_prompts(
+        IdentityChatTokenizer(),
+        num_prompts=14,
+        prompt_repeat=4,
+        workload="memory-skew",
+        memory_skew_prefix_groups=3,
+        memory_skew_warmup_prompts=6,
+        memory_skew_pressure_prompts=2,
+        seed=0,
+    )
+
+    groups = [_prefix_group(prompt) for prompt in prompts]
+    assert groups[:6] == [
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+    ]
+    assert groups[6:8] == ["pressure-0000", "pressure-0001"]
+    assert groups[8:] == [
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+        "transfer-hot-0000",
+        "transfer-hot-0001",
+        "transfer-hot-0002",
+    ]
+
+
+def test_capacity_offload_uses_the_controlled_memory_pressure_trace():
+    kwargs = {
+        "tokenizer": IdentityChatTokenizer(),
+        "num_prompts": 16,
+        "prompt_repeat": 4,
+        "memory_skew_prefix_groups": 3,
+        "seed": 0,
+    }
+    memory_skew = build_prompts(workload="memory-skew", **kwargs)
+    capacity_offload = build_prompts(workload="capacity-offload", **kwargs)
+
+    assert capacity_offload == memory_skew
+
+
+def test_transfer_calibration_repeats_groups_in_two_equal_phases():
     prompts = build_prompts(
         IdentityChatTokenizer(),
         num_prompts=12,
         prompt_repeat=2,
-        workload="session-handoff",
-        handoff_prefix_groups=6,
+        workload="transfer-calibration",
+        calibration_prefix_groups=6,
     )
 
     groups = [_prefix_group(prompt) for prompt in prompts]
-    expected = [f"handoff-{group:04d}" for group in range(6)]
+    expected = [f"calibration-{group:04d}" for group in range(6)]
     assert groups[:6] == expected
     assert groups[6:] == expected
 
 
-def test_session_handoff_supports_short_warmup_and_long_reuse_phase():
+def test_transfer_calibration_supports_short_build_and_long_reuse_phase():
     prompts = build_prompts(
         IdentityChatTokenizer(),
         num_prompts=12,
         prompt_repeat=2,
-        workload="session-handoff",
-        handoff_prefix_groups=3,
-        handoff_warmup_prompts=3,
+        workload="transfer-calibration",
+        calibration_prefix_groups=3,
+        calibration_warmup_prompts=3,
     )
 
     groups = [_prefix_group(prompt) for prompt in prompts]
-    expected = [f"handoff-{group:04d}" for group in range(3)]
+    expected = [f"calibration-{group:04d}" for group in range(3)]
     assert groups[:3] == expected
     assert groups[3:] == expected * 3
 
 
-def test_handoff_prefix_groups_fit_one_phase():
-    assert resolve_handoff_prefix_groups(128, 0) == 32
-    assert resolve_handoff_prefix_groups(128, 64) == 64
-    assert resolve_handoff_prefix_groups(128, 32, 32) == 32
+def test_transfer_calibration_prefix_groups_fit_both_phases():
+    assert resolve_transfer_calibration_prefix_groups(128, 0) == 32
+    assert resolve_transfer_calibration_prefix_groups(128, 64) == 64
+    assert resolve_transfer_calibration_prefix_groups(128, 32, 32) == 32
     with pytest.raises(ValueError):
-        resolve_handoff_prefix_groups(128, 65)
+        resolve_transfer_calibration_prefix_groups(128, 65)
     with pytest.raises(ValueError):
-        resolve_handoff_prefix_groups(128, 33, 32)
+        resolve_transfer_calibration_prefix_groups(128, 33, 32)
     with pytest.raises(ValueError):
-        resolve_handoff_prefix_groups(127, 32)
+        resolve_transfer_calibration_prefix_groups(127, 32)
 
 
-def test_handoff_warmup_prompts_default_to_half_or_accept_explicit_ratio():
-    assert resolve_handoff_warmup_prompts(128, 0) == 64
-    assert resolve_handoff_warmup_prompts(128, 32) == 32
+def test_transfer_calibration_warmup_defaults_to_half_or_accepts_explicit():
+    assert resolve_transfer_calibration_warmup_prompts(128, 0) == 64
+    assert resolve_transfer_calibration_warmup_prompts(128, 32) == 32
     with pytest.raises(ValueError):
-        resolve_handoff_warmup_prompts(128, 128)
+        resolve_transfer_calibration_warmup_prompts(128, 128)
 
 
 def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
@@ -202,6 +299,18 @@ def test_memory_skew_prefix_groups_auto_fit_phase_and_avoid_even_period():
     assert resolve_memory_skew_prefix_groups(32, 0) == 7
     with pytest.raises(ValueError):
         resolve_memory_skew_prefix_groups(16, 5)
+
+
+def test_memory_skew_phases_accept_explicit_sizes_and_validate_group_coverage():
+    assert resolve_memory_skew_phases(160, 16, 64, 32) == (64, 32, 64)
+    assert resolve_memory_skew_phases(16, 3, 0, 0) == (4, 4, 8)
+
+    with pytest.raises(ValueError, match="warm-up phase"):
+        resolve_memory_skew_phases(16, 5, 4, 4)
+    with pytest.raises(ValueError, match="reuse phase"):
+        resolve_memory_skew_phases(16, 9, 9, 1)
+    with pytest.raises(ValueError, match="non-empty warm-up, pressure, and reuse"):
+        resolve_memory_skew_phases(16, 3, 8, 8)
 
 
 def test_sequence_prefix_hashes_are_cumulative_and_ignore_partial_block():
@@ -295,9 +404,13 @@ def test_kv_block_budget_rejects_non_positive_value():
     ("workload", "expected"),
     [
         ("locality", "KV Locality End-to-End Benchmark Summary"),
-        ("load-skew", "Load-Skew End-to-End Benchmark Summary"),
-        ("memory-skew", "Memory-Skew KV Transfer Benchmark Summary"),
-        ("session-handoff", "Session-Handoff End-to-End Benchmark Summary"),
+        ("load-skew", "Load-Skew Transfer-Relief Benchmark Summary"),
+        ("memory-skew", "Memory-Skew Capacity-Offload Benchmark Summary"),
+        ("capacity-offload", "Memory-Skew Capacity-Offload Benchmark Summary"),
+        (
+            "transfer-calibration",
+            "KV Transfer Transaction Calibration Summary",
+        ),
     ],
 )
 def test_workload_summary_title_is_specific(workload, expected):
@@ -325,6 +438,29 @@ def test_confidence_interval_uses_student_t_half_width():
     expected = 2.776 * 1.5811388300841898 / (5 ** 0.5)
 
     assert confidence_interval_95(samples) == pytest.approx(expected)
+
+
+def test_goodput_sla_sweep_reuses_one_completion_sample_set():
+    sweep = compute_goodput_sla_sweep(
+        completion_times={1: 2.0, 2: 4.0},
+        submit_times={1: 0.0, 2: 0.0},
+        completion_token_counts={1: 10, 2: 20},
+        elapsed_s=5.0,
+        sla_thresholds_s=[2.0, 3.0, 5.0],
+    )
+
+    assert sweep == {"2000": 2.0, "3000": 2.0, "5000": 6.0}
+
+
+def test_goodput_sla_sweep_parser_adds_primary_and_deduplicates():
+    assert parse_goodput_sla_sweep_ms("2000,5000,10000", 3000) == [
+        2.0,
+        3.0,
+        5.0,
+        10.0,
+    ]
+    with pytest.raises(ValueError, match="must be positive"):
+        parse_goodput_sla_sweep_ms("0,3000", 3000)
 
 
 def test_summary_json_keeps_metadata_separate_from_results(tmp_path):

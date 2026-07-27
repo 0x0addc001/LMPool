@@ -3,6 +3,7 @@ import json
 import pytest
 
 from benchmarks.transfer_profile import (
+    add_transaction_residual_profile,
     build_transfer_latency_profile,
     load_transfer_latency_profile,
     parse_pair_list,
@@ -88,3 +89,54 @@ def test_parse_pair_list_rejects_duplicate_or_self_pairs():
         parse_pair_list("0,1;1,0")
     with pytest.raises(ValueError, match="different"):
         parse_pair_list("2,2")
+
+
+def test_add_transaction_residual_profile_uses_pair_bucket_p95(tmp_path):
+    micro = tmp_path / "pair.json"
+    calibration = tmp_path / "calibration.json"
+    write_microbenchmark(micro, (0, 1), (5.0, 7.0, 9.0))
+    profile = build_transfer_latency_profile([micro], [(0, 1)])
+    calibration.write_text(json.dumps({
+        "results": {
+            "multi-gpu-lmpool": {
+                "transfer_placement_observations": [
+                    {
+                        "pair": "0,1",
+                        "bucket_blocks": 2,
+                        "bytes": 2048,
+                        "residual_ms": 10.0,
+                    },
+                    {
+                        "pair": "0,1",
+                        "bucket_blocks": 2,
+                        "bytes": 2048,
+                        "residual_ms": 30.0,
+                    },
+                ],
+            },
+        },
+    }), encoding="utf-8")
+
+    calibrated = add_transaction_residual_profile(
+        profile,
+        [calibration],
+        percentile=0.95,
+    )
+
+    residual = calibrated["transaction_residual_profile"]
+    assert residual["pairs"]["0,1"]["points"][0]["samples"] == 2
+    assert residual["pairs"]["0,1"]["points"][0]["residual_ms"] == pytest.approx(29.0)
+    assert residual["default_points"][0]["residual_ms"] == pytest.approx(29.0)
+
+
+def test_add_transaction_residual_profile_rejects_missing_observations(tmp_path):
+    micro = tmp_path / "pair.json"
+    calibration = tmp_path / "calibration.json"
+    write_microbenchmark(micro, (0, 1), (5.0, 7.0, 9.0))
+    profile = build_transfer_latency_profile([micro], [(0, 1)])
+    calibration.write_text(json.dumps({
+        "results": {"multi-gpu-lmpool": {}},
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no transfer placement observations"):
+        add_transaction_residual_profile(profile, [calibration])

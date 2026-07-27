@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 import json
 
+import pytest
 import torch
 
 from lmpool.engine import model_runner as model_runner_module
@@ -39,6 +40,23 @@ def test_resolve_model_family_from_local_snapshot_metadata(tmp_path):
     assert model_runner_module._resolve_model_family({
         "model_name_or_path": str(snapshot),
     }) == "qwen3"
+
+
+def test_warmup_sequence_lengths_cover_budget_without_empty_sequences():
+    assert model_runner_module._warmup_sequence_lengths(4096, 6144) == [4096]
+    assert model_runner_module._warmup_sequence_lengths(6144, 6144) == [6144]
+    assert model_runner_module._warmup_sequence_lengths(10000, 4096) == [
+        4096,
+        4096,
+        1808,
+    ]
+
+
+def test_warmup_sequence_lengths_reject_invalid_limits():
+    with pytest.raises(ValueError, match="max_num_batched_tokens"):
+        model_runner_module._warmup_sequence_lengths(0, 6144)
+    with pytest.raises(ValueError, match="max_model_length"):
+        model_runner_module._warmup_sequence_lengths(4096, 0)
 
 
 class FakeModule:
@@ -168,6 +186,12 @@ def test_prepare_prefill_and_decode_set_context(monkeypatch):
     assert decode_ids.tolist() == [4]
     assert contexts["is_prefill"] is False
     assert contexts["slot_mapping"].tolist() == [23]
+
+
+def test_prepare_prefill_rejects_empty_batch():
+    runner = _make_runner()
+    with pytest.raises(ValueError, match="at least one sequence"):
+        runner.prepare_prefill([])
 
 
 def test_run_model_and_kv_helpers(monkeypatch):

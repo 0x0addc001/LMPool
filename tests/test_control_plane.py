@@ -1039,6 +1039,23 @@ def test_ingress_forecast_flushes_hot_prefix_copy_before_future_requests():
         assert source_plan["estimated_future_reuses"] == 4
         assert source_plan["estimated_saved_prefill_ms"] == 4.0
         assert source_plan["transfers"][0]["hashes"] == [h0, h1]
+        observations = ingress.get_transfer_cost_observations(timeout_s=5)
+        assert len(observations) == 1
+        assert observations[0]["pair"] == "0,1"
+        assert observations[0]["blocks"] == 2
+        assert observations[0]["background"] is True
+    finally:
+        _stop_control_plane(request_queue, control_thread)
+
+
+def test_ingress_can_publish_forecast_when_background_copy_is_disabled():
+    _config, request_queue, response_queues, control_thread = _start_control_plane(
+        extra_config={"enable_background_copy": False}
+    )
+    try:
+        ingress = ControlPlaneClient(-1, request_queue, response_queues[-1])
+
+        ingress.publish_future_prefix_demands({11: 4, 22: 0}, timeout_s=5)
     finally:
         _stop_control_plane(request_queue, control_thread)
 

@@ -261,6 +261,41 @@ class ControlPlaneClient:
             return msg
         raise RuntimeError(msg.get("error", "background copy flush failed"))
 
+    def publish_future_prefix_demands(
+        self,
+        prefix_demands: dict[int, int] | None = None,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """Publish an ingress demand snapshot without triggering background copy."""
+        request_id = uuid.uuid4().hex
+        self.request_queue.put({
+            "type": "future_prefix_demands",
+            "request_id": request_id,
+            "reply_rank": self.rank,
+            "prefix_demands": {
+                int(block_hash): max(0, int(count))
+                for block_hash, count in (prefix_demands or {}).items()
+            },
+            **self._request_metadata(),
+        })
+        msg = self._wait_for_response(request_id, timeout_s=max(0.1, float(timeout_s)))
+        if msg.get("type") != "future_prefix_demands_response":
+            raise RuntimeError(msg.get("error", "future demand publication failed"))
+
+    def get_transfer_cost_observations(self, timeout_s: float = 30.0) -> list[dict]:
+        """Return completed dispatch-to-publish observations for calibration."""
+        request_id = uuid.uuid4().hex
+        self.request_queue.put({
+            "type": "transfer_cost_observations",
+            "request_id": request_id,
+            "reply_rank": self.rank,
+            **self._request_metadata(),
+        })
+        msg = self._wait_for_response(request_id, timeout_s=max(0.1, float(timeout_s)))
+        if msg.get("type") == "transfer_cost_observations_response":
+            return [dict(item) for item in msg.get("observations", [])]
+        raise RuntimeError(msg.get("error", "transfer observation request failed"))
+
     def close(self):
         if self.rank < 0:
             return
@@ -679,6 +714,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     placement_leases: dict[int, dict] = {}
     placement_lease_creation_count: dict[tuple[int, int], int] = defaultdict(int)
     prefix_route_hits: dict[int, int] = defaultdict(int)
+    transfer_cost_observations: deque[dict] = deque(maxlen=4096)
     worker_last_heartbeat: dict[int, float] = {rank: time.monotonic() for rank in range(world_size)}
     worker_down: set[int] = set()
     worker_epochs: dict[int, str] = {}
@@ -825,7 +861,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 time.monotonic() - float(plan.get("placement_started_at", time.monotonic())),
             )
             for transfer in plan.get("transfers", []):
-                scheduler.observe_placement(
+                observation = scheduler.observe_placement(
                     scheduler._estimate_transfer_bytes(
                         len(transfer.get("src_blocks", []))
                     ),
@@ -833,6 +869,11 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     int(transfer["src_gpu"]),
                     int(transfer["dst_gpu"]),
                 )
+                if observation is not None:
+                    observation["plan_id"] = plan.get("plan_id")
+                    observation["mode"] = transfer.get("mode", plan.get("mode", "move"))
+                    observation["background"] = bool(plan.get("background"))
+                    transfer_cost_observations.append(observation)
         if not plan.get("background"):
             return
         candidate_keys = plan.get("background_candidate_keys")
@@ -1536,11 +1577,33 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 int(block_hash): max(0, int(count))
                 for block_hash, count in msg.get("prefix_demands", {}).items()
             })
+            scheduler.set_future_prefix_demands(background_future_demands)
             background_flush_waiters.append({
                 "request_id": msg["request_id"],
                 "reply_rank": msg["reply_rank"],
             })
             _service_background_placement(discover=True, trigger="ingress_forecast")
+            service_heartbeats()
+            continue
+        if msg_type == "future_prefix_demands":
+            background_future_demands.clear()
+            background_future_demands.update({
+                int(block_hash): max(0, int(count))
+                for block_hash, count in msg.get("prefix_demands", {}).items()
+            })
+            scheduler.set_future_prefix_demands(background_future_demands)
+            send_response(msg["reply_rank"], {
+                "type": "future_prefix_demands_response",
+                "request_id": msg["request_id"],
+            })
+            service_heartbeats()
+            continue
+        if msg_type == "transfer_cost_observations":
+            send_response(msg["reply_rank"], {
+                "type": "transfer_cost_observations_response",
+                "request_id": msg["request_id"],
+                "observations": list(transfer_cost_observations),
+            })
             service_heartbeats()
             continue
         if msg_type == "route_admitted":

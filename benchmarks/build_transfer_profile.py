@@ -9,12 +9,14 @@ from pathlib import Path
 try:
     from .transfer_profile import (
         SUPPORTED_LATENCY_METRICS,
+        add_transaction_residual_profile,
         build_transfer_latency_profile,
         parse_pair_list,
     )
 except ImportError:
     from transfer_profile import (
         SUPPORTED_LATENCY_METRICS,
+        add_transaction_residual_profile,
         build_transfer_latency_profile,
         parse_pair_list,
     )
@@ -29,6 +31,26 @@ def parse_args():
         nargs="+",
         required=True,
         help="Per-physical-pair benchmark_kv_transfer JSON files, in logical-pair order.",
+    )
+    parser.add_argument(
+        "--transaction-inputs",
+        nargs="+",
+        default=[],
+        help=(
+            "Optional benchmark_e2e JSON files from a disjoint calibration run. "
+            "Their complete placement observations calibrate the transaction residual."
+        ),
+    )
+    parser.add_argument(
+        "--transaction-scenario",
+        default="multi-gpu-lmpool",
+        help="Scenario key read from each transaction calibration JSON.",
+    )
+    parser.add_argument(
+        "--transaction-percentile",
+        type=float,
+        default=0.95,
+        help="Residual percentile used as the conservative serving prior.",
     )
     parser.add_argument(
         "--logical-pairs",
@@ -53,6 +75,13 @@ def main() -> None:
             parse_pair_list(args.logical_pairs),
             latency_metric=args.latency_metric,
         )
+        if args.transaction_inputs:
+            profile = add_transaction_residual_profile(
+                profile,
+                args.transaction_inputs,
+                scenario=args.transaction_scenario,
+                percentile=args.transaction_percentile,
+            )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(f"cannot build transfer profile: {exc}") from exc
 

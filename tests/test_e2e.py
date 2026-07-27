@@ -21,17 +21,18 @@ class DummyProcess:
         self.target = target
         self.args = args
         self.started = False
-        self.exitcode = 0
+        self.exitcode = None
         self.pid = 12345
 
     def start(self):
         self.started = True
 
     def join(self, timeout=None):
+        self.exitcode = 0
         return None
 
     def is_alive(self):
-        return False
+        return self.started and self.exitcode is None
 
     def terminate(self):
         self.exitcode = -15

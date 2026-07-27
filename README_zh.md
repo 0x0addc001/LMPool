@@ -105,7 +105,7 @@ Foreground transfer 只申请实际 shortage，而不是整条 sequence 的 bloc
 
 ![LMPool transfer 成本与收益模型](./assets/fig_transfer_cost_model_dark.png)
 
-静态成本先在每个逻辑 NVLink pair 的实测 P95 延迟曲线上按 plan payload 插值，只对随 payload 变化的部分施加加载态推理干扰倍率，再加上完整在线事务的固定先验。论文配置使用 `40 ms + 1.2 × profile_P95(plan_bytes)`：40 ms 是手工选择的保守 cold-start 设置，用于覆盖空载 microbenchmark 之外的调度、NCCL 排队、目标端发布与 block 注册，不是由独立 pilot 拟合得到的参数。论文 runner 测量 1/2/4/8/16/32/64 blocks，并校验 profile 的每 block 字节数与线上模型一致。运行时的 source-transfer 及 dispatch-to-publish 观测分别更新 pair × size-bucket EWMA，准入取静态估计和在线观测中的最大值，避免一个小 plan 的抖动污染所有大 plan。Foreground 收益使用折扣后的 prefix 链复用次数；background 收益最多只计算一次可避免的冷 prefill，因为目标 GPU 第一次 miss 后会自行预热。只有节省的 prefill 时间超过配置的安全比例，并且源块有效、目标容量等门控全部通过时，plan 才会获准执行。
+静态成本先在每个逻辑 NVLink pair 的实测 P95 延迟曲线上按 plan payload 插值，只对随 payload 变化的部分施加加载态推理干扰倍率。独立 calibration run 测量完整 dispatch-to-publish 事务，并按 pair × plan-size bucket 保存非负 residual 的 P95。最终模型为 `residual_P95(pair,size) + interference × data_path_P95(pair,bytes)`。标量 fixed-latency 现在只作为冷启动 fallback，默认值为 0；取得完整 placement 观测后，在线估计可以向上或向下纠正 fallback。论文 runner 测量 1/2/4/8/16/32/64 blocks，并校验 profile 的每 block 字节数与线上模型一致。运行时的 source-transfer 及 dispatch-to-publish 观测分别更新 pair × size-bucket EWMA。Foreground 收益使用折扣后的 prefix 链复用次数；background 收益最多只计算一次可避免的冷 prefill，因为目标 GPU 第一次 miss 后会自行预热。只有节省的 prefill 时间超过配置的安全比例，并且源块有效、目标容量等门控全部通过时，plan 才会获准执行。
 
 每个计划执行幂等事务：
 
@@ -170,7 +170,7 @@ CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache uv run python main.py
 | --- | --- |
 | `benchmarks/benchmark_kv_transfer.py` | NCCL/NVLink payload 正确性，以及 transfer 准入使用的 pair/plan-size latency profile |
 | `benchmarks/benchmark_kv_routing.py` | routing-only 的 locality 与 prefill reuse 收益 |
-| `benchmarks/benchmark_e2e.py` | load-skew、memory-skew、session-handoff 下的五配置系统对比 |
+| `benchmarks/benchmark_e2e.py` | load-skew 后台 transfer 与 memory-skew 前台容量 offload 的五配置对比 |
 
 双模型论文实验矩阵、固定变量、离线模型路径、验收标准和完整命令见 [benchmarks/PAPER_RUNBOOK.md](./benchmarks/PAPER_RUNBOOK.md)。指标和 workload 定义见 [benchmarks/README.md](./benchmarks/README.md)。
 
@@ -180,31 +180,28 @@ Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`t
 
 | Workload | 确切前缀构造 | 请求级/Token 级共享率 |
 | --- | --- | ---: |
-| Locality/routing | 192 个请求分布在 16 个循环复用的长前缀组中，每组 12 个请求 | 91.67% / 86.20% |
-| Load skew | 1 个长热点组含 144 个请求；另有 4 个较短、循环复用的冷组，每组 12 个请求 | 97.40% / 90.57% |
-| Memory skew | 32 个 warmup 请求轮流访问 15 个可复用长热点组；随后是 32 个互不相同的一次性较短 pressure 前缀和 64 个热点 reuse 请求 | 63.28% / 67.81% |
-| Session handoff | 32 个 session 前缀组，每组包含 1 个源端 warmup 请求和 3 个伙伴端 reuse 请求 | 75.00% / 70.49% |
+| Locality/routing | 192 个请求分布在 16 个循环复用组中；1x/3x/5x 最长前缀分别约为 1,911/5,655/9,399 tokens | 91.67% / 86.20-91.38% |
+| Load skew | 48 个 source warm-up 请求和 144 个 burst reuse 请求循环访问 24 个约 5.7K-token 热点组 | 87.50% / 87.21% |
+| Memory skew | 24 个 warm-up 请求循环访问 12 个可复用 3.8K-token 热点组；随后是 64 个互不共享的 1.9K-token pressure 前缀和 168 个热点 reuse 请求 | 70.31% / 76.12% |
 
 运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。JSON 会把完整计数写入 `metadata.dataset_profile`。
 
 延迟输出现在报告纯 decode TPOT，不再使用旧版 E2E-per-token 代理。对于输出 token 数 \(N>1\) 的请求，`TPOT = (完成时刻 - 首 token 时刻) / (N - 1)`；单 token 请求没有 decode 间隔，不进入 TPOT 分布。图中误差线是完整场景多次重复运行之间的双侧 95% Student-\(t\) 置信区间，不是请求级延迟范围。
 
-### 当前论文实验批次
+### 论文实验矩阵
 
-实验数据：[`benchmarks/results/paper/20260725T031840Z`](./benchmarks/results/paper/20260725T031840Z)
+当前 suite 使用 5 次重复实验、6 张组成 3 对 NV4 直连的 RTX 3090、
+BF16 Qwen3-0.6B/Qwen3-1.7B、256-token KV block，并为每个 worker 配置相同 block budget。
+实验包括 1x/3x/5x routing sweep、load-skew 后台 transfer 和 memory-skew 前台容量
+offload。内部 `transfer-calibration` trace 只生成成本 profile 使用的完整事务 residual，
+不作为 serving 性能结果。旧结果目录继续归档，但由于 workload 定义和 routing 产物命名已经
+变化，论文结果必须使用新的完整实验批次。
 
-该批次使用 5 次重复实验、6 张组成 3 对 NV4 直连的 RTX 3090、BF16 Qwen3-0.6B/Qwen3-1.7B、256-token KV block，并为每个 worker 配置相同 block budget。
-
-- **Transfer microbenchmark：** 1/2/4/8/16/32/64-block sweep 的所有 payload 均通过一致性校验，并生成线上成本模型使用的 P95 latency profile。4 blocks 达到 20.5-23.1 GiB/s，8 blocks 达到 26.8-30.1 GiB/s，64 blocks 的跨模型/链路平均带宽为 36.5 GiB/s。
-- **Routing workload：** cached prompt token 比例从 44.1% 提高到 71.3-72.2%，uncached prefill token 减少 48.6-50.2%；throughput 与 round-robin 的差异不超过 1.4%。Qwen3-0.6B 的 mean TTFT 增加 7.4%，Qwen3-1.7B 降低 10.2%，因此该实验支持 locality 改善，但不支持“所有模型 latency 都下降”。
-- **Session handoff：** 相比 round-robin multi-GPU，完整 LMPool 在 Qwen3-0.6B/Qwen3-1.7B 上分别将 throughput 提升 4.4%/7.4%，mean TTFT 降低 32.4%/40.4%，mean E2E 降低 9.3%/12.9%，P90 E2E 降低 7.4%/7.6%。
-- **边界结果：** 稳定 load skew 没有触发 transfer，各多 GPU 方案与 round-robin 的 throughput 差异不超过 0.6%。Memory skew 在 1.7B 上没有 transfer，在 0.6B 上仅一个 trial 复制 7 blocks，均未提高 throughput。
-
-论文会同时报告以上四项观察。Session handoff 是当前主要端到端 transfer 结果，memory/load skew 不会被选择性省略。
-
-![最新论文实验摘要](./docs/paper/figures/fig_results_summary.png)
-
-NVLink transfer microbenchmark 证明 packed all-layer K/V 数据路径在字节级正确，并测得每个直连 pair、每种 plan 大小的 latency，供线上准入成本模型使用。它本身不等于端到端收益；session-handoff 进一步证明，在 transferred KV 能被后续请求充分复用时，数据移动和控制开销可以被摊销。
+NVLink transfer microbenchmark 证明 packed all-layer K/V 数据路径在字节级正确，并测得每个
+直连 pair、每种 plan 大小的 latency，但它本身不等于服务收益。Load-skew 必须先观察到
+background copy 和 replica/lease routing，才能与 routing-only 比较；memory-skew 还必须同时
+观察到 foreground plan 成功、源端 block 释放，以及相对无 transfer 基线的 throughput 或
+latency 改善。
 
 ## 测试
 
@@ -230,7 +227,8 @@ RUN_NCCL_INTEGRATION=1 CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
 - 当前只对同节点 NVLink 直连 pair 做 transfer 决策，不会对 PCIe/NUMA fallback 打分。
 - 全局页表协调的是元数据，不提供透明远端 block 寻址。
 - 论文 workload 是确定性 synthetic trace，不是生产数据集。
-- 当前证据支持 routing 和 session handoff，但不支持“transfer 对所有 memory/request skew 都有收益”的结论。
+- Transfer 结论必须同时满足计划执行成功和 serving 性能改善；memory-skew 还必须观察到
+  源端 block 实际释放。
 - 原型具有 heartbeat 和控制进程重启，但没有副本化 controller 或 launcher HA。
 - 跨节点 RDMA、CPU/SSD cache tier、持久化 KV cache 和异构模型实例不在当前范围内。
 

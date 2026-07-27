@@ -13,7 +13,11 @@ def _args(**overrides):
         "model_name_or_path": "/tmp/model",
         "kv_block_budget": 64,
         "gpu_memory_utilization": 0.5,
+        "max_model_length": 6144,
+        "max_num_batched_tokens": 6144,
         "seed": 7,
+        "goodput_e2e_sla_ms": 3000.0,
+        "goodput_e2e_sla_sweep_ms": "2000,3000,5000,10000",
         "route_load_weight": 0.03,
         "route_decode_token_weight": 8.0,
         "route_owner_spill_sequence_skew": 2.0,
@@ -33,8 +37,11 @@ def test_common_routing_benchmark_config_uses_exact_shared_budget():
     assert config["model_name_or_path"] == "/tmp/model"
     assert config["max_cached_blocks"] == 64
     assert config["gpu_memory_utilization"] == 0.5
+    assert config["max_model_length"] == 6144
+    assert config["max_num_batch_tokens"] == 6144
     assert config["require_exact_kv_block_budget"] is True
     assert config["random_seed"] == 7
+    assert config["benchmark_goodput_sla_sweep_s"] == [2.0, 3.0, 5.0, 10.0]
 
 
 def test_routing_only_config_disables_all_transfer_paths():

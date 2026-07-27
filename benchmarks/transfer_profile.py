@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -192,6 +194,100 @@ def build_transfer_latency_profile(
         "default_points": default_points,
         "pairs": profile_pairs,
     }
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        raise ValueError("cannot compute a percentile from no observations")
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    fraction = rank - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def add_transaction_residual_profile(
+    profile: dict,
+    observation_paths: list[str | Path],
+    *,
+    scenario: str = "multi-gpu-lmpool",
+    percentile: float = 0.95,
+) -> dict:
+    """Add a held-out serving-transaction residual profile to a data profile."""
+    if not 0.0 < percentile <= 1.0:
+        raise ValueError("transaction residual percentile must be in (0, 1]")
+    if not observation_paths:
+        raise ValueError("at least one transaction observation input is required")
+
+    by_pair_bucket: dict[tuple[str, int], list[dict]] = {}
+    sources: list[str] = []
+    for raw_path in observation_paths:
+        path = Path(raw_path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        result = (payload.get("results") or {}).get(scenario)
+        if not isinstance(result, dict):
+            raise ValueError(f"{path} has no scenario {scenario!r}")
+        observations = result.get("transfer_placement_observations") or []
+        if not observations:
+            raise ValueError(f"{path} contains no transfer placement observations")
+        sources.append(str(path))
+        for observation in observations:
+            pair = str(observation.get("pair", ""))
+            bucket = int(observation.get("bucket_blocks", 0))
+            transfer_bytes = int(observation.get("bytes", 0))
+            residual_ms = float(observation.get("residual_ms", -1.0))
+            if pair not in (profile.get("pairs") or {}):
+                raise ValueError(f"{path} observation references unknown pair {pair!r}")
+            if bucket < 1 or transfer_bytes < 1 or residual_ms < 0:
+                raise ValueError(f"{path} contains an invalid transfer observation")
+            by_pair_bucket.setdefault((pair, bucket), []).append({
+                "bytes": transfer_bytes,
+                "residual_ms": residual_ms,
+            })
+
+    pair_profiles: dict[str, dict] = {}
+    default_by_bucket: dict[int, list[dict]] = {}
+    for (pair, bucket), observations in sorted(by_pair_bucket.items()):
+        point = {
+            "blocks": bucket,
+            "bytes": round(statistics.median(item["bytes"] for item in observations)),
+            "residual_ms": _percentile(
+                [item["residual_ms"] for item in observations],
+                percentile,
+            ),
+            "samples": len(observations),
+        }
+        pair_profiles.setdefault(pair, {"points": []})["points"].append(point)
+        default_by_bucket.setdefault(bucket, []).extend(observations)
+
+    default_points = []
+    for bucket, observations in sorted(default_by_bucket.items()):
+        default_points.append({
+            "blocks": bucket,
+            "bytes": round(statistics.median(item["bytes"] for item in observations)),
+            "residual_ms": _percentile(
+                [item["residual_ms"] for item in observations],
+                percentile,
+            ),
+            "samples": len(observations),
+        })
+
+    calibrated = deepcopy(profile)
+    calibrated["transaction_residual_profile"] = {
+        "metric": f"p{round(percentile * 100)}_residual_ms",
+        "definition": (
+            "dispatch-to-publish elapsed time minus the interference-scaled "
+            "offline data-path latency, clipped at zero"
+        ),
+        "scenario": scenario,
+        "sources": sources,
+        "default_points": default_points,
+        "pairs": pair_profiles,
+    }
+    return calibrated
 
 
 def load_transfer_latency_profile(
