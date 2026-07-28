@@ -165,15 +165,16 @@ if artifact_complete "${memory_json}" 5 memory-skew \
       --arg expected_profile "${TRANSFER_PROFILE}" \
       --argjson expected_sla "${GOODPUT_SLA_MS}" \
       --arg expected_sweep "${GOODPUT_SLA_SWEEP_MS}" \
-      '.metadata.arguments.memory_skew_prefix_groups == 12
-       and .metadata.arguments.memory_skew_warmup_prompts == 24
-       and .metadata.arguments.memory_skew_pressure_prompts == 64
-       and .metadata.arguments.num_prompts == 256
-       and .metadata.arguments.prompt_repeat == 32
+      '.metadata.arguments.memory_skew_prefix_groups == 6
+       and .metadata.arguments.memory_skew_warmup_prompts == 6
+       and .metadata.arguments.memory_skew_pressure_prompts == 30
+       and .metadata.arguments.num_prompts == 72
+       and .metadata.arguments.prompt_repeat == 64
        and .metadata.arguments.max_tokens == 16
-       and .metadata.arguments.submit_window == 32
-       and .metadata.arguments.kv_block_budget == 64
-       and .metadata.arguments.disable_background_copy == true
+       and .metadata.arguments.submit_window == 48
+       and .metadata.arguments.kv_block_budget == 128
+       and .metadata.arguments.memory_skew_proactive_move == true
+       and .metadata.arguments.background_transfer_mode == "move"
        and .metadata.arguments.goodput_e2e_sla_ms == $expected_sla
        and .metadata.arguments.goodput_e2e_sla_sweep_ms == $expected_sweep
        and .metadata.arguments.foreground_transfer_profile_json
@@ -190,23 +191,32 @@ else
     --dtype "${DTYPE}" \
     --world-size "${WORLD_SIZE}" \
     --workload memory-skew \
-    --memory-skew-prefix-groups 12 \
-    --memory-skew-warmup-prompts 24 \
-    --memory-skew-pressure-prompts 64 \
-    --num-prompts 256 \
-    --prompt-repeat 32 \
+    --memory-skew-prefix-groups 6 \
+    --memory-skew-warmup-prompts 6 \
+    --memory-skew-pressure-prompts 30 \
+    --memory-skew-pressure-hot-groups 2 \
+    --memory-skew-pressure-hot-share 0.8 \
+    --memory-skew-trigger-prompts 0 \
+    --memory-skew-proactive-move \
+    --num-prompts 72 \
+    --prompt-repeat 64 \
     --max-tokens 16 \
     --temperature 0.6 \
     --ignore-eos \
     --seed "${SEED}" \
     --repetitions "${REPETITIONS}" \
     --nvlink-pairs "${NVLINK_PAIRS}" \
-    --submit-window 32 \
-    --kv-block-budget 64 \
+    --submit-window 48 \
+    --kv-block-budget 128 \
     --gpu-memory-utilization 0.5 \
     --goodput-e2e-sla-ms "${GOODPUT_SLA_MS}" \
     --goodput-e2e-sla-sweep-ms "${GOODPUT_SLA_SWEEP_MS}" \
-    --disable-background-copy \
+    --background-transfer-mode move \
+    --background-move-source-free-block-threshold 8 \
+    --background-copy-max-blocks 64 \
+    --background-copy-batch-max-blocks 64 \
+    --background-copy-batch-max-candidates 1 \
+    --background-copy-hot-threshold 1 \
     --foreground-transfer-min-benefit-ratio 1.1 \
     --foreground-transfer-profile-json "${TRANSFER_PROFILE}" \
     --foreground-transfer-fixed-latency-ms 0.0 \
@@ -224,12 +234,14 @@ if artifact_complete "${load_json}" 5 load-skew \
       --arg expected_profile "${TRANSFER_PROFILE}" \
       --argjson expected_sla "${GOODPUT_SLA_MS}" \
       --arg expected_sweep "${GOODPUT_SLA_SWEEP_MS}" \
-      '.metadata.arguments.load_skew_prefix_groups == 24
-       and .metadata.arguments.load_skew_warmup_prompts == 48
+       '.metadata.arguments.load_skew_prefix_groups == 3
+       and .metadata.arguments.load_skew_warmup_prompts == 3
+       and .metadata.arguments.load_skew_hot_groups == 3
+       and .metadata.arguments.load_skew_hot_share == 1
        and .metadata.arguments.num_prompts == 192
-       and .metadata.arguments.prompt_repeat == 48
+       and .metadata.arguments.prompt_repeat == 64
        and .metadata.arguments.max_tokens == 8
-       and .metadata.arguments.submit_window == 64
+       and .metadata.arguments.submit_window == 96
        and .metadata.arguments.kv_block_budget == 192
        and .metadata.arguments.disable_background_copy == false
        and .metadata.arguments.goodput_e2e_sla_ms == $expected_sla
@@ -248,27 +260,29 @@ else
     --dtype "${DTYPE}" \
     --world-size "${WORLD_SIZE}" \
     --workload load-skew \
-    --load-skew-prefix-groups 24 \
-    --load-skew-warmup-prompts 48 \
+    --load-skew-prefix-groups 3 \
+    --load-skew-warmup-prompts 3 \
+    --load-skew-hot-groups 3 \
+    --load-skew-hot-share 1.0 \
     --num-prompts 192 \
-    --prompt-repeat 48 \
+    --prompt-repeat 64 \
     --max-tokens 8 \
     --temperature 0.6 \
     --ignore-eos \
     --seed "${SEED}" \
     --repetitions "${REPETITIONS}" \
     --nvlink-pairs "${NVLINK_PAIRS}" \
-    --submit-window 64 \
+    --submit-window 96 \
     --kv-block-budget 192 \
     --gpu-memory-utilization 0.7 \
     --goodput-e2e-sla-ms "${GOODPUT_SLA_MS}" \
     --goodput-e2e-sla-sweep-ms "${GOODPUT_SLA_SWEEP_MS}" \
-    --background-copy-max-blocks 24 \
-    --background-copy-batch-max-blocks 48 \
-    --background-copy-batch-max-candidates 4 \
-    --background-copy-hot-threshold 2 \
-    --background-copy-min-load-skew 2 \
-    --background-copy-expected-reuses 8 \
+    --background-copy-max-blocks 32 \
+    --background-copy-batch-max-blocks 32 \
+    --background-copy-batch-max-candidates 1 \
+    --background-copy-hot-threshold 1 \
+    --background-copy-min-load-skew 0 \
+    --background-copy-expected-reuses 64 \
     --background-copy-cooldown-s 0.1 \
     --foreground-transfer-min-benefit-ratio 1.1 \
     --foreground-transfer-profile-json "${TRANSFER_PROFILE}" \
@@ -315,43 +329,44 @@ check_result "routing locality and load balance" "${routing_json}" "
     )
     and benefit(\$candidate; \$baseline)"
 
-check_result "memory-skew foreground offload" "${memory_json}" "
-  ${benefit_filter}
-  def offloaded:
-    (.offload_verified == true)
-    and ((.rebalance_success // 0) > 0)
-    and ((.transfer_release_count // 0) > 0);
-  .results as \$r
-  | (
-      (\$r[\"multi-gpu-kv-transfer\"] | offloaded)
-      and benefit(\$r[\"multi-gpu-kv-transfer\"]; \$r[\"multi-gpu\"])
-    )
-    or (
-      (\$r[\"multi-gpu-lmpool\"] | offloaded)
-      and benefit(\$r[\"multi-gpu-lmpool\"]; \$r[\"multi-gpu-kv-routing\"])
-    )"
+check_result "memory-skew proactive move" "${memory_json}" "
+  .results[\"multi-gpu-lmpool\"] as \$pool
+  | (\$pool.offload_verified == true)
+    and ((\$pool.transfer_release_count // 0) > 0)
+    and ((\$pool.background_placement_stats.completed // 0) > 0)
+    and ((\$pool.placement_lease_route_count // 0) > 0)"
 
 check_result "load-skew background relief" "${load_json}" "
-  ${benefit_filter}
   def copied:
     ((.background_copy_success // 0) > 0)
     and ((.transfer_copy_count // 0) > 0);
   .results as \$r
-    | (
-      (\$r[\"multi-gpu-kv-transfer\"] | copied)
-      or (\$r[\"multi-gpu-lmpool\"] | copied)
-    )
-    and (
-      ((\$r[\"multi-gpu-lmpool\"].placement_lease_route_count // 0) > 0)
-      or ((\$r[\"multi-gpu-lmpool\"].replica_copy_route_count // 0) > 0)
-    )
+    | (\$r[\"multi-gpu-kv-transfer\"] | copied)
+    and (\$r[\"multi-gpu-lmpool\"] | copied)
+    and ((\$r[\"multi-gpu-kv-transfer\"].rebalance_success // 0) == 0)
+    and ((\$r[\"multi-gpu-kv-transfer\"].rebalance_fail // 0) == 0)
+    and ((\$r[\"multi-gpu-lmpool\"].rebalance_success // 0) == 0)
+    and ((\$r[\"multi-gpu-lmpool\"].rebalance_fail // 0) == 0)
+    and ((\$r[\"multi-gpu-lmpool\"].placement_lease_route_count // 0) > 0)
     and (
       (\$r[\"multi-gpu-lmpool\"].reuse_phase_request_hit_rate // 0)
-      > (\$r[\"multi-gpu\"].reuse_phase_request_hit_rate // 0)
+      >= (\$r[\"multi-gpu\"].reuse_phase_request_hit_rate // 0) + 0.10
     )
     and (
-      benefit(\$r[\"multi-gpu-kv-transfer\"]; \$r[\"multi-gpu\"])
-      or benefit(\$r[\"multi-gpu-lmpool\"]; \$r[\"multi-gpu-kv-routing\"])
+      \$r[\"multi-gpu-lmpool\"].phase_latency_stats.reuse.throughput_tok_s
+      > \$r[\"multi-gpu-kv-routing\"].phase_latency_stats.reuse.throughput_tok_s
+    )
+    and (
+      \$r[\"multi-gpu-lmpool\"].phase_latency_stats.reuse.throughput_tok_s
+      > \$r[\"multi-gpu\"].phase_latency_stats.reuse.throughput_tok_s
+    )
+    and (
+      \$r[\"multi-gpu-lmpool\"].phase_latency_stats.reuse.p90_ttft_s
+      < \$r[\"multi-gpu\"].phase_latency_stats.reuse.p90_ttft_s
+    )
+    and (
+      \$r[\"multi-gpu-lmpool\"].phase_latency_stats.reuse.p90_e2e_s
+      < \$r[\"multi-gpu\"].phase_latency_stats.reuse.p90_e2e_s
     )"
 
 echo
@@ -371,11 +386,22 @@ jq -r '
   | "memory: transfer-only fg=\($r["multi-gpu-kv-transfer"].rebalance_success), "
     + "released=\($r["multi-gpu-kv-transfer"].transfer_release_count), "
     + "verified=\($r["multi-gpu-kv-transfer"].offload_verified), "
-    + "goodput=\($r["multi-gpu-kv-transfer"].goodput_tok_s); "
+    + "overlap=\($r["multi-gpu-kv-transfer"].pressure_reuse_overlap_s)s, "
+    + "reuse tput=\($r["multi-gpu"].phase_latency_stats.reuse.throughput_tok_s)"
+    + " -> \($r["multi-gpu-kv-transfer"].phase_latency_stats.reuse.throughput_tok_s), "
+    + "reuse p90 TTFT=\($r["multi-gpu"].phase_latency_stats.reuse.p90_ttft_s)"
+    + " -> \($r["multi-gpu-kv-transfer"].phase_latency_stats.reuse.p90_ttft_s), "
+    + "reuse p90 E2E=\($r["multi-gpu"].phase_latency_stats.reuse.p90_e2e_s)"
+    + " -> \($r["multi-gpu-kv-transfer"].phase_latency_stats.reuse.p90_e2e_s), "
+    + "underprediction=\($r["multi-gpu-kv-transfer"].transfer_cost_underprediction_rate); "
     + "LMPool fg=\($r["multi-gpu-lmpool"].rebalance_success), "
     + "released=\($r["multi-gpu-lmpool"].transfer_release_count), "
     + "verified=\($r["multi-gpu-lmpool"].offload_verified), "
-    + "goodput=\($r["multi-gpu-lmpool"].goodput_tok_s)"' \
+    + "overlap=\($r["multi-gpu-lmpool"].pressure_reuse_overlap_s)s, "
+    + "reuse tput=\($r["multi-gpu-lmpool"].phase_latency_stats.reuse.throughput_tok_s), "
+    + "reuse p90 TTFT=\($r["multi-gpu-lmpool"].phase_latency_stats.reuse.p90_ttft_s), "
+    + "reuse p90 E2E=\($r["multi-gpu-lmpool"].phase_latency_stats.reuse.p90_e2e_s), "
+    + "underprediction=\($r["multi-gpu-lmpool"].transfer_cost_underprediction_rate)"' \
   "${memory_json}"
 jq -r '
   .results as $r

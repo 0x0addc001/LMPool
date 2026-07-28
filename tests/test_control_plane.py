@@ -52,6 +52,17 @@ def _get_message_type(response_queue, message_type, timeout=5):
             return message
 
 
+def test_report_block_state_is_safe_when_control_queue_is_unavailable():
+    client = ControlPlaneClient(0, None, None)
+
+    client.report_block_state(
+        free_blocks=4,
+        block_hashes={1: 123},
+    )
+
+    assert client._state_version == 0
+
+
 def test_control_plane_client_demultiplexes_concurrent_route_responses():
     config, request_queue, response_queues, thread = _start_control_plane(
         max_cached_blocks=64
@@ -185,7 +196,7 @@ def test_stale_block_state_version_cannot_overwrite_newer_snapshot():
         _stop_control_plane(request_queue, thread)
 
 
-def test_rebalance_publishes_target_before_finalizing_source():
+def test_rebalance_publishes_during_execute_before_finalizing_source():
     config, request_queue, response_queues, thread = _start_control_plane()
     try:
         request_queue.put({
@@ -241,37 +252,9 @@ def test_rebalance_publishes_target_before_finalizing_source():
                 "result": {"success": True},
             })
 
-        publish_messages = {
-            rank: _get_message_type(response_queues[rank], "rebalance_publish")
-            for rank in (0, 1)
-        }
+        finalize_message = _get_message_type(response_queues[0], "rebalance_finalize")
         with pytest.raises(queue.Empty):
-            response_queues[-1].get(timeout=0.05)
-
-        first_rank = 0
-        request_queue.put({
-            "type": "rebalance_done",
-            "plan_id": plan_id,
-            "rank": first_rank,
-            "role": publish_messages[first_rank]["role"],
-            "phase": "publish",
-            "result": {"success": True},
-        })
-        with pytest.raises(queue.Empty):
-            response_queues[-1].get(timeout=0.05)
-
-        request_queue.put({
-            "type": "rebalance_done",
-            "plan_id": plan_id,
-            "rank": 1,
-            "role": publish_messages[1]["role"],
-            "phase": "publish",
-            "result": {"success": True},
-        })
-        finalize_messages = {
-            rank: _get_message_type(response_queues[rank], "rebalance_finalize")
-            for rank in (0, 1)
-        }
+            response_queues[1].get(timeout=0.05)
         with pytest.raises(queue.Empty):
             response_queues[-1].get(timeout=0.05)
 
@@ -279,18 +262,7 @@ def test_rebalance_publishes_target_before_finalizing_source():
             "type": "rebalance_done",
             "plan_id": plan_id,
             "rank": 0,
-            "role": finalize_messages[0]["role"],
-            "phase": "finalize",
-            "result": {"success": True},
-        })
-        with pytest.raises(queue.Empty):
-            response_queues[-1].get(timeout=0.05)
-
-        request_queue.put({
-            "type": "rebalance_done",
-            "plan_id": plan_id,
-            "rank": 1,
-            "role": finalize_messages[1]["role"],
+            "role": finalize_message["role"],
             "phase": "finalize",
             "result": {"success": True},
         })

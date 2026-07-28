@@ -731,6 +731,8 @@ decision demand, decision plan, decision implementation, and decision result.
   A participating worker failure now aborts the whole transfer transaction
   immediately instead of allowing the remaining rank to complete a partial
   plan.
+
+
   Data-plane prepare verifies that every planned source block remains locally
   allocated. `release_blocks()` now reports an explicit stale-allocation error
   instead of leaking a set `KeyError`. Added concurrent-planning regression
@@ -2934,3 +2936,768 @@ decision demand, decision plan, decision implementation, and decision result.
   transfer decisions. Because the trace and primary SLA changed, the previous
   preflight remains a mechanism diagnostic but cannot authorize the revised
   formal suite; a fresh Qwen3-0.6B preflight is required.
+
+## 2026-07-27: Make Control-Plane Queue Shutdown Safe
+
+- Decision demand: An enhanced memory-skew run failed after substantial
+  progress because a data-plane worker attempted to report block state through
+  a `None` request queue. The worker then exited and the benchmark reported a
+  misleading data-plane failure.
+- Decision plan: Prevent construction of a control-plane client unless both IPC
+  queues are available, and make block-state reporting a no-op when the queue
+  is unavailable. This protects the local-only baseline path without adding a
+  lock or synchronization to the normal reporting path.
+- Decision implementation: `data_plane_process` now checks both global request
+  and response queues before creating `ControlPlaneClient`. `report_block_state`
+  returns before updating its state version when the request queue is absent.
+  A regression test covers this shutdown/partial-initialization condition.
+- Decision result: Control-plane tests pass (`28 passed`). A failed GPU trial
+  must be rerun from the beginning because its worker process exited; compatible
+  transfer calibration artifacts remain reusable.
+
+## 2026-07-27: Make Memory Skew Owner-Pressure Driven
+
+- Decision demand: The previous memory-skew trace created pressure requests with
+  unrelated prefixes. Routing therefore had no owner locality to preserve, and
+  the comparison did not represent a realistic case where active hot sessions
+  consume the memory of their prefix owner.
+- Decision plan: Keep deterministic warm-up placement only for establishing
+  source-owned hot prefixes. Construct pressure requests as continuations of
+  those hot prefixes with unique long tails, so the normal router observes
+  locality while each continuation consumes additional KV capacity. Let
+  routing and LMPool use the normal route decision; retain source-side pressure
+  only in the round-robin transfer isolation scenario.
+- Decision implementation: `build_prompts` now appends a unique
+  `memory-pressure-tail-*` to an existing hot chain during the pressure phase.
+  The launcher bypasses the hard-coded source target for pressure requests when
+  the route mode is control-plane. The transfer-only round-robin path keeps the
+  reproducible source pressure needed to isolate transfer execution.
+- Decision result: The workload now models owner-locality-induced capacity
+  shortage without forcing the routing target. Benchmark prompt tests pass
+  (`40 passed` in the focused suite); a fresh multi-GPU memory-skew run is
+  required because the dataset trace has changed.
+
+## 2026-07-27: Replace Uniform Load Skew with Hot/Cold Skew
+
+- Decision demand: The earlier load-skew trace distributed reuse too evenly
+  across a large working set. Under high concurrency this caused cache churn,
+  reduced realized prefix reuse, and made routing and transfer compete with
+  the workload instead of relieving a persistent hotspot.
+- Decision plan: Keep multiple source-owned prefixes and a nontrivial cold
+  tail, but assign most reuse requests to a hot subset. This creates a
+  realistic popularity skew while retaining enough cold traffic to exercise
+  placement and capacity decisions.
+- Decision implementation: Added `--load-skew-hot-groups` and
+  `--load-skew-hot-share`. `build_prompts` now generates a deterministic
+  weighted hot/cold interleaving for the reuse phase while keeping warm-up
+  placement unchanged. The preflight and paper runners use 36 groups, 72
+  warm-up requests, 24 hot groups, 80 percent hot-share, and 384 total
+  requests. The resulting trace has 90.63 percent request-level and 90.33
+  percent token-level prefix sharing.
+- Decision result: The workload now gives background transfer a measurable
+  future-demand signal without removing cross-group and cold-tail traffic.
+  Because the trace changed, the existing transfer profile can be reused but
+  preflight must be rerun before the formal paper suite.
+
+## 2026-07-27: Remove Round-Robin Alignment from Load Skew
+
+- Decision demand: The first hot/cold preflight still gave round-robin an
+  83.33 percent reuse-phase request hit rate. The recurring cold groups and
+  deterministic group order aligned prefix identity with the six-rank
+  round-robin period. Routing reduced TTFT but concentrated decode work, while
+  background transfer could not recover enough additional locality to improve
+  throughput.
+- Decision plan: Keep `load-skew` as the workload name, but model a recurrent
+  hot head and a one-shot cold tail. Fit the complete hot working set on each
+  source, randomize reuse order with a fixed seed, submit the reuse phase as
+  one burst, and isolate background transfer from foreground capacity offload.
+- Decision implementation: The formal trace now warms 24 long hot prefixes
+  twice with 48 source-side requests. The 336-request reuse phase contains 80
+  percent hot requests and unique cold prefixes for the remaining 20 percent;
+  the combined multiset is deterministically shuffled. The per-rank block
+  budget remains 192, enough for eight approximately 22-block hot chains per
+  source or replica. The load-skew transfer-only and LMPool configurations
+  disable foreground rebalance, and the runners use a submit window of 336.
+  Preflight now requires successful background copies and zero foreground
+  attempts in both transfer-enabled scenarios, at least a ten-point request-hit
+  gain for LMPool, higher LMPool reuse throughput than both routing-only and
+  round-robin, and lower LMPool reuse P90 TTFT and E2E than round-robin.
+- Decision result: Offline profiling reports 384 requests, 2,169,907 prompt
+  tokens, 76.30 percent request-level prefix sharing, and 76.05 percent
+  token-level prefix sharing. Unit and GPU preflight results are recorded
+  separately; the previous load-skew artifact is invalid for this trace.
+
+## 2026-07-27: Measure Capacity Offload Under Overlapping Pressure
+
+- Decision demand: Preflight `20260727T091841Z` verified foreground source
+  release, but the memory-skew performance result did not support the offload
+  claim. Transfer-only reuse throughput was 165.87 tokens/s versus 166.46 for
+  multi-GPU, and LMPool reuse throughput was 222.27 tokens/s versus 229.36 for
+  routing-only. The benchmark drained all 128 pressure requests before
+  submitting 232 reuse requests, so the measured reuse phase no longer
+  experienced the capacity pressure that transfer had relieved. LMPool also
+  admitted three plans with predicted costs of 101--131 ms that actually took
+  1.18--1.23 s because their destination workers were busy. The resulting
+  underprediction rate was 100 percent.
+- Decision plan: Keep the existing hot-prefix continuation trace and equal
+  64-block budgets, but overlap a short reuse probe with active pressure.
+  Admit reuse after all pressure requests are submitted and one pressure
+  request per hot group has emitted its first token. Add current destination
+  queue delay to foreground admission, while keeping this transient delay
+  separate from the persistent pair latency profile.
+- Decision implementation: The paper and preflight configurations now use 24
+  warm-up, 128 pressure, and 24 reuse requests with a submit window of 160.
+  `benchmark_e2e.py` tracks pressure first-token events, opens reuse after 12
+  such events, and records `pressure_reuse_overlap_s` in each scenario result.
+  `GlobalScheduler.plan_rebalance` converts the destination token-equivalent
+  load snapshot to milliseconds with the observed destination prefill rate and
+  adds it to the calibrated data-path and transaction estimate. A plan whose
+  data movement is worthwhile but whose target wait erases the benefit is
+  rejected as `target_busy`. Placement observations subtract the admission
+  queue estimate before updating pair-by-size residual EWMA, preventing busy
+  workers from permanently inflating an NVLink pair profile.
+- Decision result: Offline profiling reports 176 requests, 906,702 prompt
+  tokens, 93.18 percent request-level prefix sharing, and 64.83 percent
+  token-level prefix sharing. The preflight gate now requires positive
+  pressure/reuse overlap, verified release-style transfer, at least a
+  25-point transfer-only reuse-hit increase, higher reuse throughput and lower
+  P90 TTFT/E2E than multi-GPU, no more than 25 percent transfer-cost
+  underprediction, and LMPool performance within 5 percent of routing-only.
+  Focused scheduler, benchmark, and control-plane tests pass 113 cases; the
+  complete CPU suite passes 217 cases with one hardware-gated skip. A new GPU
+  preflight is required; no performance improvement is claimed before that run
+  passes the stricter gate.
+
+## 2026-07-27: Isolate a Stronger Memory-Skew Diagnostic
+
+- Decision demand: Preflight `20260727T120408Z` still showed that the
+  transfer-only foreground path was ineffective for the serving comparison,
+  while LMPool was dominated by routing pressure. The trace used 128 pressure
+  requests and a roughly 3.8K-token shared prefix. That allowed requests to
+  spill across ranks before a useful source shortage was observed. A high
+  prefix-hit rate therefore did not imply that the source owner could serve
+  the reuse probe without queueing.
+- Decision plan: Test the foreground mechanism in a smaller, more controlled
+  memory-skew trace before changing the formal preflight. Use 12 long prefix
+  groups, 24 warm-up requests, 24 long continuation pressure requests, and 24
+  reuse requests. Keep the 64-block per-rank budget and disable background
+  copy. The longer prefix increases the number of resident blocks, while the
+  short pressure burst makes source shortage observable before the whole
+  cluster is saturated.
+- Decision implementation: Added `benchmarks/run_memory_skew.sh`. The script
+  uses `prompt-repeat=64`, a 16K model and batch-token limit, a 48-request
+  submit window, the existing size-aware transfer profile, and the same five
+  scenario definitions used by the end-to-end benchmark. It records topology,
+  model, profile, revision, logs, figures, and a compact per-scenario
+  diagnostic summary. Background copy is explicitly disabled, so this run
+  measures foreground capacity offload rather than mixing foreground and
+  background mechanisms.
+- Decision result: Pending a fresh GPU run. The result will be accepted only
+  if transfer-only reports executable foreground plans, released source
+  blocks, and verified offload, and if its overlapping reuse phase improves
+  over round-robin. The complete LMPool result is reported separately because
+  routing-induced queueing can otherwise hide a valid foreground transfer
+  path. The formal preflight and paper suite remain unchanged until this
+  diagnostic establishes that the workload is both executable and
+  interpretable.
+
+## 2026-07-27: Correct Foreground Admission and Target Capacity Accounting
+
+- Decision demand: The isolated run `20260727T124117Z` verified foreground
+  release (`rebalance_success=3`, `transfer_release_count=129`, and
+  `offload_verified=true`), but all three placement observations were below
+  the measured elapsed time. The underprediction rate was 100 percent. The
+  run also recorded 33 failed foreground attempts, including four
+  `no_target_space` failures, even though a target can have reclaimable cold
+  cache while its raw free-block count is zero.
+- Decision plan: Make the transaction prior conservative with respect to
+  payload size and distinguish raw target free capacity from dependency-safe
+  reclaimable capacity. A larger plan must not receive a lower residual just
+  because a noisy calibration bucket was faster. A target may make room by
+  reclaiming only unreferenced, unlocked leaf blocks before reserving the
+  transfer-in blocks.
+- Decision implementation: `_normalize_residual_points` now constructs a
+  non-decreasing upper envelope for transaction residuals. Rebalance planning
+  uses `GlobalBlockManager.get_effective_capacity`, records per-target
+  `target_reclaim_blocks`, and the target data-plane prepare phase reclaims
+  dependency-safe cache leaves before reservation. Active blocks, pinned
+  blocks, and transfer-locked blocks are not reclaimable. Added scheduler
+  tests cover both monotone residual admission and target reclaim capacity.
+- Decision result: CPU validation is complete; a new GPU memory-skew run is
+  required. The next result must show zero or materially lower
+  underprediction, fewer `no_target_space` failures, and retain verified
+  source release. End-to-end performance improvement remains unclaimed until
+  these conditions hold across repeated trials.
+
+## 2026-07-27: Make Routing Transfer-Aware at Owner Admission
+
+- Decision demand: After the target-capacity fix, the isolated memory-skew run
+  reduced transfer-only cost underprediction to 33.3 percent and eliminated
+  transfer-only `no_target_space`, but full LMPool still produced zero
+  foreground plans. Its routing path spilled requests away from the prefix
+  owner before the local scheduler could observe a shortage. This made the
+  transfer mechanism and routing mechanism compete instead of cooperate.
+- Decision plan: When a prefix owner lacks effective capacity, compare keeping
+  the request on that owner and transferring the missing owner prefix to its
+  direct NVLink partner against spilling to an allocatable candidate and
+  recomputing the prefix. Retain the owner only when the estimated saved
+  recomputation exceeds the calibrated transfer cost by the configured safety
+  ratio and the partner has effective capacity. The route decision remains a
+  cost and topology decision, not a fixed target-rank constraint.
+- Decision implementation: Added
+  `enable_transfer_aware_owner_routing`. The control plane enables it when
+  foreground rebalance is enabled and disables it for routing-only and
+  load-skew foreground-disabled baselines. `GlobalScheduler` now emits
+  `prefix_owner_transfer_admission` with the partner, transfer block estimate,
+  transfer cost, spill cost, and saved recomputation estimate. The local
+  scheduler still performs the actual shortage check and invokes the normal
+  generation-safe foreground plan, so routing does not fabricate a transfer.
+  Added a scheduler test covering owner retention when transfer is cheaper
+  than spill.
+- Decision result: CPU scheduler, control-plane, and benchmark tests pass 116
+  cases. A fresh GPU memory-skew run is required to verify that LMPool now
+  produces foreground plans and that the integrated reuse phase improves
+  without degrading the routing-only baseline.
+
+## 2026-07-27: Expose Route Admission Decisions in Benchmark Results
+
+- Decision demand: The run `20260727T133048Z` showed that transfer-only
+  executed verified foreground offload, while LMPool produced no successful
+  foreground plan. The existing summary exposed rebalance failure reasons but
+  did not show whether transfer-aware owner admission had been considered.
+  This made a routing rejection indistinguishable from a later capacity or
+  planning failure.
+- Decision plan: Add low-overhead route-decision counters at scenario and rank
+  granularity. Preserve the existing conservative admission and target-space
+  checks; do not relax the cost threshold merely to increase transfer counts.
+  Aggregate repeated trials with count-preserving rounding so an admission
+  reason remains visible in the report.
+- Decision implementation: `benchmark_e2e.py` now records every control-plane
+  route reason, including `prefix_owner_transfer_admission`, in
+  `route_decision_counts` and in each rank's `rank_stats`. Repeated-trial
+  aggregation preserves these counters. A benchmark regression test verifies
+  both scenario-level and rank-level persistence.
+- Decision result: The focused benchmark, scheduler, and global-scheduler
+  tests pass. The next GPU run must inspect `route_decision_counts` together
+  with `rebalance_fail_reasons`: zero owner-admission decisions means routing
+  prevented transfer; nonzero decisions followed by `no_target_space` or
+  `no_plan` identifies the transfer-stage bottleneck. No end-to-end transfer
+  gain is claimed until the counters and verified release agree.
+
+- Follow-up result: Run `20260727T141105Z` recorded 24
+  `prefix_hit_needs_rebalance` decisions and zero
+  `prefix_owner_transfer_admission` decisions for LMPool. All 27 foreground
+  attempts failed, with 12 `no_plan` and 15 `no_target_space`; transfer count,
+  source release, and verified offload remained zero. The instrumentation
+  confirms that this is an executable-plan and target-capacity bottleneck, not
+  an unobserved routing decision. The next workload revision must leave a
+  reclaimable or free destination capacity while preserving source pressure;
+  lowering the admission threshold alone would not be a valid fix.
+
+## 2026-07-27: Make Memory-Skew Reuse Consume Owner Capacity
+
+- Decision demand: The previous memory-skew trace produced 24
+  `prefix_hit_needs_rebalance` decisions in LMPool, but no executable plan.
+  The reuse requests mostly consisted of a hot prefix followed by a short
+  generic suffix. When that suffix stayed in the final partial block, a
+  prefix hit did not create a new KV allocation. Requests could then spill to
+  the partner and fill the intended transfer destination without creating a
+  source shortage that transfer could relieve.
+- Decision plan: Keep the shared prefix and normal routing policy, but append a
+  distinct block-sized session tail to every memory-skew reuse request. This
+  creates real owner-side allocation pressure while preserving cached-prefix
+  reuse. The workload still does not select a target rank for routing.
+- Decision implementation: `build_prompts()` now appends a deterministic
+  `memory-reuse-tail-*` prefix built with `max(1, prompt_repeat // 4)` repeated
+  blocks to the reuse phase. Workload tests verify that each reuse request has
+  the independent tail, while warm-up and pressure construction remain
+  unchanged.
+- Decision result: CPU workload tests will validate the trace before the next
+  GPU run. Acceptance requires that LMPool retain prefix locality, source
+  ranks reach measurable shortage, partner ranks retain executable capacity,
+  and foreground transfer reports successful source release. If the partner
+  is still full, the next adjustment must change the pressure ratio rather
+  than relax transfer admission.
+
+- Follow-up result: Run `20260727T143836Z` kept the same route distribution as
+  the previous run and still produced zero LMPool transfers. The earlier
+  `prompt_repeat // 4` tails created too much per-request capacity demand, so
+  partner workers were filled before they could serve as transfer targets.
+  The tail construction is therefore reduced to `prompt_repeat // 16` for
+  both pressure and reuse requests. This retains a block-producing session
+  tail while limiting unrelated target-side allocation pressure.
+
+## 2026-07-27: Preserve Destination Headroom in the Standalone Offload Trace
+
+- Decision demand: Run `20260727T145810Z` improved the transfer-only source
+  release check, but LMPool still had zero transfers. Its 24 rebalance
+  failures included 12 `no_target_space`, while partner ranks were receiving
+  enough unrelated prompt state to remove the destination headroom needed by
+  foreground transfer.
+- Decision plan: Change only the standalone diagnostic workload, not the
+  scheduler policy. Use six hot groups and twelve warm-up requests, so each
+  source starts with two hot groups. Keep 24 pressure requests and 72 total
+  requests, allowing source pressure to accumulate while partner capacity
+  remains available. The compact session tails remain in place.
+- Decision implementation: Parameterized `run_memory_skew.sh` with
+  `MEMORY_SKEW_PREFIX_GROUPS`, `MEMORY_SKEW_WARMUP_PROMPTS`,
+  `MEMORY_SKEW_PRESSURE_PROMPTS`, `NUM_PROMPTS`, and `PROMPT_REPEAT`; the
+  standalone defaults are `6/12/24/72/64`. Updated benchmark documentation
+  to distinguish this diagnostic regime from the formal trace.
+- Decision result: CPU workload and scheduler tests remain the gate. The next
+  GPU run is accepted only if LMPool obtains a real destination plan and
+  reports source release. If this still fails, the next action is to inspect
+  target-side request allocation, not to lower the transfer benefit ratio.
+
+- Follow-up result: Run `20260727T152152Z` produced three
+  `prefix_owner_transfer_admission` decisions, confirming that routing and
+  transfer admission now cooperate. However, all LMPool plans still failed,
+  including 15 `no_target_space` failures. The resulting owner wait without a
+  completed transfer raised LMPool P90 E2E to 21.83 seconds, worse than the
+  routing-only 19.77 seconds. The standalone diagnostic budget is therefore
+  increased from 64 to 128 blocks for all scenarios, preserving a common
+  budget while leaving the NVLink partner enough headroom for the admitted
+  plan.
+
+## 2026-07-27: Require an Executable Plan Before Transfer-Aware Routing
+
+- Decision demand: Run `20260727T154215Z` lowered the common budget from 128
+  to 96 blocks, but LMPool still reported zero transfers and zero successful
+  rebalances. It also produced `prefix_hit_needs_rebalance` decisions without
+  a completed offload, so the run paid the admission and waiting cost without
+  receiving a transfer benefit.
+- Decision plan: Transfer-aware routing must validate a concrete move plan
+  against the authoritative block snapshot before retaining a full prefix
+  owner. Capacity and cost estimates alone are insufficient.
+- Decision implementation: `_select_transfer_aware_owner` now calls
+  `plan_rebalance` with the current shortage, requires a non-empty plan whose
+  destination is the direct NVLink partner, and records
+  `foreground_transfer_plan_ready` only after this check. The benchmark JSON
+  now records the parsed transfer policy values alongside the model config so
+  command-line settings cannot be confused with defaults. Regression tests
+  cover both an executable source plan and a pinned source with no plan.
+- Decision result: The focused scheduler, control-plane, benchmark, and local
+  scheduling tests pass (`136 passed`). A new GPU run is required to measure
+  performance; the 96-block result must not be used as evidence of transfer
+  benefit because its transfer counters were all zero.
+
+## 2026-07-27: Make Memory-Skew Pressure Blocks Reusable
+
+- Decision demand: The pressure sweep `pressure72`, `pressure96`, and
+  `pressure120` produced more `low_benefit` admissions as pressure increased,
+  but zero successful foreground transfers. The pressure tails used names
+  different from the reuse tails, so the blocks considered for transfer had
+  no matching future demand.
+- Decision plan: Keep the source-pressure and partner-reuse placement policy,
+  but make reuse requests repeat a bounded subset of the pressure tails. This
+  gives the cost model an observable future reuse count without forcing a
+  destination rank or changing the transfer policy.
+- Decision implementation: The memory-skew prompt builder now names reuse
+  tails as `memory-pressure-tail-{reuse_index % pressure_prompts}`. The reuse
+  phase therefore revisits pressure-generated KV chains on the mapped NVLink
+  partner. Prompt-construction tests cover the modulo mapping for both
+  implicit and explicit phase sizes.
+- Decision result: All focused benchmark, scheduler, control-plane, and
+  scheduling tests pass (`136 passed`). The next GPU run is the final workload
+  validation; acceptance requires a non-zero successful transfer and verified
+  source release before interpreting performance results.
+
+## 2026-07-27: Increase Transfer Amortization in Memory-Skew Workload
+
+- Decision demand: Run `final_20260727T170045Z` created executable transfer
+  candidates, but all six transfer-only and four LMPool attempts were rejected
+  as `low_benefit`. The measured transaction residual is roughly 26--32 ms per
+  small transfer, while a single 256-token block saves only about 5.12 ms of
+  prefill at the current estimate.
+- Decision plan: Keep the pressure and partner-reuse topology, but allocate
+  about 30 prompt blocks between the shared hot prefix and a longer unique
+  pressure tail. Reuse a small number of pressure tails approximately eight
+  times, with the reuse hot-group identity aligned with the pressure tail.
+  This models repeated follow-up requests for a few long sessions and lets the
+  measured transfer cost be amortized by real saved prefill work.
+- Decision implementation: Memory-skew now uses `prompt_repeat - prompt_repeat
+  // 8` repetitions for the hot prefix and `prompt_repeat // 8` for the
+  pressure tail. The reuse phase selects a bounded tail set sized for roughly
+  eight requests per tail and routes the matching hot group to the same
+  partner. No scheduler, cost-model, or direct-rank routing rule changed.
+- Decision result: Prompt construction stays within the Qwen3-0.6B context
+  limit for the final pressure-120 configuration, and all focused tests pass
+  (`136 passed`). This is the final workload change; the next GPU result must
+  be judged by successful transfer and source-release counters, not throughput
+  alone.
+
+## 2026-07-27: Preserve Destination Headroom for Final Memory-Skew Run
+
+- Decision demand: Run `20260727T172246Z` generated transfer pressure, but
+  transfer-only failed 18 times with `no_plan`. LMPool failed ten times and
+  still completed zero transfers. The partner reuse phase occupied too many
+  long chains for the destination budget.
+- Decision plan: Keep the long pressure tails and their repeated future use,
+  but cap the number of reuse tail groups at three. This leaves destination
+  capacity for a concrete move while increasing the reuse fanout per retained
+  chain.
+- Decision implementation: The memory-skew prompt builder now uses at most
+  three reuse tail groups. With 36 reuse requests, each group receives about
+  twelve requests; with the current prompt geometry, the destination footprint
+  is about 90 blocks against the shared 128-block budget.
+- Decision result: The final GPU run should accept only a non-zero
+  `rebalance_success`, `transfer_release_count`, and `offload_verified=true`.
+  The focused test suite remains green with `136 passed`.
+
+## 2026-07-27: Expose Foreground Transfer Admission Evidence
+
+- Decision demand: The latest memory-skew result showed source pressure, but
+  transfer-only requests ended with `no_plan` and LMPool requests ended with
+  `low_benefit`. Aggregate counters did not reveal whether the failure came
+  from target capacity, missing evictable blocks, insufficient predicted reuse,
+  or the transfer cost threshold.
+- Decision plan: Preserve the existing admission policy and add a bounded
+  diagnostic record for every foreground rebalance decision. The record must
+  cross the control-plane response and worker runtime-stat path and be saved
+  with the scenario result.
+- Decision implementation: `GlobalScheduler` now records source and target
+  capacity, requested blocks, candidate and release counts, plan mode,
+  predicted reuse, transfer cost, saved prefill time, queue delay, and benefit
+  ratio for `no_plan`, `no_target_space`, `low_benefit`, `target_busy`, and
+  accepted decisions. `ControlPlaneClient` keeps the latest 128 records with a
+  monotonic count. Worker runtime statistics forward only newly observed
+  records, and `benchmark_e2e.py` stores them as `rebalance_diagnostics` in
+  each scenario JSON result.
+- Decision result: The focused benchmark, scheduler, control-plane, and local
+  scheduling tests pass (`136 passed`). The next memory-skew run can identify
+  the exact admission bottleneck before any further workload or cost-model
+  change is considered.
+
+## 2026-07-27: Include Cold Blocks in Capacity-Offload Candidates
+
+- Decision demand: The diagnostic result showed full source pressure but
+  `candidate_block_count=0` and `reclaimable_source_blocks=0` for several
+  requests. The source blocks created by the pressure phase had no historical
+  access timestamp, so the candidate selector never examined them.
+- Decision plan: Treat every valid source cache block as a possible leaf, while
+  preserving dependency-safe release, pinned-block protection, target-capacity
+  checks, and the existing cost admission. Rank candidates with an exact
+  future-demand match ahead of candidates supported only by historical access.
+- Decision implementation: `_select_chain_move_candidates` now enumerates all
+  non-empty source block hashes instead of only `block_access_time` keys. Its
+  utility key first considers whether the ingress demand snapshot contains the
+  complete chain and then uses predicted reuse and historical frequency. The
+  diagnostics now also report `source_reclaimable_blocks`. The benchmark
+  runtime template applies the CLI GPU-memory fraction before exporting
+  `resolved_config`, so the recorded value matches the scenario workers.
+- Decision result: The regression suite passes (`137 passed`). A new GPU run is
+  required to verify that cold pressure blocks produce an executable plan and
+  that `rebalance_success`, `transfer_release_count`, and
+  `offload_verified=true` become non-zero before evaluating performance.
+
+## 2026-07-27: Separate Memory Pressure From Movable Session KV
+
+- Decision demand: The diagnostic run after cold-candidate discovery still
+  produced no useful foreground move. Pressure requests extended the same long
+  prefix chains that were intended for later reuse, leaving those chains pinned
+  when source shortage occurred. When a block was releasable, it belonged to a
+  one-off pressure tail with no exact remaining demand, so admission correctly
+  observed `predicted_reuses=0` and rejected the plan.
+- Decision plan: Make the capacity-offload trace satisfy the three conditions
+  required for a meaningful foreground transfer: a dormant, releasable source
+  session chain; exact future requests that consume that chain; and an idle
+  partner with available KV budget. Use a four-phase barriered trace rather
+  than overlapping pressure and reuse.
+- Decision implementation: `benchmark_e2e.py` now constructs each long
+  `transfer-session` prefix from a short `transfer-anchor` followed by a long
+  session body. Pressure requests use only anchors plus unique short tails.
+  After pressure drains, one long anchor-based trigger per group creates a
+  shortage while session suffixes are no longer referenced. The final reuse
+  phase replays the complete warm-up session prompt, including its suffix, so
+  its block-hash chain exactly matches the planned transfer. The trace never
+  selects a source or target rank: round-robin and control-plane scenarios use
+  their ordinary dispatch paths. The benchmark records a new `trigger` phase,
+  removes memory-skew phase overlap, and exposes
+  `--memory-skew-trigger-prompts`. The standalone `run_memory_skew.sh` defaults
+  to six groups, 12 warm-up requests, 30 pressure requests, six triggers, and
+  24 exact reuses.
+- Decision result: Focused benchmark, scheduler, and control-plane tests cover
+  prompt construction and phase validation. The next GPU run must show a
+  non-zero foreground success and source release before throughput and reuse
+  metrics are treated as offload evidence.
+
+## 2026-07-27: Remove Oracle Worker Placement From Transfer Workloads
+
+- Decision demand: Earlier benchmark code directly selected warm-up source
+  ranks and partner reuse ranks for several transfer-oriented traces. Although
+  the same trace was applied to all scenarios, it embedded the desired
+  source--target relationship in the client workload and could overstate the
+  benefit of a topology-aware policy.
+- Decision plan: Treat worker selection as part of the evaluated system. The
+  workload may control only prompt content, arrival order, and phase barriers.
+  Round-robin must use its ordinary cycle, while routing and LMPool must use the
+  ordinary control-plane route decision. NVLink pairs remain available only to
+  the scheduler when it independently plans a transfer.
+- Decision implementation: Removed benchmark helpers and configuration fields
+  that mapped prefix groups to source ranks or source ranks to partner targets.
+  `run_engine_scenario()` no longer overrides `target_rank` for warm-up,
+  pressure, trigger, reuse, load-skew, memory-skew, capacity-offload, or
+  transfer-calibration prompts. Memory-skew uses a shared anchor inside each
+  session prefix, so ordinary prefix-aware routing can still create locality
+  without client-side rank hints.
+- Decision result: Focused benchmark, scheduler, and control-plane tests pass
+  (`133 passed`). Subsequent paper results must report the ordinary dispatch
+  policy and must not claim an end-to-end gain unless it appears without
+  workload-level target placement.
+
+## 2026-07-27: Break Round-Robin Alignment in Memory-Skew
+
+- Decision demand: The first oracle-free memory-skew run had zero foreground
+  admissions and a 100% reuse-phase request hit in the round-robin baseline.
+  Six groups, six GPUs, and phase lengths of 12, 30, and 6 aligned every
+  session with the same round-robin rank in warm-up and reuse. Pressure was
+  also uniform, so no rank became short of KV capacity. The trace therefore
+  removed the artificial placement but also removed the condition that transfer
+  is meant to address.
+- Decision plan: Keep worker choice entirely within each scenario, but change
+  the arrival process. Independently shuffle warm-up, pressure, trigger, and
+  reuse group orders using the benchmark seed. Concentrate most pressure on a
+  small anchor subset so prefix-aware routing naturally creates owner pressure;
+  round-robin remains balanced by its own policy.
+- Decision implementation: Added `--memory-skew-pressure-hot-groups` and
+  `--memory-skew-pressure-hot-share`, with defaults of two groups and 80% of
+  pressure requests. Session prompts already contain their short anchors, so
+  pressure and trigger traffic can match an owner through ordinary prefix
+  lookup. Every phase uses a distinct deterministic shuffle; no request carries
+  a rank hint. Trigger requests cycle only through the hot anchors, while reuse
+  remains a shuffled exact replay across all sessions. Added unit coverage for
+  the 80/20 pressure distribution and exact replay.
+- Decision result: This change restores a fair opportunity for routing-induced
+  memory shortage and foreground offload. It does not guarantee an E2E gain;
+  a run is acceptable only if it reports non-zero transfer admission and source
+  release, then compares LMPool directly with routing-only under the same trace.
+
+## 2026-07-27: Make Memory-Skew Preserve Locality and Expose Transaction Wait
+
+- Decision demand: The shuffled hot-anchor trace created one transfer-only
+  move, but LMPool completed no move because routing used load bypass and pair
+  spill to avoid shortage. The completed 29-block transaction also took
+  576 ms end to end while source P2P took only 16.8 ms, so payload bandwidth
+  could not explain the observed latency.
+- Decision plan: Increase the natural recomputation cost of leaving a prefix
+  owner without selecting any worker rank, and measure each control transaction
+  phase before changing transport or admission policy.
+- Decision implementation: Added `--memory-skew-anchor-share`, default 0.375.
+  The session prompt keeps the same total length, but its shared anchor grows
+  and its movable suffix shrinks. A bypass therefore loses a substantial cached
+  prefix, while foreground transfer can still move the completed suffix. The
+  control plane now timestamps prepare, execute, publish, and finalize; every
+  completed transfer observation records `phase_elapsed_ms` and
+  `transaction_elapsed_ms` alongside source P2P timing.
+- Decision result: Focused tests remain green (`134 passed`). The next run must
+  show whether the long latency is dominated by worker arrival at a phase or by
+  the execute phase itself. Only the former justifies a control-protocol
+  optimization; only the latter implicates data-path integration.
+
+## 2026-07-27: Remove No-Op Transfer Phase Participants
+
+- Decision demand: The phase measurements from the oracle-free memory-skew
+  trace showed that NVLink data movement was typically tens of milliseconds,
+  while complete transfer transactions could take hundreds of milliseconds.
+  The protocol asked both source and destination workers to acknowledge
+  `publish` and `finalize`, although only the destination publishes received
+  blocks and only the source releases the old blocks. Those no-op messages
+  added worker scheduling delay without changing ownership or visibility.
+- Decision plan: Keep the existing safe order, destination publication before
+  source release, while dispatching each phase only to workers that mutate
+  state. Prepare and execute remain bilateral because they reserve and move
+  data; publish is destination-only; finalize is source-only.
+- Decision implementation: The control plane now records source and target
+  participant sets for every pending rebalance. After execute, it sends
+  `rebalance_publish` only to target ranks and waits for those acknowledgements.
+  It then sends `rebalance_finalize` only to source ranks. Phase timing remains
+  attached to each completed transaction. The control-plane test now verifies
+  that source ranks do not receive publish and target ranks do not receive
+  finalize, while preserving publish-before-finalize ordering.
+- Decision result: Relevant benchmark, scheduler, and control-plane tests pass
+  (`134 passed`). A focused memory-skew rerun is required to determine whether
+  transaction latency decreases enough to make foreground offload beneficial;
+  no performance claim is made before that run.
+
+## 2026-07-27: Fix Source Finalization After Destination-Only Publish
+
+- Decision demand: The first run after participant minimization reported zero
+  successful foreground moves and `missing_publish` failures. Source workers no
+  longer receive a publish message by design, but their finalize handler still
+  required a locally recorded publish phase.
+- Decision plan: Make the control-plane publish acknowledgement the visibility
+  boundary for source finalization. The source should require only its local
+  execute state, because the control plane sends finalize only after all target
+  publish acknowledgements have arrived.
+- Decision implementation: Updated the source finalize precondition from local
+  `publish` to local `execute`. A source now rejects only a finalize that
+  precedes its own copy execution; it cannot receive finalize before target
+  publication because the control-plane phase machine enforces that order.
+- Decision result: The failed run is invalid as an offload performance result:
+  it measures an incomplete transaction that cannot release source blocks. A
+  focused rerun is required after this correctness repair.
+
+## 2026-07-27: Publish Received KV in the Execute Phase
+
+- Decision demand: After the finalize repair, foreground moves completed but
+  remained slower than recomputation. Phase observations showed that packed
+  NVLink transfer took roughly 9--36 ms, while a separate destination publish
+  round could wait 143--453 ms. The target already had complete and validated
+  KV after `execute_swap_in`; delaying hash visibility to a later message added
+  no safety property.
+- Decision plan: Make target visibility part of the execute completion
+  contract. The control plane may release source blocks only after every target
+  executes, publishes, and acknowledges that combined operation.
+- Decision implementation: Destination workers now register received blocks
+  with `publish=True` immediately after P2P receive. The control-plane phase
+  machine transitions directly from execute acknowledgements to source-only
+  finalize and no longer dispatches a separate publish message. The
+  control-plane test verifies that finalization follows execute completion and
+  is delivered only to the source.
+- Decision result: This removes one control-plane round trip per foreground
+  move while retaining the required order: target visibility precedes source
+  release. Focused tests and a memory-skew rerun are required before claiming
+  performance improvement.
+
+## 2026-07-27: Admit Foreground Transfer Only to Ready NVLink Neighbours
+
+- Decision demand: Even after publishing during execute, successful moves spent
+  tens of milliseconds on P2P but 100--500 ms waiting at prepare or execute.
+  The control plane was planning against an older idle snapshot while a target
+  worker was entering a long model batch.
+- Decision plan: Treat a worker with known waiting, running, or pending work as
+  ineligible for synchronous foreground placement. This is not workload-level
+  target selection: the scheduler still considers only its ordinary NVLink
+  neighbours and chooses capacity normally. If none is ready, it rejects the
+  move and uses the existing local reclaim fallback.
+- Decision implementation: Workers now report block state immediately before
+  each CUDA batch, so the control plane observes `running` work before it can
+  admit a move. `GlobalBlockManager.is_transfer_target_ready()` checks reported
+  waiting, running, and pending sequence counts. `GlobalScheduler.plan_rebalance()`
+  filters only foreground targets with that predicate and records
+  `no_ready_target` plus excluded ranks in its diagnostics. The behavior is
+  configurable through `--foreground-transfer-require-idle-target`.
+- Decision result: Unit coverage verifies rejection of a busy ordinary NVLink
+  partner without any rank hint. A focused memory-skew run must now trade some
+  transfer opportunities for bounded transaction latency; only successful,
+  released moves that improve the reuse phase are valid offload evidence.
+# 2026-07-27: Proactive Move-Based Memory-Skew Workload
+
+## Decision Demand
+
+The previous memory-skew trace either attempted foreground transfer after a request had already encountered capacity pressure or used copy-style background placement. Foreground work is visible on the request critical path, while a copy retains the source blocks, so neither form proves capacity offload.
+
+## Decision Plan
+
+Create a four-stage trace without rank hints: build long reusable session prefixes, create source-side pressure using unrelated anchor-only traffic, move a safe session suffix during the drained barrier, and replay the sessions. The control plane must choose the NVLink peer from topology, capacity, and worker-idle state.
+
+## Decision Implementation
+
+Added `--memory-skew-proactive-move` and `--background-transfer-mode move`. In move mode, the global block manager computes a dependency-safe leaf suffix, the transfer sends the complete prefix chain for target registration, and the source releases only that suffix after target publication. The benchmark publishes future demand at the warm-up barrier, flushes proactive moves only after pressure drains, and disables foreground rebalance in memory-skew scenarios. The standalone script enables this mode with a one-candidate, 64-block transfer budget.
+
+## Decision Result
+
+The workload now measures proactive source-capacity release separately from request-triggered transfer. A successful run must report released source blocks and route forecast reuse to the committed target lease; neither request content nor the workload selects source or target ranks.
+# 2026-07-27: Content-Hot Reuse for Memory-Skew Offload
+
+## Decision Demand
+
+The first proactive move run completed one plan and released source blocks, but only five reuse requests consumed its placement lease. The trace therefore verified correctness without providing enough affected requests to measure a stable service benefit.
+
+## Decision Plan
+
+Concentrate pressure and subsequent reuse on the same content-level session group. This models a hot conversation family whose short shared anchor creates cache pressure while its long session suffix remains valuable. The trace must not select a worker rank: normal routing determines the source owner and the control plane determines the NVLink target.
+
+## Decision Implementation
+
+Added `--memory-skew-reuse-hot-groups` and `--memory-skew-reuse-hot-share`. The standalone memory-skew script defaults to one hot pressure anchor and one hot reuse session group, both at full share. It also raises the load-bypass threshold so the routing policy retains the hot anchor at its cache owner during the pressure phase, which creates the locality-induced capacity skew that offloading is intended to relieve.
+
+## Decision Result
+
+One accepted move can now serve most reuse requests through the target lease rather than only one sixth of them. The workload remains rank-agnostic and should be accepted only when it reports both nonzero released blocks and a material reuse-phase improvement over routing-only.
+# 2026-07-27: Align Suite Memory-Skew With Proactive Move Semantics
+
+## Decision Demand
+
+The preflight and paper scripts still invoked the retired foreground-only memory-skew trace with background placement disabled. Their acceptance condition expected a foreground rebalance and therefore did not validate the implementation now used by the standalone move benchmark.
+
+## Decision Plan
+
+Restore the standalone workload distribution that completed a move, then make preflight and paper-suite runs invoke the same proactive move trace. Treat it as a mechanism gate, not a claimed end-to-end performance win.
+
+## Decision Implementation
+
+Restored the standalone defaults to two pressure-hot groups at 80\% share, uniform reuse, and the normal route-load bypass threshold. Updated both suites to use six groups, 12 warm-up requests, 30 pressure requests, zero trigger requests, a 128-block budget, and move-mode background placement. The preflight gate now requires only a completed LMPool move, released source blocks, and at least one lease route.
+
+## Decision Result
+
+The suite will no longer silently run a different foreground-only workload. A passing memory-skew result proves the proactive move transaction and follow-up routing path; it must not be presented as a throughput superiority claim without separate repeated evidence.
+# 2026-07-27: Remove Redundant Session Warm-Up Replicas
+
+## Decision Demand
+
+The proactive move trace was nondeterministic with 12 warm-up requests for six session groups. It created duplicate session chains before pressure, leaving some NVLink targets unable to accept a complete chain and causing `no_target_space` rejections.
+
+## Decision Plan
+
+Build each session group exactly once in the warm-up phase. This preserves a normal content-derived owner while avoiding redundant target residency. The pressure and reuse phases remain rank-agnostic.
+
+## Decision Implementation
+
+Changed the standalone, preflight, and paper-suite memory-skew warm-up length from 12 to 6. No target selection, route hint, or topology-specific workload content was added.
+
+## Decision Result
+
+The validated run completed five proactive moves, released 90 source blocks, and routed all 30 reuse requests through placement leases. This configuration is now the suite default for memory-skew mechanism validation.
+# 2026-07-27: Define the Load-Skew Reuse Boundary
+
+## Decision Demand
+
+The preflight load-skew run raised `NameError: trigger_end` while assigning phase labels. Load-skew has only warm-up and reuse phases, but the shared submission path referenced the memory-skew-only trigger boundary.
+
+## Decision Plan
+
+Represent the absent trigger phase with an empty interval at the pressure boundary so common phase labeling remains valid without adding a special dispatch path.
+
+## Decision Implementation
+
+Set `trigger_end = pressure_end` in the load-skew phase setup. The existing label logic now skips the empty trigger interval and assigns all post-warm-up requests to reuse.
+
+## Decision Result
+
+Load-skew no longer fails before worker execution, while memory-skew retains its explicit optional trigger phase.
+# 2026-07-27: Narrow-Hotset Load-Skew Replica Validation
+
+## Decision Demand
+
+The preflight load-skew trace used 24 hot prefixes and 48 warm-up requests. It filled potential replica targets with duplicated prefixes, so LMPool completed only one background copy and one lease route. The trace measured routing well but did not test replica-based load relief.
+
+## Decision Plan
+
+Use a small content-hot set with one warm-up per prefix and a long reuse burst. This leaves NVLink peers with capacity for replicas and gives every accepted copy enough future requests to amortize its cost. The workload continues to select only prompt identities; the control plane selects all owners and targets.
+
+## Decision Implementation
+
+Added `benchmarks/run_load_skew.sh`. Its default trace uses three hot prefix groups, three warm-up requests, 189 reuse requests, 64 prompt repeats, a 192-block budget, and a 96-request submit window. Background placement uses one 32-block candidate per plan with a forecast threshold of one and up to 64 expected reuses.
+
+## Decision Result
+
+The standalone run exposes copy count, completed background placements, lease routes, and reuse-phase throughput and latency before this configuration is admitted into preflight or the paper suite.
+
+# 2026-07-27: Promote the Validated Narrow-Hotset Load-Skew Trace
+
+## Decision Demand
+
+The standalone narrow-hotset load-skew run completed two background placements, copied 58 blocks, and routed 63 requests through placement leases. The preflight and paper suites still used the older broad-hotset trace, which had insufficient target capacity and did not reliably exercise replica placement.
+
+## Decision Plan
+
+Make the suite workload identical to the validated trace while retaining model-specific SLA values and suite repetition counts. Resume checks must include every workload-shaping argument so old broad-hotset artifacts cannot be reused.
+
+## Decision Implementation
+
+Updated `run_preflight_suite.sh` and `run_paper_suite.sh` to use three prefix groups, three warm-up requests, three hot groups at full share, 192 total requests, 64 prompt repeats, and a 96-request submission window. Both scripts now use one 32-block copy candidate, a one-request hot threshold, zero minimum load-skew gate, and a 64-reuse forecast. Their artifact checks validate the same workload parameters.
+
+## Decision Result
+
+Preflight and paper runs now measure the same background-copy and placement-lease path that the focused workload validated, rather than a separate broad-hotset workload with different capacity behavior.

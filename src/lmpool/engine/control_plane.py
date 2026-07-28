@@ -60,7 +60,13 @@ class ControlPlaneClient:
         self.rebalance_success_count = 0
         self.rebalance_fail_count = 0
         self.rebalance_fail_reasons = defaultdict(int)
+        self.rebalance_diagnostics: deque[dict] = deque(maxlen=128)
+        self.rebalance_diagnostics_total = 0
         self.last_rebalance_fail_reason = ""
+
+    def _record_rebalance_diagnostic(self, diagnostic: dict) -> None:
+        self.rebalance_diagnostics.append(dict(diagnostic))
+        self.rebalance_diagnostics_total += 1
 
     def _request_metadata(self) -> dict:
         return {
@@ -112,7 +118,7 @@ class ControlPlaneClient:
         block_access_stats: dict[int, dict] | None = None,
         block_generations: dict[int, int] | None = None,
     ):
-        if self.rank < 0:
+        if self.rank < 0 or self.request_queue is None:
             return
         self._state_version += 1
         self.request_queue.put({
@@ -207,6 +213,11 @@ class ControlPlaneClient:
                 self.rebalance_fail_count += 1
                 self.last_rebalance_fail_reason = "control_restarted"
                 self.rebalance_fail_reasons["control_restarted"] += 1
+                self._record_rebalance_diagnostic({
+                    "reason": "control_restarted",
+                    "gpu_id": int(gpu_id),
+                    "needed_blocks": int(needed_blocks),
+                })
             return False
         if msg.get("type") == "rebalance_response":
             success = bool(msg.get("success", False))
@@ -218,6 +229,9 @@ class ControlPlaneClient:
                     self.last_rebalance_fail_reason = msg.get("reason", "unknown")
                     self.rebalance_fail_count += 1
                     self.rebalance_fail_reasons[self.last_rebalance_fail_reason] += 1
+                diagnostics = msg.get("diagnostics")
+                if isinstance(diagnostics, dict):
+                    self._record_rebalance_diagnostic(diagnostics)
             return success
         if msg.get("type") == "error":
             logger.error(
@@ -231,6 +245,11 @@ class ControlPlaneClient:
                 self.rebalance_fail_count += 1
                 self.last_rebalance_fail_reason = "error"
                 self.rebalance_fail_reasons["error"] += 1
+                self._record_rebalance_diagnostic({
+                    "reason": "error",
+                    "gpu_id": int(gpu_id),
+                    "needed_blocks": int(needed_blocks),
+                })
             return False
 
     def flush_background_copies(
@@ -593,6 +612,12 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         0.0,
         float(config.get("route_owner_spill_max_extra_cost", scheduler.owner_spill_max_extra_cost)),
     )
+    scheduler.enable_transfer_aware_owner_routing = bool(
+        config.get(
+            "enable_transfer_aware_owner_routing",
+            config.get("enable_foreground_rebalance", False),
+        )
+    )
     scheduler.block_size = max(1, int(config.get("block_size", scheduler.block_size)))
     scheduler.prefill_cost_weight = max(
         0.0,
@@ -612,6 +637,12 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             "foreground_transfer_min_benefit_ratio",
             scheduler.foreground_transfer_min_benefit_ratio,
         )),
+    )
+    scheduler.foreground_transfer_require_idle_target = bool(
+        config.get(
+            "foreground_transfer_require_idle_target",
+            scheduler.foreground_transfer_require_idle_target,
+        )
     )
     scheduler.num_layers = max(1, int(config.get("num_layers", scheduler.num_layers)))
     scheduler.num_kv_heads = max(1, int(config.get("num_kv_heads", scheduler.num_kv_heads)))
@@ -661,6 +692,15 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
     enable_route_cache = bool(config.get("enable_route_cache", False))
     route_cache_queue_slack = float(config.get("route_cache_queue_slack", 2.0))
     enable_background_copy = bool(config.get("enable_background_copy", False))
+    background_transfer_mode = str(
+        config.get("background_transfer_mode", "copy")
+    ).strip().lower()
+    if background_transfer_mode not in {"copy", "move"}:
+        raise ValueError("background_transfer_mode must be 'copy' or 'move'")
+    background_move_source_free_block_threshold = max(
+        0,
+        int(config.get("background_move_source_free_block_threshold", 0)),
+    )
     background_copy_max_blocks = max(1, int(config.get("background_copy_max_blocks", 1)))
     background_copy_batch_max_candidates = max(
         1,
@@ -868,11 +908,27 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                     elapsed_s,
                     int(transfer["src_gpu"]),
                     int(transfer["dst_gpu"]),
+                    transfer.get(
+                        "estimated_transfer_cost_ms",
+                        plan.get("estimated_transfer_cost_ms"),
+                    ),
+                    transfer.get(
+                        "estimated_target_queue_delay_ms",
+                        plan.get("estimated_target_queue_delay_ms", 0.0),
+                    ),
                 )
                 if observation is not None:
                     observation["plan_id"] = plan.get("plan_id")
                     observation["mode"] = transfer.get("mode", plan.get("mode", "move"))
                     observation["background"] = bool(plan.get("background"))
+                    phase_elapsed_s = dict(
+                        plan.get("transaction_phase_elapsed_s", {})
+                    )
+                    observation["phase_elapsed_ms"] = {
+                        phase: float(elapsed_s) * 1000.0
+                        for phase, elapsed_s in phase_elapsed_s.items()
+                    }
+                    observation["transaction_elapsed_ms"] = float(elapsed_s) * 1000.0
                     transfer_cost_observations.append(observation)
         if not plan.get("background"):
             return
@@ -898,10 +954,13 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 int(background_future_demands.get(int(candidate_key[0]), 0)),
             )
             if candidate is not None and future_demand > 0:
+                moved = background_transfer_mode == "move"
                 start_with_target = placement_lease_creation_count[pair] % 2 == 0
                 placement_lease_creation_count[pair] += 1
                 split = future_demand // 2
-                if future_demand == 1:
+                if moved:
+                    target_quota, source_quota = future_demand, 0
+                elif future_demand == 1:
                     target_quota, source_quota = 1, 0
                 else:
                     target_quota = split + int(
@@ -967,8 +1026,15 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             "request_id": request_id,
             "reply_rank": reply_rank,
             "phase": "prepare",
+            "phase_started_at": time.monotonic(),
+            "phase_elapsed_s": {},
             "pending_ranks": set(execute_ranks),
             "execute_ranks": execute_ranks,
+            # Every participant prepares and executes the copy. Only the
+            # destination changes visibility during publish, and only the
+            # source changes ownership during finalize.
+            "source_ranks": source_ranks,
+            "target_ranks": target_ranks,
             "plan": plan,
         }
 
@@ -1056,6 +1122,12 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         for first_gpu, second_gpu in sorted(gbm.nvlink_pairs):
             for src_gpu, dst_gpu in ((first_gpu, second_gpu), (second_gpu, first_gpu)):
                 if (
+                    background_transfer_mode == "move"
+                    and gbm.get_free_blocks_count(src_gpu)
+                    > background_move_source_free_block_threshold
+                ):
+                    continue
+                if (
                     trigger == "route"
                     and gbm.get_queue_pressure(src_gpu) - gbm.get_queue_pressure(dst_gpu)
                     < background_copy_min_load_skew
@@ -1132,6 +1204,20 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             generations.append(gbm.get_block_generation(src_gpu, block_id))
         if not src_blocks:
             return None, "already_placed"
+        release_source_blocks: list[int] = []
+        if background_transfer_mode == "move":
+            release_source_blocks = gbm.get_releasable_chain_suffix(
+                src_gpu, src_blocks
+            )
+            if not release_source_blocks:
+                return None, "no_releasable_suffix"
+        release_metadata = {
+            block_id: (
+                int(gbm.get_block_hash(src_gpu, block_id) or -1),
+                int(gbm.get_block_generation(src_gpu, block_id)),
+            )
+            for block_id in release_source_blocks
+        }
         return {
             "src_gpu": src_gpu,
             "dst_gpu": dst_gpu,
@@ -1140,7 +1226,10 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
             "parent_hashes": parent_hashes,
             "access_counts": access_counts,
             "generations": generations,
-            "mode": "copy",
+            "release_source_blocks": release_source_blocks,
+            "release_source_hashes": [release_metadata[block_id][0] for block_id in release_source_blocks],
+            "release_source_generations": [release_metadata[block_id][1] for block_id in release_source_blocks],
+            "mode": "chain_move" if background_transfer_mode == "move" else "copy",
         }, ""
 
     def _build_background_batch_plan(
@@ -1149,6 +1238,45 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
         """Coalesce one directed NVLink pair into a single transfer payload."""
         if not candidates:
             return None, []
+        # A move retains an ordered chain and releases only its safe suffix.
+        # Do not coalesce chains: deduplicating a shared ancestor would make
+        # source-side release ownership ambiguous.
+        if background_transfer_mode == "move":
+            candidate = candidates[0]
+            candidate_key = tuple(candidate["key"])
+            transfer, reason = _build_background_transfer(candidate)
+            if transfer is None:
+                return None, [(candidate_key, reason)]
+            src_gpu = int(transfer["src_gpu"])
+            dst_gpu = int(transfer["dst_gpu"])
+            if gbm.get_free_blocks_count(dst_gpu) < len(transfer["src_blocks"]):
+                return None, [(candidate_key, "no_target_space")]
+            transfer_bytes = scheduler._estimate_transfer_bytes(len(transfer["src_blocks"]))
+            transfer_cost_ms = scheduler._estimate_transfer_cost_ms(
+                transfer_bytes, src_gpu, dst_gpu
+            )
+            saved_prefill_ms = (
+                len(transfer["src_blocks"])
+                * scheduler.block_size
+                * scheduler.estimate_prefill_token_time_ms(dst_gpu)
+            )
+            if saved_prefill_ms < (
+                transfer_cost_ms * scheduler.foreground_transfer_min_benefit_ratio
+            ):
+                return None, [(candidate_key, "low_benefit")]
+            return {
+                "gpu_id": src_gpu,
+                "needed_blocks": len(transfer["src_blocks"]),
+                "mode": "chain_move",
+                "background": True,
+                "background_candidate_keys": [candidate_key],
+                "background_trigger": candidate["trigger"],
+                "estimated_transfer_bytes": transfer_bytes,
+                "estimated_transfer_cost_ms": transfer_cost_ms,
+                "estimated_saved_prefill_ms": saved_prefill_ms,
+                "estimated_future_reuses": float(candidate["predicted_reuses"]),
+                "transfers": [transfer],
+            }, []
         src_gpu = int(candidates[0]["src_gpu"])
         dst_gpu = int(candidates[0]["dst_gpu"])
         selected_keys = []
@@ -1682,6 +1810,7 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "error": result_error,
                         "reason": result_reason,
                         "plan_id": plan_id,
+                        "diagnostics": plan.get("admission_diagnostics", {}),
                     })
                 _release_rebalance_inflight(plan["plan"])
                 del pending_rebalances[plan_id]
@@ -1693,23 +1822,26 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                 plan.setdefault("prepared_ranks", set()).add(msg["rank"])
             plan["pending_ranks"].discard(msg["rank"])
             if not plan["pending_ranks"]:
+                phase_elapsed = max(
+                    0.0,
+                    time.monotonic() - float(plan.get("phase_started_at", time.monotonic())),
+                )
+                plan.setdefault("phase_elapsed_s", {})[phase] = phase_elapsed
                 if phase == "prepare":
                     plan["phase"] = "execute"
+                    plan["phase_started_at"] = time.monotonic()
                     plan["pending_ranks"] = set(plan["execute_ranks"])
                     _send_rebalance_execute(plan_id, plan["plan"])
                 elif phase == "execute":
-                    # Execute only copies and registers hidden destination KV.
-                    # Publish every target before any source can be released.
-                    plan["phase"] = "publish"
-                    plan["pending_ranks"] = set(plan["execute_ranks"])
-                    _send_rebalance_publish(
-                        plan_id, plan["plan"], set(plan["execute_ranks"])
-                    )
-                elif phase == "publish":
+                    # A target publishes received KV before acknowledging
+                    # execute. Its ACK is therefore the visibility boundary:
+                    # source blocks can be released without a separate publish
+                    # round-trip and its additional worker scheduling delay.
                     plan["phase"] = "finalize"
-                    plan["pending_ranks"] = set(plan["execute_ranks"])
+                    plan["phase_started_at"] = time.monotonic()
+                    plan["pending_ranks"] = set(plan["source_ranks"])
                     _send_rebalance_finalize(
-                        plan_id, plan["plan"], set(plan["execute_ranks"])
+                        plan_id, plan["plan"], set(plan["source_ranks"])
                     )
                 else:
                     if plan.get("reply_rank") is not None:
@@ -1718,7 +1850,11 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                             "request_id": plan["request_id"],
                             "success": True,
                             "plan_id": plan_id,
+                            "diagnostics": plan.get("admission_diagnostics", {}),
                         })
+                    plan["plan"]["transaction_phase_elapsed_s"] = dict(
+                        plan.get("phase_elapsed_s", {})
+                    )
                     _release_rebalance_inflight(plan["plan"], succeeded=True)
                     del pending_rebalances[plan_id]
                     _service_background_placement()
@@ -1915,8 +2051,13 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "request_id": msg["request_id"],
                         "success": False,
                         "reason": scheduler.last_rebalance_fail_reason or "no_plan",
+                        "diagnostics": dict(scheduler.last_rebalance_diagnostics),
                     })
                     continue
+
+                plan["admission_diagnostics"] = dict(
+                    scheduler.last_rebalance_diagnostics
+                )
 
                 if not _enqueue_rebalance_plan(plan, msg["request_id"], msg["reply_rank"]):
                     reason = plan.get("enqueue_fail_reason", "no_plan")
@@ -1926,6 +2067,10 @@ def control_plane_process(config: dict, request_queue: Queue, response_queues: d
                         "success": False,
                         "error": f"rebalance plan rejected: {reason}",
                         "reason": reason,
+                        "diagnostics": {
+                            **dict(scheduler.last_rebalance_diagnostics),
+                            "reason": reason,
+                        },
                     })
                     continue
                 # 先等待目标 rank 预留成功，再下发 execute，避免源端单边进入 NCCL send。

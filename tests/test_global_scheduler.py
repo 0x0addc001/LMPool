@@ -75,6 +75,38 @@ def test_route_sequence_meta_falls_back_when_prefix_owner_has_no_space():
     assert info["reason"] == "prefix_owner_full_fallback"
 
 
+def test_route_sequence_meta_retains_full_owner_when_transfer_beats_spill():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [4, 0]
+    # The admission path now requires an executable plan, so the fixture must
+    # contain an actual evictable source block rather than only a page-table
+    # location.
+    gbm.update_gpu_state(
+        1,
+        free_blocks=0,
+        block_hashes={0: 456},
+        evictable_block_hashes={0: 456},
+    )
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.enable_transfer_aware_owner_routing = True
+    scheduler.foreground_transfer_min_benefit_ratio = 1.1
+    scheduler.future_prefix_demands = {456: 10}
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=0,
+        seq_id=13,
+        num_tokens=512,
+        num_blocks=2,
+        prefix_hash=456,
+        return_info=True,
+    )
+
+    assert target == 1
+    assert info["reason"] == "prefix_owner_transfer_admission"
+    assert info["foreground_transfer_candidate"] is True
+    assert info["foreground_transfer_target_rank"] == 0
+
+
 def test_route_sequence_meta_requests_rebalance_only_when_all_candidates_are_full():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [0, 0]
@@ -92,6 +124,34 @@ def test_route_sequence_meta_requests_rebalance_only_when_all_candidates_are_ful
 
     assert target == 1
     assert info["reason"] == "prefix_hit_needs_rebalance"
+
+
+def test_route_sequence_meta_does_not_admit_transfer_without_executable_plan():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [4, 0]
+    gbm.update_gpu_state(
+        1,
+        free_blocks=0,
+        block_hashes={0: 456},
+        evictable_block_hashes={},
+        pinned_block_hashes={0: 456},
+    )
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.enable_transfer_aware_owner_routing = True
+    scheduler.future_prefix_demands = {456: 10}
+
+    target, info = scheduler.route_sequence_meta(
+        requester_rank=0,
+        seq_id=14,
+        num_tokens=512,
+        num_blocks=2,
+        prefix_hash=456,
+        return_info=True,
+    )
+
+    assert target == 0
+    assert info["reason"] == "prefix_owner_full_fallback"
+    assert "foreground_transfer_candidate" not in info
 
 
 def test_route_sequence_meta_uses_longest_contiguous_prefix_when_deepest_hash_misses():
@@ -416,6 +476,23 @@ def test_plan_rebalance_groups_transfers():
     assert plan["transfers"][0]["mode"] == "chain_move"
 
 
+def test_plan_rebalance_rejects_busy_nvlink_target_without_rank_hint():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_access_time[0] = {0: 5.0}
+    gbm.block_hash[0] = {0: 11}
+    gbm.running_sequences_per_gpu[1] = 1
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
+
+    assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=1) is None
+    assert scheduler.last_rebalance_diagnostics["reason"] == "no_ready_target"
+    assert scheduler.last_rebalance_diagnostics["busy_target_ranks"] == [1]
+
+    gbm.running_sequences_per_gpu[1] = 0
+    assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=1) is not None
+
+
 def test_plan_rebalance_transfers_complete_chain_and_releases_only_leaf():
     gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
     gbm.free_blocks_per_gpu = [0, 4]
@@ -487,6 +564,22 @@ def test_plan_rebalance_can_release_target_resident_ancestor_without_resending_i
     transfer = plan["transfers"][0]
     assert transfer["src_blocks"] == [1]
     assert transfer["release_source_blocks"] == [1, 0]
+
+
+def test_plan_rebalance_uses_dependency_safe_target_reclaim_capacity():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=2, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 0]
+    gbm.block_hash[0] = {0: 11}
+    gbm.block_access_time[0] = {0: 1.0}
+    gbm.block_hash[1] = {0: 99}
+    gbm.block_parent_hash[1] = {0: -1}
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    assert plan["target_reclaim_blocks"] == {1: 1}
 
 
 def test_plan_rebalance_reuses_ancestors_already_present_on_target():
@@ -569,6 +662,7 @@ def test_plan_rebalance_uses_copy_for_pinned_blocks_when_move_is_impossible():
     gbm.free_blocks_per_gpu = [0, 2]
     gbm.block_access_time[0] = {}
     gbm.block_hash[0] = {0: 11, 1: 22}
+    gbm.pinned_block_ids[0] = {0, 1}
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
     scheduler.foreground_transfer_min_benefit_ratio = 0.0
 
@@ -589,6 +683,8 @@ def test_plan_rebalance_does_not_copy_by_default_for_foreground_shortage():
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
 
     assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=1) is None
+    assert scheduler.last_rebalance_diagnostics["reason"] == "low_benefit"
+    assert scheduler.last_rebalance_diagnostics["candidate_block_count"] > 0
 
 
 def test_plan_rebalance_rejects_cold_transfer_below_benefit_threshold():
@@ -601,6 +697,9 @@ def test_plan_rebalance_rejects_cold_transfer_below_benefit_threshold():
 
     assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=1) is None
     assert scheduler.last_rebalance_fail_reason == "low_benefit"
+    assert scheduler.last_rebalance_diagnostics["predicted_reuses"] == 0.0
+    assert scheduler.last_rebalance_diagnostics["estimated_saved_prefill_ms"] == 0.0
+    assert "benefit_ratio" in scheduler.last_rebalance_diagnostics
 
 
 def test_plan_rebalance_accepts_hot_transfer_and_reports_cost():
@@ -621,6 +720,72 @@ def test_plan_rebalance_accepts_hot_transfer_and_reports_cost():
     assert plan is not None
     assert plan["estimated_future_reuses"] == 2.0
     assert plan["estimated_saved_prefill_ms"] > plan["estimated_transfer_cost_ms"]
+    assert scheduler.last_rebalance_diagnostics["reason"] == "accepted"
+    assert scheduler.last_rebalance_diagnostics["candidate_block_count"] == 1
+
+
+def test_plan_rebalance_considers_cold_block_with_future_demand():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_hash[0] = {0: 11}
+    # This block has no historical access sample, but it is a valid completed
+    # cache block and the ingress snapshot predicts future reuse.
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 100.0
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.prefill_token_time_ms = 1.0
+    scheduler.future_reuse_discount = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
+    scheduler.set_future_prefix_demands({11: 10})
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    assert plan["estimated_future_reuses"] == 10.0
+    assert scheduler.last_rebalance_diagnostics["reason"] == "accepted"
+
+
+def test_plan_rebalance_includes_target_dispatch_delay():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_hash[0] = {0: 11}
+    gbm.block_access_time[0] = {0: 1.0}
+    gbm.block_access_count[0] = {0: 3}
+    gbm.waiting_tokens_per_gpu[1] = 100
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 100.0
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.prefill_token_time_ms = 1.0
+    scheduler.future_reuse_discount = 1.0
+    scheduler.foreground_transfer_min_benefit_ratio = 0.0
+
+    plan = scheduler.plan_rebalance(gpu_id=0, needed_blocks=1)
+
+    assert plan is not None
+    assert plan["estimated_target_queue_delay_ms"] == 100.0
+    assert plan["estimated_transfer_cost_ms"] == (
+        plan["estimated_data_transfer_cost_ms"] + 100.0
+    )
+
+
+def test_plan_rebalance_rejects_plan_when_target_queue_erases_benefit():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=4, nvlink_pairs=[(0, 1)])
+    gbm.free_blocks_per_gpu = [0, 4]
+    gbm.block_hash[0] = {0: 11}
+    gbm.block_access_time[0] = {0: 1.0}
+    gbm.block_access_count[0] = {0: 3}
+    gbm.waiting_tokens_per_gpu[1] = 10_000
+    scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
+    scheduler.transfer_bandwidth_gib_s = 100.0
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.prefill_token_time_ms = 1.0
+    scheduler.future_reuse_discount = 1.0
+
+    assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=1) is None
+    assert scheduler.last_rebalance_fail_reason == "target_busy"
 
 
 def test_plan_rebalance_uses_exact_ingress_forecast_for_cold_chain():
@@ -779,6 +944,34 @@ def test_transaction_residual_profile_replaces_scalar_fallback_by_pair_and_size(
     assert scheduler._estimate_transfer_cost_ms(200, 2, 3) == 30.0
 
 
+def test_transaction_residual_profile_is_monotone_conservative_for_large_plans():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.set_transfer_latency_profile({
+        "pairs": {
+            "0,1": {
+                "points": [
+                    {"bytes": 100, "latency_ms": 10.0},
+                    {"bytes": 300, "latency_ms": 30.0},
+                ],
+            },
+        },
+        "transaction_residual_profile": {
+            "pairs": {
+                "0,1": {
+                    "points": [
+                        {"bytes": 100, "residual_ms": 80.0},
+                        {"bytes": 300, "residual_ms": 20.0},
+                    ],
+                },
+            },
+        },
+    })
+
+    assert scheduler._estimate_transfer_cost_ms(300, 0, 1) == 110.0
+
+
 def test_complete_placement_observation_can_correct_manual_fallback_downward():
     scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
     scheduler.transfer_fixed_latency_ms = 40.0
@@ -799,6 +992,34 @@ def test_complete_placement_observation_can_correct_manual_fallback_downward():
     assert observation["residual_ms"] == 15.0
     assert observation["has_calibrated_residual"] is False
     assert scheduler._estimate_transfer_cost_ms(100, 0, 1) == 25.0
+
+
+def test_placement_observation_excludes_estimated_queue_delay_from_pair_residual():
+    scheduler = GlobalScheduler(gbm=None, block_manager=DummyBlockManager())
+    scheduler.transfer_fixed_latency_ms = 0.0
+    scheduler.transfer_interference_multiplier = 1.0
+    scheduler.transfer_cost_ewma_alpha = 1.0
+    scheduler.set_transfer_latency_profile({
+        "pairs": {
+            "0,1": {
+                "points": [{"bytes": 100, "latency_ms": 10.0}],
+            },
+        },
+    })
+
+    observation = scheduler.observe_placement(
+        100,
+        0.110,
+        0,
+        1,
+        admission_cost_ms=110.0,
+        target_queue_delay_ms=100.0,
+    )
+
+    assert observation is not None
+    assert observation["estimated_target_queue_delay_ms"] == 100.0
+    assert observation["residual_ms"] == 0.0
+    assert scheduler._estimate_transfer_cost_ms(100, 0, 1) == 10.0
 
 
 def test_loaded_profile_prior_rejects_small_plan_but_keeps_amortized_large_plan():
@@ -895,3 +1116,13 @@ def test_plan_rebalance_does_not_use_recursive_target_victims():
     scheduler = GlobalScheduler(gbm=gbm, block_manager=DummyBlockManager())
 
     assert scheduler.plan_rebalance(gpu_id=0, needed_blocks=5) is None
+
+
+def test_releasable_chain_suffix_preserves_shared_anchor_and_sibling_branch():
+    gbm = GlobalBlockManager(rank=0, world_size=2, num_blocks_per_gpu=8, nvlink_pairs=[(0, 1)])
+    # 10 -> 11 is an anchor shared by two session tails: 12 -> 13 and 14.
+    gbm.block_hash[0] = {0: 10, 1: 11, 2: 12, 3: 13, 4: 14}
+    gbm.block_parent_hash[0] = {0: -1, 1: 10, 2: 11, 3: 12, 4: 11}
+
+    assert gbm.get_releasable_chain_suffix(0, [0, 1, 2, 3]) == [2, 3]
+    assert gbm.get_releasable_chain_suffix(0, [0, 1, 4]) == [4]

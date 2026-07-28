@@ -181,8 +181,8 @@ Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`t
 | Workload | 确切前缀构造 | 请求级/Token 级共享率 |
 | --- | --- | ---: |
 | Locality/routing | 192 个请求分布在 16 个循环复用组中；1x/3x/5x 最长前缀分别约为 1,911/5,655/9,399 tokens | 91.67% / 86.20-91.38% |
-| Load skew | 48 个 source warm-up 请求和 144 个 burst reuse 请求循环访问 24 个约 5.7K-token 热点组 | 87.50% / 87.21% |
-| Memory skew | 24 个 warm-up 请求循环访问 12 个可复用 3.8K-token 热点组；随后是 64 个互不共享的 1.9K-token pressure 前缀和 168 个热点 reuse 请求 | 70.31% / 76.12% |
+| Load skew | 48 个 source warm-up 请求覆盖 24 个热点组，随后提交 336 个打乱的请求；其中 80% 复用热点，20% 使用各不相同的一次性冷前缀 | 76.30% / 76.05% |
+| Memory skew | 24 个 warm-up 请求建立 12 个热点组；随后是 128 个复用热点前缀但追加独立长尾的 pressure 请求，以及与仍在执行的 pressure 重叠的 24 个 reuse 请求 | 93.18% / 64.83% |
 
 运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。JSON 会把完整计数写入 `metadata.dataset_profile`。
 
@@ -200,8 +200,8 @@ offload。内部 `transfer-calibration` trace 只生成成本 profile 使用的�
 NVLink transfer microbenchmark 证明 packed all-layer K/V 数据路径在字节级正确，并测得每个
 直连 pair、每种 plan 大小的 latency，但它本身不等于服务收益。Load-skew 必须先观察到
 background copy 和 replica/lease routing，才能与 routing-only 比较；memory-skew 还必须同时
-观察到 foreground plan 成功、源端 block 释放，以及相对无 transfer 基线的 throughput 或
-latency 改善。
+观察到 foreground plan 成功、源端 block 释放，以及在 pressure 仍活跃时，相对无 transfer
+基线更高的 reuse-phase throughput 和更低的 P90 TTFT/E2E。
 
 ## 测试
 

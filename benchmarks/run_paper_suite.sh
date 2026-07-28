@@ -316,14 +316,16 @@ run_model_suite() {
       && jq -e \
         --argjson expected_sla "${goodput_sla_ms}" \
         --arg expected_sweep "${GOODPUT_SLA_SWEEP_MS}" \
-        '.metadata.arguments.memory_skew_prefix_groups == 12
-         and .metadata.arguments.memory_skew_warmup_prompts == 24
-         and .metadata.arguments.memory_skew_pressure_prompts == 64
-         and .metadata.arguments.num_prompts == 256
-         and .metadata.arguments.prompt_repeat == 32
+        '.metadata.arguments.memory_skew_prefix_groups == 6
+         and .metadata.arguments.memory_skew_warmup_prompts == 6
+         and .metadata.arguments.memory_skew_pressure_prompts == 30
+         and .metadata.arguments.num_prompts == 72
+         and .metadata.arguments.prompt_repeat == 64
          and .metadata.arguments.max_tokens == 16
-         and .metadata.arguments.submit_window == 32
-         and .metadata.arguments.disable_background_copy == true
+         and .metadata.arguments.submit_window == 48
+         and .metadata.arguments.kv_block_budget == 128
+         and .metadata.arguments.memory_skew_proactive_move == true
+         and .metadata.arguments.background_transfer_mode == "move"
          and .metadata.arguments.goodput_e2e_sla_ms
              == $expected_sla
          and .metadata.arguments.goodput_e2e_sla_sweep_ms
@@ -339,23 +341,32 @@ run_model_suite() {
       --dtype "${DTYPE}" \
       --world-size "${WORLD_SIZE}" \
       --workload memory-skew \
-      --memory-skew-prefix-groups 12 \
-      --memory-skew-warmup-prompts 24 \
-      --memory-skew-pressure-prompts 64 \
-      --num-prompts 256 \
-      --prompt-repeat 32 \
+      --memory-skew-prefix-groups 6 \
+      --memory-skew-warmup-prompts 6 \
+      --memory-skew-pressure-prompts 30 \
+      --memory-skew-pressure-hot-groups 2 \
+      --memory-skew-pressure-hot-share 0.8 \
+      --memory-skew-trigger-prompts 0 \
+      --memory-skew-proactive-move \
+      --num-prompts 72 \
+      --prompt-repeat 64 \
       --max-tokens 16 \
       --temperature 0.6 \
       --ignore-eos \
       --seed "${SEED}" \
       --repetitions "${REPETITIONS}" \
       --nvlink-pairs "${NVLINK_PAIRS}" \
-      --submit-window 32 \
-      --kv-block-budget 64 \
+      --submit-window 48 \
+      --kv-block-budget 128 \
       --gpu-memory-utilization 0.5 \
       --goodput-e2e-sla-ms "${goodput_sla_ms}" \
       --goodput-e2e-sla-sweep-ms "${GOODPUT_SLA_SWEEP_MS}" \
-      --disable-background-copy \
+      --background-transfer-mode move \
+      --background-move-source-free-block-threshold 8 \
+      --background-copy-max-blocks 64 \
+      --background-copy-batch-max-blocks 64 \
+      --background-copy-batch-max-candidates 1 \
+      --background-copy-hot-threshold 1 \
       --foreground-transfer-min-benefit-ratio 1.1 \
       --foreground-transfer-profile-json "${transfer_profile}" \
       --foreground-transfer-fixed-latency-ms "${TRANSFER_FIXED_LATENCY_MS}" \
@@ -373,12 +384,14 @@ run_model_suite() {
     && jq -e \
       --argjson expected_sla "${goodput_sla_ms}" \
       --arg expected_sweep "${GOODPUT_SLA_SWEEP_MS}" \
-      '.metadata.arguments.load_skew_prefix_groups == 24
-       and .metadata.arguments.load_skew_warmup_prompts == 48
+      '.metadata.arguments.load_skew_prefix_groups == 3
+       and .metadata.arguments.load_skew_warmup_prompts == 3
+       and .metadata.arguments.load_skew_hot_groups == 3
+       and .metadata.arguments.load_skew_hot_share == 1
        and .metadata.arguments.num_prompts == 192
-       and .metadata.arguments.prompt_repeat == 48
+       and .metadata.arguments.prompt_repeat == 64
        and .metadata.arguments.max_tokens == 8
-       and .metadata.arguments.submit_window == 64
+       and .metadata.arguments.submit_window == 96
        and .metadata.arguments.kv_block_budget == 192
        and .metadata.arguments.disable_background_copy == false
        and .metadata.arguments.goodput_e2e_sla_ms
@@ -393,27 +406,29 @@ run_model_suite() {
       --dtype "${DTYPE}" \
       --world-size "${WORLD_SIZE}" \
       --workload load-skew \
-      --load-skew-prefix-groups 24 \
-      --load-skew-warmup-prompts 48 \
+      --load-skew-prefix-groups 3 \
+      --load-skew-warmup-prompts 3 \
+      --load-skew-hot-groups 3 \
+      --load-skew-hot-share 1.0 \
       --num-prompts 192 \
-      --prompt-repeat 48 \
+      --prompt-repeat 64 \
       --max-tokens 8 \
       --temperature 0.6 \
       --ignore-eos \
       --seed "${SEED}" \
       --repetitions "${REPETITIONS}" \
       --nvlink-pairs "${NVLINK_PAIRS}" \
-      --submit-window 64 \
+      --submit-window 96 \
       --kv-block-budget 192 \
       --gpu-memory-utilization 0.7 \
       --goodput-e2e-sla-ms "${goodput_sla_ms}" \
       --goodput-e2e-sla-sweep-ms "${GOODPUT_SLA_SWEEP_MS}" \
-      --background-copy-max-blocks 24 \
-      --background-copy-batch-max-blocks 48 \
-      --background-copy-batch-max-candidates 4 \
-      --background-copy-hot-threshold 2 \
-      --background-copy-min-load-skew 2 \
-      --background-copy-expected-reuses 8 \
+      --background-copy-max-blocks 32 \
+      --background-copy-batch-max-blocks 32 \
+      --background-copy-batch-max-candidates 1 \
+      --background-copy-hot-threshold 1 \
+      --background-copy-min-load-skew 0 \
+      --background-copy-expected-reuses 64 \
       --background-copy-cooldown-s 0.1 \
       --foreground-transfer-min-benefit-ratio 1.1 \
       --foreground-transfer-profile-json "${transfer_profile}" \

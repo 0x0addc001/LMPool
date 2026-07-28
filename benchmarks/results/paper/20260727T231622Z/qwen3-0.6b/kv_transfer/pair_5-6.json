@@ -1,0 +1,143 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "benchmark": "benchmark_kv_transfer",
+    "created_at_utc": "2026-07-27T23:18:54.670517+00:00",
+    "command": "/home/jialiangli/LMPool/.venv/bin/python3 benchmarks/benchmark_kv_transfer.py --model-name-or-path /home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca --dtype auto --block-size 256 --block-counts 1,2,4,8,16,32,64 --iterations 100 --warmup 20 --output-json benchmarks/results/paper/20260727T231622Z/qwen3-0.6b/kv_transfer/pair_5-6.json --output-figure benchmarks/results/paper/20260727T231622Z/qwen3-0.6b/kv_transfer/pair_5-6.png",
+    "cwd": "/home/jialiangli/LMPool",
+    "git_revision": "17260b06d81b49ca7bfb0f9a6fd3e278f07f3f62",
+    "git_status": "M README.md\n M README_zh.md\n M benchmarks/PAPER_RUNBOOK.md\n M benchmarks/README.md\n M benchmarks/benchmark_e2e.py\n M benchmarks/run_paper_suite.sh\n M benchmarks/run_preflight_suite.sh\n M docs/flow/decisions.md\n M src/lmpool/engine/control_plane.py\n M src/lmpool/engine/data_plane.py\n M src/lmpool/engine/global_block_manager.py\n M src/lmpool/engine/global_scheduler.py\n M tests/test_benchmark_e2e.py\n M tests/test_control_plane.py\n M tests/test_global_scheduler.py\n?? benchmarks/results/light/\n?? benchmarks/results/paper/20260727T231622Z/\n?? benchmarks/results/preflight/20260727T054006Z/\n?? benchmarks/results/preflight/20260727T091841Z/\n?? benchmarks/results/preflight/20260727T111841Z/\n?? benchmarks/results/preflight/20260727T120408Z/\n?? benchmarks/results/preflight/20260727T222721Z/\n?? benchmarks/results/preflight/20260727T223805Z/\n?? benchmarks/run_load_skew.sh\n?? benchmarks/run_memory_skew.sh",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "5,6",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "arguments": {
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "dtype": "auto",
+      "num_layers": 28,
+      "block_size": 256,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "num_transfer_blocks": 2,
+      "block_counts": "1,2,4,8,16,32,64",
+      "iterations": 100,
+      "warmup": 20,
+      "input_json": "",
+      "output_json": "benchmarks/results/paper/20260727T231622Z/qwen3-0.6b/kv_transfer/pair_5-6.json",
+      "output_figure": "benchmarks/results/paper/20260727T231622Z/qwen3-0.6b/kv_transfer/pair_5-6.png",
+      "resolved_dtype": "bfloat16"
+    },
+    "model": {
+      "name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "label": "Qwen/Qwen3-0.6B",
+      "model_type": "qwen3",
+      "architecture": "Qwen3ForCausalLM",
+      "dtype": "bfloat16",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "num_kv_heads": 8,
+      "head_dim": 128,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "max_position_embeddings": 40960,
+      "kv_bytes_per_token": 114688
+    },
+    "resolved_config": {
+      "max_model_length": 2048,
+      "model_name_or_path": "/home/jialiangli/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+      "model_architecture": "Qwen3ForCausalLM",
+      "model_type": "qwen3",
+      "vocab_size": 151936,
+      "hidden_size": 1024,
+      "head_dim": 128,
+      "num_kv_heads": 8,
+      "intermediate_size": 3072,
+      "num_layers": 28,
+      "tie_word_embeddings": true,
+      "rms_norm_epsilon": 1e-06,
+      "ffn_bias": false,
+      "torch_dtype": "bfloat16",
+      "kv_dtype_bytes": 2,
+      "eos": 151645,
+      "num_heads": 16,
+      "qkv_bias": false,
+      "base": 1000000,
+      "max_position": 40960,
+      "block_size": 256
+    }
+  },
+  "results": [
+    {
+      "num_transfer_blocks": 1,
+      "bytes_per_iteration": 29360128,
+      "gib_per_iteration": 0.02734375,
+      "mean_latency_ms": 3.4952964501280803,
+      "p50_latency_ms": 3.494384502118919,
+      "p95_latency_ms": 3.5859201474522706,
+      "effective_bandwidth_gib_s": 7.82301312353578,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 2,
+      "bytes_per_iteration": 58720256,
+      "gib_per_iteration": 0.0546875,
+      "mean_latency_ms": 3.5160071199788945,
+      "p50_latency_ms": 3.5088360018562526,
+      "p95_latency_ms": 3.57204749743687,
+      "effective_bandwidth_gib_s": 15.553864976339487,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 4,
+      "bytes_per_iteration": 117440512,
+      "gib_per_iteration": 0.109375,
+      "mean_latency_ms": 5.090447749753366,
+      "p50_latency_ms": 5.383379495469853,
+      "p95_latency_ms": 5.453650148047018,
+      "effective_bandwidth_gib_s": 21.486322103060434,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 8,
+      "bytes_per_iteration": 234881024,
+      "gib_per_iteration": 0.21875,
+      "mean_latency_ms": 7.917659389859182,
+      "p50_latency_ms": 7.900933000200894,
+      "p95_latency_ms": 7.993309452285757,
+      "effective_bandwidth_gib_s": 27.62811447536777,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 16,
+      "bytes_per_iteration": 469762048,
+      "gib_per_iteration": 0.4375,
+      "mean_latency_ms": 13.26139175973367,
+      "p50_latency_ms": 13.2591744986712,
+      "p95_latency_ms": 13.28700299745833,
+      "effective_bandwidth_gib_s": 32.99050415872688,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 32,
+      "bytes_per_iteration": 939524096,
+      "gib_per_iteration": 0.875,
+      "mean_latency_ms": 24.392776710155886,
+      "p50_latency_ms": 24.382507501286454,
+      "p95_latency_ms": 24.424530253963894,
+      "effective_bandwidth_gib_s": 35.87127494327841,
+      "data_validation": "passed"
+    },
+    {
+      "num_transfer_blocks": 64,
+      "bytes_per_iteration": 1879048192,
+      "gib_per_iteration": 1.75,
+      "mean_latency_ms": 47.890814900165424,
+      "p50_latency_ms": 47.88414700306021,
+      "p95_latency_ms": 47.93309900123859,
+      "effective_bandwidth_gib_s": 36.541453797520475,
+      "data_validation": "passed"
+    }
+  ]
+}

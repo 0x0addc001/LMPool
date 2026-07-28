@@ -14,8 +14,10 @@ specific evaluation question and is a complete executable script:
   `load-skew` uses source warm-up followed by a high-concurrency reuse burst to
   exercise forecast-driven background copy and replica-aware routing.
   `memory-skew` disables background copy and requires foreground transfer to
-  release source blocks. Its phase boundary publishes the exact remaining
-  reuse demand before pressure so foreground admission can value retained KV.
+  release source blocks. It publishes exact remaining reuse demand before
+  pressure, then opens reuse after the pressure prefills begin instead of
+  draining them first. This makes the measured reuse phase experience the
+  capacity contention that offload is intended to relieve.
 
 `build_transfer_profile.py` is a calibration utility rather than a fourth
 benchmark. It combines per-physical-pair microbenchmark JSON files into the
@@ -39,6 +41,20 @@ the 0.6B structure accidentally. After an interrupted run, keep the same
 `metadata` and the expected 7 transfer, 3 routing, or 5 E2E results are reused.
 The paper runner evaluates routing at 1x, 3x, and 5x prefix length. A model is
 complete only after its output directory contains `SUITE_COMPLETE`.
+
+For an isolated foreground capacity-offload check, use
+[`run_memory_skew.sh`](./run_memory_skew.sh). It runs only the memory-skew
+workload with a longer shared prefix, a short pressure burst, and an
+overlapping reuse probe. The script disables background copy so that positive
+`fg ok`, released source blocks, and reuse-phase latency can be attributed to
+foreground transfer. This diagnostic command does not replace the formal
+preflight until its acceptance conditions pass.
+The standalone defaults use 6 hot groups, 12 warm-up requests, 24 pressure
+requests, 72 total requests, and a shared 128-block KV budget. This leaves each NVLink partner with headroom
+while source ranks accumulate new session blocks. Override these values with
+`MEMORY_SKEW_PREFIX_GROUPS`, `MEMORY_SKEW_WARMUP_PROMPTS`,
+`MEMORY_SKEW_PRESSURE_PROMPTS`, `NUM_PROMPTS`, `PROMPT_REPEAT`, and
+`KV_BLOCK_BUDGET` when testing another capacity regime.
 
 ## Scenarios
 
@@ -127,6 +143,9 @@ complete only after its output directory contains `SUITE_COMPLETE`.
   for warm-up, optional pressure, and reuse separately. Use the reuse row to
   evaluate transfer benefit; aggregate P90 can be dominated by an earlier phase.
   Supplying `--output-figure` also writes an adjacent `_reuse_phase` figure.
+- `pressure_reuse_overlap_s`: time from reuse submission until the final
+  pressure request completes. A positive memory-skew value verifies that reuse
+  was measured under active capacity pressure.
 - `fg ok` / `fg fail`: number of successful / failed foreground rebalance requests. Foreground rebalance is the current-request path that tries to free local KV blocks with move-style transfer.
 
 Foreground transfer candidates use worker-reported KV heat. The control plane
@@ -139,6 +158,9 @@ recently.
 - `pinned`: rebalance failures caused by source blocks still being referenced (`ref_count > 0`), which are safe copy candidates but not safe move/eviction victims.
 - `no space`: rebalance failures caused by no NVLink target having enough free blocks.
 - `no plan`: rebalance failures where the control plane could not build an executable plan.
+- `target busy`: a structurally valid foreground plan whose predicted saved
+  prefill covers the NVLink path but not the target rank's current dispatch
+  queue. This is a transient admission rejection, not a topology failure.
 - `bg space`: background copy failures caused by the target rank not having enough free blocks during prepare.
 
 ## Routing Experiment
@@ -181,12 +203,16 @@ relief experiment. Its warm-up phase places 24 long hot prefixes on source
 ranks, and its reuse phase submits a large burst after the control plane sees
 exact future-prefix demand. Use
 `benchmark_e2e.py --workload memory-skew --disable-background-copy` for the
-five-configuration offload experiment. A publishable offload result requires
-`offload_verified=true`, positive `transfer_release_count`, and successful
-foreground plans; sent blocks retained at the source prove replication, not
-capacity relief. `capacity-offload` is a compatibility alias for this same
-trace. The exact remaining reuse demand is also published before pressure so
-foreground admission does not undervalue the retained hot chains.
+five-configuration offload experiment. The trace warms 12 hot groups, submits
+128 owner-local continuations, and opens 24 cross-pair reuse requests after one
+pressure request per group emits its first token. Pressure and reuse therefore
+overlap. A publishable offload result requires `offload_verified=true`,
+positive `transfer_release_count`, successful foreground plans, and better
+reuse-phase throughput and tail latency than the no-transfer baseline. Sent
+blocks retained at the source prove replication, not capacity relief.
+`capacity-offload` is a compatibility alias for this same trace. The exact
+remaining reuse demand is published before pressure so foreground admission
+does not undervalue retained hot chains.
 
 All scripts print `saved json: ...` and `saved figure: ...` after successful
 export. Parent directories are created automatically.
@@ -204,18 +230,20 @@ traces have the following intrinsic reuse potential:
 | Locality/routing 1x | 192 | 16 recurring prefix groups, 12 requests per group, repeat 16 | 365,880 | 91.67% | 86.20% |
 | Locality/routing 3x | 192 | same groups and request order, repeat 48 | 1,084,728 | 91.67% | 91.38% |
 | Locality/routing 5x | 192 | same groups and request order, repeat 80 | 1,803,576 | 91.67% | 89.93% |
-| Load skew | 192 | 48 source warm-up and 144 burst reuse requests over 24 long groups, repeat 48 | 1,084,920 | 87.50% | 87.21% |
-| Memory skew | 256 | 24 warm-up requests over 12 long groups, 64 one-shot pressure prefixes, and 168 hot-prefix reuse requests, repeat 32 | 847,456 | 70.31% | 76.12% |
+| Load skew | 384 | 48 source warm-up requests over 24 hot groups, followed by 336 shuffled requests; 80% revisit hot groups and 20% use one-shot cold prefixes, repeat 48 | 2,169,907 | 76.30% | 76.05% |
+| Memory skew | 176 | 24 warm-up requests over 12 long groups, 128 hot-prefix continuations with unique tails, and 24 overlapping hot-prefix reuse requests, repeat 32 | 906,702 | 93.18% | 64.83% |
 
 These are trace-level upper bounds under ordered replay, unlimited cache, and
 perfect placement. Compare them with runtime `DP req hit` and `DP tok reuse` to
 quantify losses from finite capacity, dispatch, eviction, and transfer policy.
-For load skew, each of the 24 hot groups is observed twice before a 144-request
-reuse burst. For memory skew, the 256 requests are explicitly split into 24
-warm-up, 64 one-shot pressure, and 168 hot-prefix reuse requests. Each of the
-12 hot groups is observed twice before pressure. The
-pressure prefixes are not a reusable group: each pressure request has its own
-distinct prefix.
+For load skew, each of the 24 hot groups is observed twice before a shuffled
+336-request reuse burst. Hot groups receive 80 percent of that burst, while
+every cold request uses a unique prefix. For memory skew, 176 requests are
+split into 24 warm-up, 128 hot-prefix pressure, and 24 hot-prefix reuse
+requests. Each of the 12 hot groups is observed twice before pressure. Every
+pressure request reuses one hot prefix but appends a distinct tail. Reuse opens
+after 12 pressure requests have emitted first tokens, so pressure remains
+active while the final two reuse requests per group execute.
 
 ## Parameters
 
@@ -240,11 +268,16 @@ distinct prefix.
   `load-skew` is a deterministic two-phase trace: repeated source-side warm-up
   builds access counts and KV ownership, then a high-concurrency reuse burst
   creates owner load pressure. The phase boundary provides exact remaining
-  demand to background admission; foreground transfer remains gated by an
-  actual block shortage and the same calibrated cost model.
+  demand to background admission. Reuse order is shuffled independently of
+  prefix IDs so round-robin does not receive a periodic locality advantage.
+  Foreground transfer is disabled in this workload; `memory-skew` evaluates
+  foreground capacity offload separately.
   `memory-skew` is a
   deterministic three-phase trace: hot-prefix warm-up on source ranks,
-  unique-prefix pressure on those ranks, then hot-prefix reuse. For
+  hot-prefix continuations with unique tails during pressure, then hot-prefix
+  reuse. The third phase is submitted once one pressure request per hot group
+  has reached its first token; it does not wait for all pressure requests to
+  finish. For
   topology-blind and transfer-only scenarios, reuse is deterministically sent
   to the opposite side of each NVLink pair: the baseline recomputes there,
   while only a completed transfer can eliminate the first partner-side
@@ -254,6 +287,11 @@ distinct prefix.
   topology-aware policy decisions.
   Per-rank JSON diagnostics expose `warmup_submitted`, `pressure_submitted`,
   and `reuse_submitted` so placement fairness can be checked directly.
+  Foreground admission uses the calibrated transaction residual as a
+  conservative non-decreasing payload prior. If a direct NVLink target has no
+  raw free block but owns dependency-safe, unreferenced cache leaves, the
+  target reclaims those leaves before reserving transfer-in blocks; active and
+  transfer-locked blocks are never reclaimed.
   `capacity-offload` is a deprecated compatibility alias for the same
   `memory-skew` trace. `transfer-calibration` builds synthetic prefixes on
   source ranks and reuses them on direct partners solely to produce complete
@@ -264,22 +302,42 @@ distinct prefix.
   accidentally aligning with round-robin ranks. More groups expose redundant
   per-GPU caching without routing; keep the value no larger than
   `--num-prompts`.
-- `--load-skew-prefix-groups`: number of long hot prefixes initially assigned
-  to NVLink source ranks. The paper setting is `24`, eight per physical pair.
+- `--load-skew-prefix-groups`: number of long prefixes initially assigned to
+  NVLink source ranks. The paper setting is `24`, eight per source rank.
 - `--load-skew-warmup-prompts`: size of the source warm-up phase. `0` selects
   one quarter of the trace while covering every group. The paper setting is
-  `48`, followed by `144` reuse requests at submit window `64`.
-- `--memory-skew-prefix-groups`: number of long hot prefixes preserved across
-  the three memory-skew phases. `0` automatically chooses the largest odd value
-  up to `15` that fits both warm-up and reuse. Each group is warmed repeatedly
-  on one source rank; the reuse phase interleaves groups so round-robin cannot
-  saturate its cache after one miss to a single global hotspot.
+  `48`, followed by `336` shuffled reuse requests submitted as one burst.
+- `--load-skew-hot-groups` and `--load-skew-hot-share`: define the recurring
+  hot subset and its share of the reuse burst. A group count of `0` uses all
+  `--load-skew-prefix-groups`. Every remaining request receives a unique cold
+  prefix rather than a repeatedly self-warming cold group.
+- `--memory-skew-prefix-groups`: number of movable long session prefixes. `0`
+  automatically chooses the largest odd value up to `15` that fits warm-up,
+  trigger, and exact reuse. Each group has a long session chain and a shorter
+  routing anchor so source pressure does not pin the chain that foreground
+  transfer must move.
+- The standalone foreground diagnostic uses 6 groups rather than the formal
+  12-group trace. Each source then starts with two hot groups, leaving target
+  capacity for a real source-to-partner transfer while preserving identical
+  per-rank KV block budgets.
 - `--memory-skew-warmup-prompts`: explicit number of requests that establish
-  hot KV on source ranks. `0` uses one quarter of the trace. The paper setting
-  is `24`, which observes each of 12 groups twice before pressure.
-- `--memory-skew-pressure-prompts`: explicit number of distinct one-shot
-  prefixes sent to source ranks to create block shortage. `0` uses one quarter
-  of the trace. The paper setting is `64` with `--prompt-repeat 32`.
+  long session KV. Each session contains its own short anchor, and the normal
+  dispatch policy selects every worker rank.
+- `--memory-skew-pressure-prompts`: explicit number of short, anchor-based
+  continuations that fill source capacity without pinning session KV. Pressure
+  drains before a foreground plan can be triggered.
+- `--memory-skew-trigger-prompts`: long, anchor-based source requests issued
+  after pressure drains. The default is one per group; the normal router sends
+  them to hot anchor owners, where they can create a shortage while session
+  chains are releasable.
+- `--memory-skew-pressure-hot-groups` and
+  `--memory-skew-pressure-hot-share`: the recurring anchor subset and its
+  pressure share. The default sends 80% of pressure requests to two groups,
+  creating a routing-induced memory skew without client-side worker placement.
+- `--memory-skew-anchor-share`: fraction of each session prompt occupied by the
+  shared anchor. The default is `0.375`. A longer anchor makes an owner bypass
+  pay meaningful uncached prefill work, while the remaining session suffix is
+  still a releasable foreground-transfer candidate.
 - `--calibration-prefix-groups`: synthetic prefix groups represented in both
   phases of the internal transaction calibration trace.
 - `--calibration-warmup-prompts`: requests that build source-side KV before
@@ -405,6 +463,11 @@ Routing cost-model defaults are set in `MODEL_CONFIG` inside `benchmark_e2e.py`:
   before local cache reclamation, so a prompt that already fits cannot silently
   discard the hot prefix merely because its future decode block is missing. A
   failed plan still falls back to local reclamation.
+  Foreground admission adds destination queue delay to the calibrated data-path
+  and transaction cost. The queue term is evaluated from the current
+  token-equivalent worker load and destination prefill-time estimate. It is not
+  learned as a persistent NVLink residual, because queue delay changes with
+  workload pressure rather than pair bandwidth.
   Structural failures use exponential cooldown up to 30 seconds by default,
   so an unchanged `no_plan` or `no_target_space` state does not produce a tight
   loop of failed control-plane transactions.

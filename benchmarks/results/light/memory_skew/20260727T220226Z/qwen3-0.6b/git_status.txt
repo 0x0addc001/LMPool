@@ -1,0 +1,21 @@
+ M README.md
+ M README_zh.md
+ M benchmarks/PAPER_RUNBOOK.md
+ M benchmarks/README.md
+ M benchmarks/benchmark_e2e.py
+ M benchmarks/run_paper_suite.sh
+ M benchmarks/run_preflight_suite.sh
+ M docs/flow/decisions.md
+ M src/lmpool/engine/control_plane.py
+ M src/lmpool/engine/data_plane.py
+ M src/lmpool/engine/global_block_manager.py
+ M src/lmpool/engine/global_scheduler.py
+ M tests/test_benchmark_e2e.py
+ M tests/test_control_plane.py
+ M tests/test_global_scheduler.py
+?? benchmarks/results/light/
+?? benchmarks/results/preflight/20260727T054006Z/
+?? benchmarks/results/preflight/20260727T091841Z/
+?? benchmarks/results/preflight/20260727T111841Z/
+?? benchmarks/results/preflight/20260727T120408Z/
+?? benchmarks/run_memory_skew.sh

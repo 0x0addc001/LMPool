@@ -533,6 +533,22 @@ class GlobalBlockManager:
             + 2.0 * float(self.running_sequences_per_gpu[gpu_id])
         )
 
+    def is_transfer_target_ready(self, gpu_id: int) -> bool:
+        """Return whether a worker has no known serving or ingress work.
+
+        Foreground transfer is synchronous for the source worker. Dispatching
+        it to a worker that has already entered a model batch turns a fast P2P
+        copy into a full batch-boundary wait. This is an eligibility check, not
+        a routing hint: the scheduler still chooses only among its normal
+        NVLink neighbours and capacity constraints.
+        """
+        return bool(
+            self.is_gpu_available(gpu_id)
+            and self.waiting_sequences_per_gpu[gpu_id] == 0
+            and self.running_sequences_per_gpu[gpu_id] == 0
+            and self.pending_sequences_per_gpu[gpu_id] == 0
+        )
+
     def get_load_score(
         self,
         gpu_id: int,
@@ -636,6 +652,39 @@ class GlobalBlockManager:
                 chain["leaf_hash"],
             ),
         )
+
+    def get_releasable_chain_suffix(
+        self,
+        gpu_id: int,
+        chain_block_ids: List[int],
+    ) -> List[int]:
+        """Return the dependency-safe suffix of a root-to-leaf chain.
+
+        A move may release only blocks whose descendants are also released.
+        This preserves a shared anchor and sibling session branches on the
+        source. The data plane validates refcounts again during prepare.
+        """
+        chain = [
+            int(block_id)
+            for block_id in chain_block_ids
+            if int(block_id) in self.block_hash[gpu_id]
+        ]
+        if not chain:
+            return []
+        children: Dict[int, set[int]] = {}
+        for block_id, parent_hash in self.block_parent_hash[gpu_id].items():
+            if block_id in self.block_hash[gpu_id]:
+                children.setdefault(int(parent_hash), set()).add(int(block_id))
+
+        released: set[int] = set()
+        for block_id in reversed(chain):
+            block_hash = int(self.block_hash[gpu_id].get(block_id, -1))
+            if block_hash == -1:
+                break
+            if any(child not in released for child in children.get(block_hash, set())):
+                break
+            released.add(block_id)
+        return [block_id for block_id in chain if block_id in released]
 
     def get_global_free_blocks_count(self) -> int:
         """获取集群总空闲块数量"""

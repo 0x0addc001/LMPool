@@ -84,7 +84,15 @@ def data_plane_process(
             dtype=getattr(model_runner, "default_dtype", torch.get_default_dtype()),
         )
     control_plane_client = None
-    if config.get("enable_global_pool", False) and config.get("use_control_plane_process", True):
+    # A worker must not create a control-plane client without both IPC queues.
+    # Some baseline configurations keep the global-pool flag while omitting
+    # the control-plane queues; those workers use only the local scheduler.
+    if (
+        config.get("enable_global_pool", False)
+        and config.get("use_control_plane_process", True)
+        and global_request_queue is not None
+        and global_response_queue is not None
+    ):
         control_plane_client = ControlPlaneClient(
             rank,
             global_request_queue,
@@ -283,6 +291,15 @@ def data_plane_process(
                 for transfer in transfers
                 if rank == transfer["dst_gpu"]
             )
+            target_reclaim = int(
+                (plan.get("target_reclaim_blocks") or {}).get(rank, 0)
+            )
+            if target_reclaim > 0:
+                # A target may have no raw free blocks while still owning
+                # dependency-safe, unreferenced cache leaves. Reclaim only
+                # those leaves before reserving transfer-in blocks; active
+                # request blocks and transfer-locked blocks remain protected.
+                scheduler.block_manager.reclaim_cached_blocks(target_reclaim)
             if len(scheduler.block_manager.free_block_ids) < needed:
                 if is_background:
                     send_queue.put({
@@ -350,12 +367,16 @@ def data_plane_process(
             )
 
         if phase == "finalize":
-            if state is None or "publish" not in state.get("phase_results", {}):
+            # Publish is now destination-only. The control plane sends this
+            # source-only finalize only after every destination has
+            # acknowledged publication, so the source must validate the local
+            # execute state rather than wait for a no-op local publish.
+            if state is None or "execute" not in state.get("phase_results", {}):
                 return cache_phase_result(plan_id, phase, {
                     "success": False,
                     "rank": rank,
-                    "reason": "missing_publish",
-                    "error": "transfer finalize received before publish",
+                    "reason": "missing_execute",
+                    "error": "transfer finalize received before execute",
                 })
             release_source_blocks = list(dict.fromkeys(
                 block_id
@@ -508,9 +529,12 @@ def data_plane_process(
                     hashes,
                     parent_hashes=parent_hashes,
                     access_counts=access_counts,
-                    publish=False,
+                    # The execute acknowledgement is the control-plane
+                    # visibility boundary. Publish immediately after the P2P
+                    # receive completes so source finalization does not wait
+                    # for an extra worker control-message round trip.
+                    publish=True,
                 )
-                state.setdefault("received_blocks", []).extend(local_target_blocks)
                 send_queue.put({
                     "type": "runtime_stats",
                     "rank": rank,
@@ -583,6 +607,7 @@ def data_plane_process(
     last_rebalance_success_count = 0
     last_rebalance_fail_count = 0
     last_rebalance_fail_reasons: dict[str, int] = {}
+    last_rebalance_diagnostics_count = 0
     last_preemption_count = 0
 
     def maybe_send_worker_heartbeat():
@@ -674,7 +699,14 @@ def data_plane_process(
                 delta = count - last_rebalance_fail_reasons.get(reason, 0)
                 if delta:
                     reason_deltas[reason] = delta
-            if success_delta or fail_delta or reason_deltas:
+            diagnostics = list(control_plane_client.rebalance_diagnostics)
+            diagnostics_total = control_plane_client.rebalance_diagnostics_total
+            new_diagnostics = (
+                diagnostics
+                if diagnostics_total > last_rebalance_diagnostics_count
+                else []
+            )
+            if success_delta or fail_delta or reason_deltas or new_diagnostics:
                 send_queue.put({
                     "type": "runtime_stats",
                     "rank": rank,
@@ -682,11 +714,13 @@ def data_plane_process(
                         "rebalance_success": success_delta,
                         "rebalance_fail": fail_delta,
                         "rebalance_fail_reasons": reason_deltas,
+                        "rebalance_diagnostics": new_diagnostics,
                     },
                 })
                 last_rebalance_success_count = control_plane_client.rebalance_success_count
                 last_rebalance_fail_count = control_plane_client.rebalance_fail_count
                 last_rebalance_fail_reasons = dict(control_plane_client.rebalance_fail_reasons)
+                last_rebalance_diagnostics_count = diagnostics_total
         if not scheduled:
             if scheduler.local_state_dirty:
                 send_block_state()
@@ -707,6 +741,12 @@ def data_plane_process(
             send_queue.put({"type": "sequence", "target": seq.remote_gpu_id, "seq": seq})
 
         if local_seqs:
+            # Publish busy state before launching the CUDA batch. Foreground
+            # admission uses this snapshot to avoid sending a synchronous P2P
+            # plan to a target that is about to be unavailable for a long
+            # prefill or decode batch.
+            if control_plane_client is not None:
+                send_block_state()
             run_tokens = sum(len(seq) for seq in local_seqs) if is_prefill else len(local_seqs)
             prefill_cached_tokens = (
                 sum(min(len(seq), int(seq.num_cached_tokens)) for seq in local_seqs)

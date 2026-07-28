@@ -181,8 +181,8 @@ The benchmark profiles prefix sharing before launching the system. `trace req sh
 | Workload | Exact prefix construction | Request/token sharing |
 | --- | --- | ---: |
 | Locality/routing | 192 requests across 16 recurring groups; 1x/3x/5x prefixes contain up to 1,911/5,655/9,399 tokens | 91.67% / 86.20-91.38% |
-| Load skew | 48 source warm-up requests and 144 burst reuse requests across 24 recurring 5.7K-token groups | 87.50% / 87.21% |
-| Memory skew | 24 warm-up requests over 12 reusable 3.8K-token groups, 64 distinct 1.9K-token pressure prefixes, then 168 hot-prefix reuse requests | 70.31% / 76.12% |
+| Load skew | 48 source warm-up requests over 24 hot groups, followed by 336 shuffled requests; 80% revisit hot groups and 20% use one-shot cold prefixes | 76.30% / 76.05% |
+| Memory skew | 24 warm-up requests over 12 hot groups, 128 hot-prefix continuations with unique tails, then 24 reuse requests that overlap active pressure | 93.18% / 64.83% |
 
 Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. JSON artifacts store the full counts under `metadata.dataset_profile`.
 
@@ -204,7 +204,8 @@ byte-correct and measures latency for each direct pair and plan size. It does
 not by itself prove serving benefit. Load skew must show successful copy and
 replica/lease routing before comparing against routing-only; memory skew must
 show successful foreground plans, positive source-block release, and improved
-throughput or latency over the corresponding no-transfer baseline.
+reuse-phase throughput and P90 TTFT/E2E over the corresponding no-transfer
+baseline while pressure remains active.
 
 ## Tests
 

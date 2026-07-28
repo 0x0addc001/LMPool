@@ -41,6 +41,10 @@ class GlobalScheduler:
         self.block_manager = block_manager
         self.model_runner = model_runner
         self.last_rebalance_fail_reason = ""
+        # Keep the latest admission decision explainable.  A reason counter
+        # alone cannot distinguish a missing executable plan from a plan that
+        # was rejected by the cost model.
+        self.last_rebalance_diagnostics: dict = {}
         self.prefix_hit_weight = 8.0
         self.queue_pressure_weight = 1.0
         self.free_block_weight = 0.05
@@ -51,6 +55,11 @@ class GlobalScheduler:
         self.load_bypass_threshold = 512.0
         self.owner_spill_sequence_skew = 2.0
         self.owner_spill_max_extra_cost = 2048.0
+        # When foreground rebalance is enabled, routing may retain a full
+        # prefix owner if an NVLink-backed transfer is cheaper than spilling
+        # the request and recomputing the cached prefix. Routing-only keeps
+        # this disabled so it remains a clean no-transfer baseline.
+        self.enable_transfer_aware_owner_routing = False
         self.enable_routing_guided_copy = False
         self.routing_guided_copy_expected_reuses = 4.0
         # Route costs use token-equivalent units so queue work, repeated
@@ -60,6 +69,7 @@ class GlobalScheduler:
         self.reclaim_cost_weight = 0.5
         self.transfer_cost_weight = 1.0
         self.foreground_transfer_min_benefit_ratio = 1.5
+        self.foreground_transfer_require_idle_target = True
         # Foreground transfer admission is evaluated in wall-clock time. These
         # defaults are deliberately conservative and can be calibrated from
         # benchmark_kv_transfer.py on the target machine.
@@ -429,6 +439,51 @@ class GlobalScheduler:
             return (best_gpu, route_info) if return_info else best_gpu
 
         if failed_gpus:
+            transfer_owner = self._select_transfer_aware_owner(
+                rank,
+                candidates,
+                num_tokens,
+                num_blocks,
+                hit_summary,
+                gpu_hit_count,
+                failed_gpus,
+            )
+            if transfer_owner is not None:
+                owner_gpu, transfer_info = transfer_owner
+                owner_hit_count = gpu_hit_count[owner_gpu]
+                route_info["prefix_hit"] = True
+                route_info["reason"] = "prefix_owner_transfer_admission"
+                route_info["target_rank"] = owner_gpu
+                route_info["hit_summary"] = hit_summary
+                route_info["matched_prefix_blocks"] = owner_hit_count
+                route_info["prefix_owner_rank"] = owner_gpu
+                route_info["matched_prefix_hash"] = prefix_hashes[owner_hit_count - 1]
+                route_info["required_new_blocks"] = self._required_new_blocks(
+                    num_blocks,
+                    owner_hit_count,
+                )
+                route_info.update(transfer_info)
+                route_info["failed_gpus"] = [(g, s) for g, s, _ in failed_gpus]
+                route_info["load_score"] = self._load_summary(candidates)
+                route_info["queue_pressure"] = self._queue_pressure_summary(candidates)
+                self._annotate_target_capacity(
+                    route_info,
+                    owner_gpu,
+                    route_info["required_new_blocks"],
+                    hit_summary.get(owner_gpu, []),
+                )
+                logger.info(
+                    "route seq %s: owner=%s is full but transfer admission is cheaper "
+                    "than spill (transfer_blocks=%s, transfer_cost_ms=%.1f, "
+                    "spill_savings_ms=%.1f)",
+                    seq_id,
+                    owner_gpu,
+                    route_info["foreground_transfer_blocks"],
+                    route_info["foreground_transfer_cost_ms"],
+                    route_info["foreground_transfer_saved_ms"],
+                )
+                return (owner_gpu, route_info) if return_info else owner_gpu
+
             allocatable_candidates = [
                 gpu_id
                 for gpu_id in candidates
@@ -558,6 +613,127 @@ class GlobalScheduler:
             seq_id, num_tokens, num_blocks, prefix_hash, hit_summary, free_snapshot, target,
         )
         return (target, route_info) if return_info else target
+
+    def _select_transfer_aware_owner(
+        self,
+        requester_rank: int,
+        candidates: List[int],
+        num_tokens: int,
+        num_blocks: int,
+        hit_summary: dict[int, list[int]],
+        gpu_hit_count: dict[int, int],
+        failed_gpus: list[tuple[int, float, int]],
+    ) -> tuple[int, dict] | None:
+        """Retain a full prefix owner when foreground transfer beats spill.
+
+        This is a routing admission hint only. It does not reserve or execute
+        transfer; the local scheduler still requests a real foreground plan
+        after observing its shortage. The estimate deliberately accounts for
+        the complete owner prefix that must be present at the direct partner,
+        while the actual planner may send fewer blocks already present there.
+        """
+        if not self.enable_transfer_aware_owner_routing or self.gbm is None:
+            return None
+
+        # Prefer the deepest local/NVLink owner, then the least loaded owner.
+        owners = sorted(
+            failed_gpus,
+            key=lambda item: (-item[2], self._load_score(item[0]), item[0]),
+        )
+        spill_candidates = [
+            gpu_id
+            for gpu_id in candidates
+            if self.gbm.can_allocate_effective(
+                gpu_id,
+                self._required_new_blocks(
+                    num_blocks,
+                    gpu_hit_count.get(gpu_id, 0),
+                ),
+                hit_summary.get(gpu_id, []),
+            )
+        ]
+        if not spill_candidates:
+            return None
+
+        spill_costs = {
+            gpu_id: self._route_cost(
+                gpu_id,
+                num_tokens,
+                num_blocks,
+                gpu_hit_count.get(gpu_id, 0),
+                hit_summary.get(gpu_id, []),
+            )
+            for gpu_id in spill_candidates
+        }
+        spill_gpu = min(spill_candidates, key=lambda gpu_id: (spill_costs[gpu_id], gpu_id))
+
+        for owner_gpu, _score, owner_hit_count in owners:
+            partner_gpu = self.gbm._get_nvlink_partner(owner_gpu)
+            if (
+                partner_gpu is None
+                or partner_gpu == owner_gpu
+                or partner_gpu not in candidates
+                or not self.gbm.is_gpu_available(partner_gpu)
+            ):
+                continue
+
+            owner_required = self._required_new_blocks(num_blocks, owner_hit_count)
+            # Do not retain an owner based only on a scalar capacity estimate.
+            # The worker will later request a concrete plan, so admission must
+            # first prove that the authoritative block snapshot can produce a
+            # direct, executable move to this NVLink partner.
+            needed_blocks = max(
+                1,
+                owner_required - self.gbm.get_free_blocks_count(owner_gpu),
+            )
+            executable_plan = self.plan_rebalance(
+                owner_gpu,
+                needed_blocks,
+                allow_copy=False,
+            )
+            if not executable_plan or not executable_plan.get("transfers"):
+                continue
+            plan_targets = {
+                int(transfer["dst_gpu"])
+                for transfer in executable_plan["transfers"]
+            }
+            if plan_targets != {partner_gpu}:
+                continue
+            transfer_blocks = sum(
+                len(transfer.get("src_blocks", []))
+                for transfer in executable_plan["transfers"]
+            )
+            if transfer_blocks < needed_blocks:
+                continue
+
+            transfer_cost_ms = self._estimate_transfer_cost_ms(
+                self._estimate_transfer_bytes(transfer_blocks),
+                owner_gpu,
+                partner_gpu,
+            ) + self._estimate_target_dispatch_delay_ms(partner_gpu)
+            owner_compute_cost = (
+                self._load_score(owner_gpu)
+                + min(
+                    max(0, int(num_tokens)),
+                    owner_required * max(1, int(self.block_size)),
+                )
+                * self.prefill_cost_weight
+            )
+            spill_saved_ms = max(0.0, spill_costs[spill_gpu] - owner_compute_cost)
+            if spill_saved_ms < transfer_cost_ms * self.foreground_transfer_min_benefit_ratio:
+                continue
+
+            return owner_gpu, {
+                "foreground_transfer_candidate": True,
+                "foreground_transfer_blocks": transfer_blocks,
+                "foreground_transfer_target_rank": partner_gpu,
+                "foreground_transfer_cost_ms": transfer_cost_ms,
+                "foreground_transfer_saved_ms": spill_saved_ms,
+                "foreground_transfer_spill_rank": spill_gpu,
+                "foreground_transfer_spill_cost_ms": spill_costs[spill_gpu],
+                "foreground_transfer_plan_ready": True,
+            }
+        return None
 
     def _free_snapshot(self, world_size: int) -> dict[int, int]:
         return {
@@ -818,6 +994,19 @@ class GlobalScheduler:
     # 显存重平衡
     # ------------------------------------------------------------------
 
+    def _set_rebalance_diagnostics(self, reason: str, **fields) -> None:
+        """Record one bounded, JSON-serializable admission decision."""
+        self.last_rebalance_fail_reason = reason if reason != "accepted" else ""
+        diagnostics = {"reason": reason}
+        for key, value in fields.items():
+            if isinstance(value, dict):
+                diagnostics[key] = {str(k): value[k] for k in value}
+            elif isinstance(value, (list, tuple, set)):
+                diagnostics[key] = list(value)
+            else:
+                diagnostics[key] = value
+        self.last_rebalance_diagnostics = diagnostics
+
     def plan_rebalance(
         self,
         gpu_id: int,
@@ -844,16 +1033,54 @@ class GlobalScheduler:
             }
             或在无法满足时返回 None。
         """
-        self.last_rebalance_fail_reason = ""
-        target_order = self.gbm._get_target_gpu_order(gpu_id)
+        source_blocks = self.gbm.block_hash[gpu_id]
+        topology_target_order = self.gbm._get_target_gpu_order(gpu_id)
+        target_order = list(topology_target_order)
+        busy_targets: list[int] = []
+        if self.foreground_transfer_require_idle_target:
+            busy_targets = [
+                int(target)
+                for target in target_order
+                if not self.gbm.is_transfer_target_ready(target)
+            ]
+            target_order = [
+                target for target in target_order
+                if target not in busy_targets
+            ]
+        target_capacity = {
+            int(target): int(self.gbm.get_effective_capacity(target))
+            for target in target_order
+        }
+        base_diagnostics = {
+            "source_gpu": int(gpu_id),
+            "needed_blocks": int(needed_blocks),
+            "source_block_count": int(len(source_blocks)),
+            "source_free_blocks": int(self.gbm.get_free_blocks_count(gpu_id)),
+            "source_effective_capacity": int(self.gbm.get_effective_capacity(gpu_id)),
+            "source_reclaimable_blocks": int(
+                self.gbm.get_reclaimable_blocks_count(gpu_id)
+            ),
+            "topology_target_order": [int(target) for target in topology_target_order],
+            "target_order": [int(target) for target in target_order],
+            "busy_target_ranks": busy_targets,
+            "require_idle_target": bool(self.foreground_transfer_require_idle_target),
+            "target_effective_capacity": target_capacity,
+            "allow_copy": bool(allow_copy),
+        }
         if not target_order:
-            self.last_rebalance_fail_reason = "no_plan"
+            self._set_rebalance_diagnostics(
+                "no_ready_target" if busy_targets else "no_plan",
+                **base_diagnostics,
+            )
             return None
-        if not self.gbm.block_hash[gpu_id]:
-            self.last_rebalance_fail_reason = "no_plan"
+        if not source_blocks:
+            self._set_rebalance_diagnostics("no_plan", **base_diagnostics)
             return None
-        if all(self.gbm.get_free_blocks_count(target) <= 0 for target in target_order):
-            self.last_rebalance_fail_reason = "no_target_space"
+        if all(
+            self.gbm.get_effective_capacity(target) <= 0
+            for target in target_order
+        ):
+            self._set_rebalance_diagnostics("no_target_space", **base_diagnostics)
             return None
 
         excluded = set(excluded_source_blocks or ())
@@ -876,7 +1103,14 @@ class GlobalScheduler:
         valid_move = mode == "move" and candidates and len(release_blocks) >= needed_blocks
         valid_copy = mode == "copy" and len(candidates) >= needed_blocks
         if not (valid_move or valid_copy):
-            self.last_rebalance_fail_reason = "no_plan"
+            self._set_rebalance_diagnostics(
+                "no_plan",
+                **base_diagnostics,
+                candidate_block_count=len(candidates),
+                release_block_count=len(release_blocks),
+                plan_mode=mode,
+                reclaimable_source_blocks=len(release_blocks),
+            )
             return None
 
         actual_candidates = candidates
@@ -886,6 +1120,7 @@ class GlobalScheduler:
 
         transfers = []
         release_target = actual_candidates[0][1] if actual_candidates else None
+        target_reclaim_blocks: dict[int, int] = {}
         for target_gpu, blocks in grouped.items():
             hashes = []
             parent_hashes = []
@@ -924,23 +1159,40 @@ class GlobalScheduler:
                     if target_gpu == release_target else []
                 ),
             })
+            target_reclaim_blocks[int(target_gpu)] = max(
+                0,
+                len(blocks) - self.gbm.get_free_blocks_count(target_gpu),
+            )
 
         plan = {
             "gpu_id": gpu_id,
             "needed_blocks": needed_blocks,
             "mode": "chain_move" if mode == "move" else mode,
             "transfers": transfers,
+            "target_reclaim_blocks": target_reclaim_blocks,
         }
         transferred_blocks = sum(len(item["src_blocks"]) for item in transfers)
         transfer_bytes = self._estimate_transfer_bytes(transferred_blocks)
-        transfer_cost_ms = sum(
-            self._estimate_transfer_cost_ms(
-                self._estimate_transfer_bytes(len(item["src_blocks"])),
-                gpu_id,
+        data_transfer_cost_ms = 0.0
+        target_queue_delay_ms = 0.0
+        for item in transfers:
+            item_bytes = self._estimate_transfer_bytes(len(item["src_blocks"]))
+            item_data_cost_ms = self._estimate_transfer_cost_ms(
+                item_bytes,
+                item["src_gpu"],
                 item["dst_gpu"],
             )
-            for item in transfers
-        )
+            item_queue_delay_ms = self._estimate_target_dispatch_delay_ms(
+                item["dst_gpu"]
+            )
+            item["estimated_data_transfer_cost_ms"] = item_data_cost_ms
+            item["estimated_target_queue_delay_ms"] = item_queue_delay_ms
+            item["estimated_transfer_cost_ms"] = (
+                item_data_cost_ms + item_queue_delay_ms
+            )
+            data_transfer_cost_ms += item_data_cost_ms
+            target_queue_delay_ms += item_queue_delay_ms
+        transfer_cost_ms = data_transfer_cost_ms + target_queue_delay_ms
 
         # A chain's blocks share the same future request. Summing every block's
         # historical access count overstates demand by roughly chain length.
@@ -980,6 +1232,8 @@ class GlobalScheduler:
         plan["estimated_future_reuses"] = predicted_reuses
         plan["estimated_historical_reuses"] = historical_reuses
         plan["estimated_forecast_reuses"] = forecast_reuses
+        plan["estimated_data_transfer_cost_ms"] = data_transfer_cost_ms
+        plan["estimated_target_queue_delay_ms"] = target_queue_delay_ms
         plan["estimated_transfer_cost_ms"] = transfer_cost_ms
         plan["estimated_saved_prefill_ms"] = saved_prefill_ms
         # Legacy field names remain in the protocol for older result readers,
@@ -987,9 +1241,33 @@ class GlobalScheduler:
         plan["estimated_transfer_cost"] = transfer_cost_ms
         plan["estimated_saved_prefill"] = saved_prefill_ms
         plan["estimated_benefit_ratio"] = saved_prefill_ms / max(transfer_cost_ms, 1e-9)
+        decision_diagnostics = {
+            **base_diagnostics,
+            "candidate_block_count": int(len(candidates)),
+            "release_block_count": int(len(release_blocks)),
+            "reclaimable_source_blocks": int(len(release_blocks)),
+            "plan_mode": mode,
+            "predicted_reuses": float(predicted_reuses),
+            "estimated_transfer_cost_ms": float(transfer_cost_ms),
+            "estimated_saved_prefill_ms": float(saved_prefill_ms),
+            "benefit_ratio": float(saved_prefill_ms / max(transfer_cost_ms, 1e-9)),
+            "data_transfer_cost_ms": float(data_transfer_cost_ms),
+            "target_queue_delay_ms": float(target_queue_delay_ms),
+        }
         if saved_prefill_ms < transfer_cost_ms * self.foreground_transfer_min_benefit_ratio:
-            self.last_rebalance_fail_reason = "low_benefit"
+            reason = (
+                "target_busy"
+                if (
+                    target_queue_delay_ms > 0
+                    and saved_prefill_ms
+                    >= data_transfer_cost_ms
+                    * self.foreground_transfer_min_benefit_ratio
+                )
+                else "low_benefit"
+            )
+            self._set_rebalance_diagnostics(reason, **decision_diagnostics)
             return None
+        self._set_rebalance_diagnostics("accepted", **decision_diagnostics)
         return plan
 
     def set_future_prefix_demands(self, prefix_demands: dict[int, int] | None) -> None:
@@ -1009,6 +1287,28 @@ class GlobalScheduler:
             * max(1, int(self.num_kv_heads))
             * max(1, int(self.head_dim))
             * max(1, int(self.kv_dtype_bytes))
+        )
+
+    def _estimate_target_dispatch_delay_ms(self, dst_gpu: int) -> float:
+        """Estimate when a target worker can service a foreground plan.
+
+        The source requests rebalance from a scheduler safe point, but the
+        target still has to reach its control queue. Reuse the same
+        token-equivalent load snapshot as routing and convert it with the
+        destination prefill observation. This keeps admission conservative
+        when an otherwise fast NVLink copy would wait behind active work.
+        """
+        if self.gbm is None:
+            return 0.0
+        load_tokens = self.gbm.get_load_score(
+            int(dst_gpu),
+            waiting_token_weight=self.waiting_token_weight,
+            running_token_weight=self.running_token_weight,
+            running_sequence_weight=self.running_sequence_weight,
+        )
+        return max(
+            0.0,
+            load_tokens * self.estimate_prefill_token_time_ms(int(dst_gpu)),
         )
 
     @staticmethod
@@ -1101,7 +1401,16 @@ class GlobalScheduler:
             if transfer_bytes <= 0 or residual_ms < 0:
                 continue
             points[transfer_bytes] = max(points.get(transfer_bytes, 0.0), residual_ms)
-        return sorted(points.items())
+        # Placement residuals are noisy, but a larger payload cannot make the
+        # same dispatch-to-publish transaction cheaper by construction. Use a
+        # monotone upper envelope so an isolated low sample at a larger bucket
+        # does not make foreground admission under-estimate a large plan.
+        normalized: list[tuple[int, float]] = []
+        running_max = 0.0
+        for transfer_bytes, residual_ms in sorted(points.items()):
+            running_max = max(running_max, residual_ms)
+            normalized.append((transfer_bytes, running_max))
+        return normalized
 
     def _profile_points(
         self,
@@ -1348,14 +1657,20 @@ class GlobalScheduler:
         elapsed_s: float,
         src_gpu: int,
         dst_gpu: int,
+        admission_cost_ms: float | None = None,
+        target_queue_delay_ms: float = 0.0,
     ) -> dict | None:
         """Learn plan cost from dispatch through destination commit."""
         if transfer_bytes <= 0 or elapsed_s <= 0:
             return None
-        predicted_cost_ms = self._estimate_transfer_cost_ms(
-            transfer_bytes,
-            src_gpu,
-            dst_gpu,
+        predicted_cost_ms = (
+            max(0.0, float(admission_cost_ms))
+            if admission_cost_ms is not None
+            else self._estimate_transfer_cost_ms(
+                transfer_bytes,
+                src_gpu,
+                dst_gpu,
+            )
         )
         (
             static_cost_ms,
@@ -1369,7 +1684,11 @@ class GlobalScheduler:
         )
         elapsed_ms = elapsed_s * 1000.0
         scaled_data_path_ms = data_path_ms * self.transfer_interference_multiplier
-        observed_extra_ms = max(0.0, elapsed_ms - scaled_data_path_ms)
+        estimated_queue_delay_ms = max(0.0, float(target_queue_delay_ms))
+        observed_extra_ms = max(
+            0.0,
+            elapsed_ms - scaled_data_path_ms - estimated_queue_delay_ms,
+        )
         pair = self._pair_key(src_gpu, dst_gpu)
         alpha = min(1.0, max(0.0, self.transfer_cost_ewma_alpha))
         previous = self.observed_placement_extra_ms_by_pair.get(pair)
@@ -1414,9 +1733,10 @@ class GlobalScheduler:
             "elapsed_ms": elapsed_ms,
             "data_path_ms": data_path_ms,
             "scaled_data_path_ms": scaled_data_path_ms,
+            "estimated_target_queue_delay_ms": estimated_queue_delay_ms,
             "residual_ms": observed_extra_ms,
             "predicted_cost_ms": predicted_cost_ms,
-            "admission_cost_before_observation_ms": static_cost_ms,
+            "admission_cost_before_observation_ms": predicted_cost_ms,
             "has_data_path_profile": has_profile,
             "has_calibrated_residual": has_calibrated_residual,
         }
@@ -1458,7 +1778,10 @@ class GlobalScheduler:
         excluded_source_blocks: set[int],
     ) -> tuple[List[Tuple[int, int]], List[int]]:
         """Plan valuable complete chains and a dependency-safe release suffix."""
-        target_free = {target: self.gbm.get_free_blocks_count(target) for target in target_order}
+        target_capacity = {
+            target: self.gbm.get_effective_capacity(target)
+            for target in target_order
+        }
         planned_hashes = {
             target: set(self.gbm.block_hash[target].values()) for target in target_order
         }
@@ -1467,13 +1790,27 @@ class GlobalScheduler:
         block_depth: dict[int, int] = {}
         target_hashes = planned_hashes[target_order[0]]
 
-        def transfer_utility(block_id: int) -> tuple[float, float, int]:
+        def transfer_utility(block_id: int) -> tuple[float, float, float, int]:
             chain = self.gbm.get_prefix_chain(gpu_id, block_id)
             if not chain:
-                return (0.0, 0.0, block_id)
+                return (0.0, 0.0, 0.0, -block_id)
             frequency = max(
                 self.gbm.block_access_count[gpu_id].get(chain_block, 1)
                 for chain_block in chain
+            )
+            # A future-demand match is stronger evidence than historical
+            # access frequency for capacity offload. Prefer chains that the
+            # ingress snapshot says will be reused after placement.
+            future_reuses = min(
+                (
+                    int(self.future_prefix_demands.get(
+                        int(self.gbm.get_block_hash(gpu_id, chain_block)),
+                        0,
+                    ))
+                    for chain_block in chain
+                    if self.gbm.get_block_hash(gpu_id, chain_block) is not None
+                ),
+                default=0,
             )
             missing = sum(
                 self.gbm.get_block_hash(gpu_id, chain_block) not in target_hashes
@@ -1484,10 +1821,17 @@ class GlobalScheduler:
                 self.gbm.block_access_time[gpu_id].get(chain_block, 0.0)
                 for chain_block in chain
             )
-            return (utility, recency, -block_id)
+            return (float(future_reuses > 0), float(future_reuses), utility, -block_id)
 
+        # Cold blocks can be perfectly valid eviction candidates. Restricting
+        # this list to block_access_time silently made untouched pressure
+        # blocks invisible to foreground offload.
         leaves = sorted(
-            self.gbm.block_access_time[gpu_id],
+            {
+                int(block_id)
+                for block_id, block_hash in self.gbm.block_hash[gpu_id].items()
+                if int(block_hash) != -1
+            },
             key=transfer_utility,
             reverse=True,
         )
@@ -1509,7 +1853,7 @@ class GlobalScheduler:
                     block_id for block_id in chain
                     if self.gbm.get_block_hash(gpu_id, block_id) not in planned_hashes[target]
                 ]
-                if leaf_block not in missing or target_free[target] < len(missing):
+                if leaf_block not in missing or target_capacity[target] < len(missing):
                     continue
                 candidates.extend((block_id, target) for block_id in missing)
                 selected_blocks.update(chain)
@@ -1517,7 +1861,7 @@ class GlobalScheduler:
                     block_depth[block_id] = max(block_depth.get(block_id, -1), depth)
                 for block_id in missing:
                     planned_hashes[target].add(self.gbm.get_block_hash(gpu_id, block_id))
-                target_free[target] -= len(missing)
+                target_capacity[target] -= len(missing)
                 break
             release_blocks = self._dependency_safe_release_order(
                 gpu_id,

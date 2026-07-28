@@ -6,6 +6,8 @@ import pytest
 
 from benchmarks.benchmark_e2e import (
     MODEL_CONFIG,
+    ScenarioResult,
+    aggregate_scenario_trials,
     build_prompts,
     confidence_interval_95,
     compute_goodput_sla_sweep,
@@ -16,13 +18,10 @@ from benchmarks.benchmark_e2e import (
     parse_goodput_sla_sweep_ms,
     prepare_benchmark_rendezvous,
     resolve_load_skew_phases,
-    resolve_load_skew_source_rank,
     resolve_memory_skew_phases,
     resolve_memory_skew_prefix_groups,
     resolve_transfer_calibration_prefix_groups,
     resolve_transfer_calibration_warmup_prompts,
-    resolve_memory_skew_source_ranks,
-    resolve_memory_skew_target_by_source,
     resolve_kv_block_budget,
     save_reuse_phase_figure,
     save_summary_figure,
@@ -112,13 +111,21 @@ def test_load_skew_workload_has_source_warmup_and_hot_reuse_phases():
         workload="load-skew",
         load_skew_prefix_groups=3,
         load_skew_warmup_prompts=6,
+        load_skew_hot_groups=3,
+        load_skew_hot_share=0.8,
         seed=0,
     )
 
     groups = [_prefix_group(prompt) for prompt in prompts]
     expected = [f"load-hot-{group:04d}" for group in range(3)]
     assert groups[:6] == expected * 2
-    assert groups[6:] == expected * 4
+    reuse_groups = groups[6:]
+    hot_reuse = [group for group in reuse_groups if group.startswith("load-hot-")]
+    cold_reuse = [group for group in reuse_groups if group.startswith("load-cold-")]
+    assert len(hot_reuse) == 10
+    assert set(hot_reuse) == set(expected)
+    assert len(cold_reuse) == len(set(cold_reuse)) == 2
+    assert set(cold_reuse) == {"load-cold-0000", "load-cold-0001"}
 
 
 def test_load_skew_phases_require_hot_group_coverage():
@@ -131,26 +138,32 @@ def test_load_skew_phases_require_hot_group_coverage():
         resolve_load_skew_phases(16, 9, 9)
 
 
-def test_load_skew_stripes_group_pairs_across_nvlink_sources():
-    sources = [0, 2, 4]
+def test_load_skew_reuse_order_breaks_round_robin_prefix_alignment():
+    prompts = build_prompts(
+        IdentityChatTokenizer(),
+        num_prompts=384,
+        prompt_repeat=2,
+        workload="load-skew",
+        load_skew_prefix_groups=24,
+        load_skew_warmup_prompts=48,
+        load_skew_hot_groups=24,
+        load_skew_hot_share=0.8,
+        seed=0,
+    )
 
-    assert [
-        resolve_load_skew_source_rank(group, 12, sources)
-        for group in range(12)
-    ] == [0, 0, 2, 2, 4, 4, 0, 0, 2, 2, 4, 4]
+    targets_by_group = {group: set() for group in range(24)}
+    for reuse_index, prompt in enumerate(prompts[48:]):
+        group_name = _prefix_group(prompt)
+        if not group_name.startswith("load-hot-"):
+            continue
+        group = int(group_name.rsplit("-", 1)[1])
+        targets_by_group[group].add(reuse_index % 6)
+
+    assert all(len(targets) >= 3 for targets in targets_by_group.values())
+    assert any(len(targets) >= 4 for targets in targets_by_group.values())
 
 
-def test_load_skew_round_robin_reuse_stays_with_owner_or_direct_partner():
-    sources = [0, 2, 4]
-    partner_by_source = {0: 1, 2: 3, 4: 5}
-
-    for group in range(24):
-        source = resolve_load_skew_source_rank(group, 24, sources)
-        round_robin_target = group % 6
-        assert round_robin_target in {source, partner_by_source[source]}
-
-
-def test_memory_skew_workload_has_warmup_pressure_and_reuse_phases():
+def test_memory_skew_workload_separates_session_anchor_pressure_trigger_and_reuse():
     prompts = build_prompts(
         IdentityChatTokenizer(),
         num_prompts=16,
@@ -161,23 +174,21 @@ def test_memory_skew_workload_has_warmup_pressure_and_reuse_phases():
     )
 
     groups = [_prefix_group(prompt) for prompt in prompts]
-    assert groups[:4] == [
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-        "transfer-hot-0000",
-    ]
-    assert groups[4:8] == [f"pressure-{index:04d}" for index in range(4)]
-    assert groups[8:] == [
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-    ]
+    assert all("transfer-session-" in prompt for prompt in prompts[:4])
+    assert set(prompts[11:]).issubset(set(prompts[:4]))
+    assert all(
+        f"memory-pressure-tail-{index:04d}" in prompts[4 + index]
+        for index in range(4)
+    )
+    assert all("transfer-anchor-" in prompts[8 + index] for index in range(3))
+    assert all(
+        f"memory-trigger-tail-{index:04d}" in prompts[8 + index]
+        for index in range(3)
+    )
+    assert all(
+        "memory-pressure-tail" not in prompt and "memory-trigger-tail" not in prompt
+        for prompt in prompts[11:]
+    )
 
 
 def test_memory_skew_workload_accepts_explicit_phase_sizes():
@@ -187,29 +198,23 @@ def test_memory_skew_workload_accepts_explicit_phase_sizes():
         prompt_repeat=4,
         workload="memory-skew",
         memory_skew_prefix_groups=3,
-        memory_skew_warmup_prompts=6,
+        memory_skew_warmup_prompts=3,
         memory_skew_pressure_prompts=2,
+        memory_skew_trigger_prompts=3,
         seed=0,
     )
 
     groups = [_prefix_group(prompt) for prompt in prompts]
-    assert groups[:6] == [
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-    ]
-    assert groups[6:8] == ["pressure-0000", "pressure-0001"]
-    assert groups[8:] == [
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-        "transfer-hot-0000",
-        "transfer-hot-0001",
-        "transfer-hot-0002",
-    ]
+    assert all("transfer-session-" in prompt for prompt in prompts[:3])
+    assert all(group.startswith("transfer-anchor-") for group in groups[3:5])
+    assert "memory-pressure-tail-0000" in prompts[3]
+    assert "memory-pressure-tail-0001" in prompts[4]
+    assert all("memory-trigger-tail" in prompt for prompt in prompts[5:8])
+    assert set(prompts[8:]).issubset(set(prompts[:3]))
+    assert all(
+        "memory-pressure-tail" not in prompt and "memory-trigger-tail" not in prompt
+        for prompt in prompts[8:]
+    )
 
 
 def test_capacity_offload_uses_the_controlled_memory_pressure_trace():
@@ -224,6 +229,31 @@ def test_capacity_offload_uses_the_controlled_memory_pressure_trace():
     capacity_offload = build_prompts(workload="capacity-offload", **kwargs)
 
     assert capacity_offload == memory_skew
+
+
+def test_memory_skew_concentrates_pressure_on_hot_anchors_without_rank_hints():
+    prompts = build_prompts(
+        IdentityChatTokenizer(),
+        num_prompts=40,
+        prompt_repeat=4,
+        workload="memory-skew",
+        memory_skew_prefix_groups=4,
+        memory_skew_warmup_prompts=4,
+        memory_skew_pressure_prompts=20,
+        memory_skew_trigger_prompts=4,
+        memory_skew_pressure_hot_groups=2,
+        memory_skew_pressure_hot_share=0.8,
+        seed=0,
+    )
+
+    pressure_groups = [
+        int(_prefix_group(prompt).rsplit("-", 1)[1])
+        for prompt in prompts[4:24]
+    ]
+    assert pressure_groups.count(0) == 8
+    assert pressure_groups.count(1) == 8
+    assert pressure_groups.count(2) == 2
+    assert pressure_groups.count(3) == 2
 
 
 def test_transfer_calibration_repeats_groups_in_two_equal_phases():
@@ -276,41 +306,24 @@ def test_transfer_calibration_warmup_defaults_to_half_or_accepts_explicit():
         resolve_transfer_calibration_warmup_prompts(128, 128)
 
 
-def test_memory_skew_placement_is_explicit_for_topology_blind_baseline():
-    config = {
-        "world_size": 6,
-        "benchmark_memory_skew_source_ranks": [0, 2, 4],
-    }
-
-    assert resolve_memory_skew_source_ranks(config) == [0, 2, 4]
-
-
-def test_memory_skew_reuse_targets_are_explicit_for_topology_blind_baseline():
-    config = {
-        "world_size": 6,
-        "benchmark_memory_skew_target_by_source": {0: 1, 2: 3, 4: 5},
-    }
-
-    assert resolve_memory_skew_target_by_source(config) == {0: 1, 2: 3, 4: 5}
-
-
 def test_memory_skew_prefix_groups_auto_fit_phase_and_avoid_even_period():
     assert resolve_memory_skew_prefix_groups(128, 0) == 15
-    assert resolve_memory_skew_prefix_groups(32, 0) == 7
+    assert resolve_memory_skew_prefix_groups(32, 0) == 3
     with pytest.raises(ValueError):
         resolve_memory_skew_prefix_groups(16, 5)
 
 
 def test_memory_skew_phases_accept_explicit_sizes_and_validate_group_coverage():
-    assert resolve_memory_skew_phases(160, 16, 64, 32) == (64, 32, 64)
-    assert resolve_memory_skew_phases(16, 3, 0, 0) == (4, 4, 8)
+    assert resolve_memory_skew_phases(160, 16, 64, 32, 16) == (64, 32, 16, 48)
+    assert resolve_memory_skew_phases(16, 3, 0, 0) == (4, 4, 3, 5)
 
     with pytest.raises(ValueError, match="warm-up phase"):
-        resolve_memory_skew_phases(16, 5, 4, 4)
+        resolve_memory_skew_phases(16, 5, 4, 4, 5)
+    assert resolve_memory_skew_phases(16, 3, 3, 3, 2) == (3, 3, 2, 8)
     with pytest.raises(ValueError, match="reuse phase"):
-        resolve_memory_skew_phases(16, 9, 9, 1)
-    with pytest.raises(ValueError, match="non-empty warm-up, pressure, and reuse"):
-        resolve_memory_skew_phases(16, 3, 8, 8)
+        resolve_memory_skew_phases(16, 4, 8, 1, 4)
+    with pytest.raises(ValueError, match="non-empty warm-up, pressure, trigger, and reuse"):
+        resolve_memory_skew_phases(16, 3, 8, 8, 3)
 
 
 def test_sequence_prefix_hashes_are_cumulative_and_ignore_partial_block():
@@ -475,6 +488,82 @@ def test_summary_json_keeps_metadata_separate_from_results(tmp_path):
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["metadata"]["model"]["hidden_size"] == 2048
     assert payload["results"]["multi-gpu"]["throughput_tok_s"] == 12.0
+
+
+def test_repeated_results_preserve_route_decision_counts():
+    base = dict(
+        name="multi-gpu-lmpool",
+        total_requests=2,
+        total_tokens=2,
+        elapsed_s=1.0,
+        throughput_tok_s=2.0,
+        goodput_tok_s=2.0,
+        mean_ttft_s=1.0,
+        p50_ttft_s=1.0,
+        p90_ttft_s=1.0,
+        p95_ttft_s=1.0,
+        mean_tpot_s=1.0,
+        p50_tpot_s=1.0,
+        p90_tpot_s=1.0,
+        p95_tpot_s=1.0,
+        mean_e2e_s=1.0,
+        p50_e2e_s=1.0,
+        p90_e2e_s=1.0,
+        p95_e2e_s=1.0,
+        route_hit_rate=0.0,
+        routed_to_prefix_owner_rate=0.0,
+        prefix_hit_rate=0.0,
+        initial_cached_token_ratio=0.0,
+        prefill_attempts=0,
+        preemption_count=0,
+        redundant_prefill_tokens=0,
+        transfer_count=0,
+        transfer_bytes=0,
+        transfer_time_s=0.0,
+        transfer_source_time_s=0.0,
+        transfer_target_time_s=0.0,
+        transfer_bandwidth_gib_s=0.0,
+        estimated_transfer_cost_ms=0.0,
+        estimated_saved_prefill_ms=0.0,
+        transfer_copy_count=0,
+        transfer_release_count=0,
+        chain_transfer_count=0,
+        hot_transfer_block_count=0,
+        hot_transfer_block_ratio=0.0,
+        rebalance_success=0,
+        rebalance_fail=0,
+        rebalance_fail_reasons={},
+        background_copy_success=0,
+        background_copy_fail=0,
+        background_copy_fail_reasons={},
+        gpu_util_mean=0.0,
+        gpu_util_p95=0.0,
+        gpu_mem_util_mean=0.0,
+        gpu_mem_util_p95=0.0,
+        route_decision_counts={"prefix_hit": 2},
+        rank_stats={0: {"route_decision_counts": {"prefix_hit": 2}}},
+    )
+    first = ScenarioResult(**base)
+    second = ScenarioResult(
+        **{**base, "route_decision_counts": {
+            "prefix_owner_transfer_admission": 1,
+            "prefix_hit": 1,
+        }, "rank_stats": {0: {"route_decision_counts": {
+            "prefix_owner_transfer_admission": 1,
+            "prefix_hit": 1,
+        }}}}
+    )
+
+    result = aggregate_scenario_trials([first, second])
+
+    assert result.route_decision_counts == {
+        "prefix_hit": 2,
+        "prefix_owner_transfer_admission": 1,
+    }
+    assert result.rank_stats[0]["route_decision_counts"] == {
+        "prefix_hit": 2,
+        "prefix_owner_transfer_admission": 1,
+    }
 
 
 def test_summary_figures_accept_confidence_intervals(tmp_path):

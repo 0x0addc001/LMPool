@@ -18,11 +18,13 @@
     --locality-prefix-groups 16 \
     --load-skew-prefix-groups 24 \
     --load-skew-warmup-prompts 48 \
+    --load-skew-hot-groups 24 \
+    --load-skew-hot-share 0.8 \
     --world-size 6 \
     --nvlink-pairs "0,1;2,3;4,5" \
     --kv-block-budget 192 \
     --gpu-memory-utilization 0.70 \
-    --submit-window 64 \
+    --submit-window 336 \
     --background-copy-max-blocks 24 \
     --background-copy-batch-max-blocks 48 \
     --background-copy-batch-max-candidates 4 \
@@ -91,197 +93,213 @@
   `--num-prompts` 之间；组数越多，未启用 routing 时跨 GPU 重复缓存和 cache churn 越明显。
 
 10. `--load-skew-prefix-groups`：
-  `load-skew` 中固定在 NVLink source rank 上预热的长热点前缀数量。论文配置使用 24 组，
+  `load-skew` 中固定在 NVLink source rank 上预热的长热点前缀组数量。论文配置使用 24 组，
   使三个 NVLink pair 的每个 source 持有 8 组前缀，而 partner 在 reuse burst 前保持空闲。
-  组到 source 的映射按 NVLink pair 周期交错，使普通 round-robin 的 reuse 请求只会落到
-  对应前缀的 owner 或 direct NVLink partner，而不会误落到无直连关系的 rank。
+  warm-up 映射按 NVLink pair 周期交错以均衡初始 owner；reuse 顺序则按 `--seed` 打乱，
+  刻意消除 prefix group 与 round-robin rank 周期的对齐，使 baseline 必须面对真实的
+  跨 rank 重复 prefill，而 LMPool 可以利用 source/replica placement。
 
-11. `--load-skew-warmup-prompts`：
+11. `--load-skew-hot-groups` / `--load-skew-hot-share`：
+  reuse burst 中的高频前缀组数量和请求比例。`0` 表示所有
+  `--load-skew-prefix-groups` 都是热点；其余请求使用每次都不同的一次性 cold prefix。
+  论文配置使用 24 个热点和 0.8，使 background copy 面对明确的高收益对象，同时保留
+  不可复用的真实长尾。
+
+12. `--load-skew-warmup-prompts`：
   `load-skew` 的预热请求数。默认 0 使用总请求数的四分之一且至少覆盖每个热点一次；
-  论文配置使用 48 个 warm-up 和 144 个 reuse 请求，让每组前缀先获得 2 次真实访问，
-  再为后台 forecast 提供明确的后续需求。
+  论文配置使用 48 个 warm-up 和 336 个 reuse 请求；每个热点先获得 2 次真实访问，
+  reuse 中 80% 的请求访问热点，其余请求使用一次性 cold prefix。
 
-12. `--memory-skew-prefix-groups`：
-  `memory-skew` workload 中需要跨阶段保留的长热点前缀数量。默认 0 表示自动选择不超过 15
-  的最大奇数，使其适配 warmup/reuse 阶段长度。每个热点在 warmup
-  阶段固定到一个 source rank，reuse 阶段交错重放；使用多个热点可防止 round-robin 在第一次
-  miss 后自然把唯一热点复制到所有 GPU。该值不能超过 warmup 或 reuse 阶段请求数。
+13. `--memory-skew-prefix-groups`：
+  `memory-skew` workload 中需要跨阶段保留的长会话前缀数量。每组在 warm-up 中建立一条
+  可迁移 session chain 和一条较短的 routing anchor。默认 0 自动选择不超过 15 的最大奇数，
+  并保证两条 warm-up 请求、一次 trigger 和一次精确 reuse 都能覆盖每组。
 
-13. `--memory-skew-warmup-prompts`：
-  `memory-skew` 中建立热点 KV 和访问频率的请求数。默认 0 使用总请求数的四分之一。论文配置
-  使用 24 个请求覆盖 12 个长热点组两次，使 block 达到热点阈值，同时把更多请求留给
-  最终 reuse 阶段，避免准备阶段稀释 offload 的端到端收益。
+14. `--memory-skew-warmup-prompts`：
+  `memory-skew` 中建立长 session KV 的请求数。每个 session 内含短 anchor，因此每组至少一条
+  warm-up 请求；worker rank 仍由当前场景的普通分发策略决定。
 
-14. `--memory-skew-pressure-prompts`：
-  `memory-skew` 中使用互不共享的短前缀挤压 source KV 容量的请求数。默认 0 使用总请求数的
-  四分之一。论文配置将其提高到 64，并将共享前缀扩大到 `--prompt-repeat 32`；该阶段不提供
-  未来复用，只负责在每个 source 形成真实 block shortage。
+15. `--memory-skew-pressure-prompts`：
+  `memory-skew` 中只复用短 anchor、再追加唯一短尾的压力请求数。它们占满 source KV，
+  但不引用或 pin 住长 session chain。pressure 会完整 drain，之后才进入 trigger。
 
-15. `--calibration-prefix-groups`：
+16. `--memory-skew-trigger-prompts`：
+  pressure 完成后提交的长 anchor continuation 数。默认每个 prefix group 一条。它们通过普通
+  路由在热门 anchor owner 处请求额外 KV blocks，触发 foreground transfer。
+
+17. `--memory-skew-pressure-hot-groups` / `--memory-skew-pressure-hot-share`：
+  接收大部分 pressure 请求的 anchor group 数量及其请求比例。默认两个 group 承担 80% pressure，
+  以生成由 KV-aware routing 自然导致的容量倾斜，不指定任何 worker rank。
+
+18. `--memory-skew-anchor-share`：
+  每个 session 中共享 routing anchor 所占的文本比例，默认 0.375。较长 anchor 让绕过 owner
+  需要重算足够多的 prefix；其余 session suffix 仍可作为 foreground transfer 候选。
+
+17. `--calibration-prefix-groups`：
   仅供 `transfer-calibration` 使用的不同前缀组数。每个组必须同时出现在 source-build 和
   partner-reuse 阶段，用于产生完整 transfer transaction observation。
 
-16. `--calibration-warmup-prompts`：
+18. `--calibration-warmup-prompts`：
   `transfer-calibration` 中固定在 NVLink source 侧建立 KV 的请求数。其余请求固定到对应
   partner；该参数只用于生成成本 profile，不进入论文 serving 性能对比。
 
-17. `--output-json`：
+18. `--output-json`：
   将各场景统计结果导出到指定 JSON 文件。脚本会自动创建父目录，并在成功后打印
   `saved json: ...`。
 
-18. `--model-name-or-path`：
+19. `--model-name-or-path`：
   指定要测试的模型名称或本地路径。默认使用脚本里的 Qwen 配置，对应模型结构也基于这份配置。
 
-19. `--dtype`：
+20. `--dtype`：
   模型权重与 KV cache 的运行 dtype。`auto` 从模型 `config.json` 读取；也可显式指定
   `float16`、`bfloat16` 或 `float32`。构建和加载 transfer profile 时 dtype 必须一致。
 
-20. `--nvlink-pairs`：
+21. `--nvlink-pairs`：
   手动指定 NVLink 拓扑，格式如 `0,1` 或 `0,1;2,3`。这里使用的是
   `CUDA_VISIBLE_DEVICES` 之后的逻辑 GPU 编号，不是物理 GPU 编号。如果不想手动写，
   可以传空字符串，让底层逻辑尝试解析 `nvidia-smi topo -m`。命令行里包含分号时必须加引号，
   例如 `--nvlink-pairs "0,2;1,3;4,5;6,7"`。
 
-21. `--world-size`：
+22. `--world-size`：
   多卡场景启动多少个 data-plane worker。默认 2；八卡实验需要显式传 `--world-size 8`。
   该值不能超过 `CUDA_VISIBLE_DEVICES` 暴露出的 GPU 数。
 
-22. `--kv-block-budget`：
+23. `--kv-block-budget`：
   每个 rank 请求使用的 KV block 数。五个场景必须使用同一个值，避免把容量差异误判成
   routing / transfer 收益。显式设置后采用严格语义：worker 实际容量不足时会在提交请求前报错，
   不再静默缩小预算。
 
-23. `--gpu-memory-utilization`：
+24. `--gpu-memory-utilization`：
   ModelRunner 推导可用 KV cache 容量时可使用的空闲显存比例，范围 `(0, 1]`，benchmark
   默认 0.20。最终分配仍受 `--kv-block-budget` 限制；提高该值只是让显式 block budget
   能够实现，不会越过该上限。
 
-24. `--goodput-e2e-sla-ms`：
+25. `--goodput-e2e-sla-ms`：
   goodput 的端到端延迟门槛，单位毫秒。只有在这个 SLA 内完成的请求，其输出 token
   才计入 goodput。因此表里的 goodput 单位是 tokens/s，不是 requests/s。
 
-25. `--goodput-e2e-sla-sweep-ms`：
+26. `--goodput-e2e-sla-sweep-ms`：
   用逗号分隔的多个端到端 SLA 门槛。脚本使用同一批请求完成时间计算每个门槛下的
   goodput，不会重新执行推理；JSON 同时保存各门槛的均值和 95% 置信区间。
 
-26. `--skip-pool`：
+27. `--skip-pool`：
   跳过 `multi-gpu-lmpool` 场景，只跑基线、routing 和 transfer。
 
-27. `--output-figure`：
+28. `--output-figure`：
   将五种场景的核心指标画成一张图表图片并保存到指定路径。脚本会自动创建父目录，
   使用无显示环境可用的 Matplotlib Agg 后端，并在成功后打印 `saved figure: ...`。
 
-28. `--submit-window`：
+29. `--submit-window`：
   benchmark 中允许同时在途的请求数。值越大越接近一次性高并发提交；值越小越容易让前面请求先完成
   prefill 并上报全局页表，从而观察在线 prefix reuse。设为 0 或负数表示一次性提交全部请求。
   如果要验证 prefix hit 是否生效，建议先用 4 ~ 8；如果要模拟 burst 流量，可以设为 0 或 -1。
 
-29. `--disable-background-copy`：
+30. `--disable-background-copy`：
   关闭后台 speculative copy-style transfer。默认开启，用于把热点 prefix block 异步复制到 NVLink
   伙伴，服务后续请求；关闭后只保留因当前请求容量不足而同步触发的 foreground transfer。
 
-30. `--background-copy-max-blocks`：
+31. `--background-copy-max-blocks`：
   每条后台候选前缀链最多贡献多少个 prefix block。相同方向、相同 NVLink pair 的多条候选
   会在内部合并成一个有界 plan，以摊薄控制协议和 payload 启动开销。
 
-31. `--background-copy-batch-max-blocks`：
+32. `--background-copy-batch-max-blocks`：
   同一 `src -> dst` 事务合并后的总 block 上限。它限制一次 packed transfer 的 payload，
   不改变单条候选链的 `--background-copy-max-blocks` 上限。
 
-32. `--background-copy-batch-max-candidates`：
+33. `--background-copy-batch-max-candidates`：
   一个 pair 在构造一次 packed transfer 时最多检查的候选链数。该参数与总 block 上限共同
   约束事务大小，主要用于成本校准和控制面开销保护。
 
-33. `--background-copy-cooldown-s`：
+34. `--background-copy-cooldown-s`：
   同一个 prefix 在同一组 `src -> dst` GPU 之间再次触发后台 copy 的最短间隔，单位秒。
   值越大越保守，值越小越容易在高并发下产生更多 transfer。验证后台 copy 收益时可尝试 0.5。
 
-34. `--background-copy-hot-threshold`：
+35. `--background-copy-hot-threshold`：
   最大热点前缀链中每个 block 至少需要达到的 worker 上报访问次数。值越大越保守，能减少
   无效 copy；该统计来自真实数据面访问，不再使用路由请求次数代替。
 
-35. `--background-copy-min-load-skew`：
+36. `--background-copy-min-load-skew`：
   route-originated 候选发现要求 prefix owner 与 NVLink partner 至少相差多少队列压力，默认 2；
   phase 边界的 ingress forecast 使用已观测的数据放置偏斜，不受该瞬时负载差限制。
 
-36. `--background-copy-expected-reuses`：
+37. `--background-copy-expected-reuses`：
   预测未来复用次数的保守上限，默认 4。实际预测来自 ingress 尚未提交请求的逐前缀计数；
   没有 forecast 时才使用折扣后的 worker 历史访问次数，不再固定假设一定有 4 次复用。
 
-37. `--route-load-weight`：
+38. `--route-load-weight`：
   旧 prefix score 中 token-aware load 的 tie-break 权重。主路由决策现在使用统一预计完成成本；
   该参数只在成本相同时参与稳定排序，通常保持默认值。
 
-38. `--route-decode-token-weight`：
+39. `--route-decode-token-weight`：
   一个预计 decode token 在路由负载快照中的权重，默认 8，用于避免长输出请求集中到单一 owner。
 
-39. `--route-owner-spill-sequence-skew`：
+40. `--route-owner-spill-sequence-skew`：
   prefix owner 比 NVLink partner 多出的序列压力达到该值时允许 pair 内 spill，默认 2。
 
-40. `--route-owner-spill-max-extra-cost`：
+41. `--route-owner-spill-max-extra-cost`：
   pair spill 相比留在 owner 最多允许增加的 token-equivalent 重算成本，默认 2048。
 
-41. `--route-load-bypass-threshold`：
+42. `--route-load-bypass-threshold`：
   冷目标的预计总成本必须比 prefix owner 至少低多少 token-equivalent cost，才允许绕过
   owner。值越小越激进，越容易牺牲 locality 换并行度。
 
-42. `--route-prefill-cost-weight`：
+43. `--route-prefill-cost-weight`：
   缺失 prefix token 的重算成本权重。默认 1.0，使一个缺失 token 与一个 waiting token
   使用相同成本单位；增大后路由更偏向已有 prefix 的 owner。
 
-43. `--route-reclaim-cost-weight`：
+44. `--route-reclaim-cost-weight`：
   使用 reclaimable capacity 时，每个待回收 block 按 `block_size * weight` 计入的附加成本。
   默认 0.5，用于反映回收元数据操作及未来 cache miss 风险。
 
-44. `--foreground-transfer-cost-weight`：
+45. `--foreground-transfer-cost-weight`：
   对时间模型算出的 transfer 成本施加的整体倍率，默认 1.0。大于 1 会更保守；通常保持
   1.0，优先校准下面的带宽、固定延迟和干扰系数。
 
-45. `--foreground-transfer-min-benefit-ratio`：
+46. `--foreground-transfer-min-benefit-ratio`：
   foreground transfer 预计节省的 prefill 毫秒数与预计 transfer 毫秒数的最小比值。
   默认 1.5；未达到门槛时跳过 transfer，直接使用本地回收。
 
-46. `--foreground-transfer-bandwidth-gib-s`：
+47. `--foreground-transfer-bandwidth-gib-s`：
   未提供 size-aware profile 时的兼容回退带宽，单位 GiB/s，默认 3.5。正式实验应优先使用
   下一项 profile，不再用单一带宽代表所有 plan 大小。
 
-47. `--foreground-transfer-profile-json`：
+48. `--foreground-transfer-profile-json`：
   `build_transfer_profile.py` 生成的分段延迟 profile。它按逻辑 NVLink pair 保存
   1/2/4/8/16/32/64-block 的实测延迟；运行时按实际 payload 插值，并严格校验模型、dtype
   对应的每 block 字节数。若构建时提供独立 E2E calibration JSON，同一文件还包含
   pair × size-bucket 的 dispatch-to-publish P95 transaction residual。未提供数据路径
   profile 时才回退到上一项标量带宽。
 
-48. `--foreground-transfer-fixed-latency-ms`：
+49. `--foreground-transfer-fixed-latency-ms`：
   没有 transaction residual profile 时的冷启动 fallback，单位毫秒，默认 0.0。它不再是
   永久下界：取得一次完整 dispatch-to-publish 观测后，在线 EWMA 可以向上或向下纠正该值。
   正式实验应通过独立 calibration run 生成 P95 residual profile，而不是手工填写 40 ms。
 
-49. `--foreground-transfer-interference-multiplier`：
+50. `--foreground-transfer-interference-multiplier`：
   对空载 transfer microbenchmark 的分段数据通路 P95 施加的加载态干扰倍率，
   默认 1.2，且不能小于 1。它只表示随 payload 变化的模型执行竞争、打包和解包干扰；
   完整 serving 事务中不随 payload 线性变化的部分由 residual profile 表示。
 
-50. `--scenarios`：
+51. `--scenarios`：
   逗号分隔的场景子集。默认运行五个场景；成本校准时可设置
   `--scenarios multi-gpu-lmpool`，只运行完整系统，避免把基线重复执行。
 
-51. `--foreground-prefill-token-time-ms`：
+52. `--foreground-prefill-token-time-ms`：
   重算一个未缓存 prompt token 的预计耗时，单位毫秒，默认 0.02。该值应由目标模型的
   prefill 统计校准。
 
-52. `--foreground-future-reuse-discount`：
+53. `--foreground-future-reuse-discount`：
   将历史叶前缀访问次数折算成未来复用次数的折扣，范围 `[0, 1]`，默认 0.5。成本模型不会
   再把前缀链上每个 block 的访问次数相加，从而避免将一条请求重复计算多次。Ingress 已经
   发布尚未提交请求的精确 prefix-demand snapshot 时，foreground admission 直接使用该计数，
   不再对它应用历史折扣。
 
-53. `--kv-transfer-prewarm-blocks`：
+54. `--kv-transfer-prewarm-blocks`：
   serving 开始前，每个 NVLink pair 使用真实 KV 形状预热的 block 数，默认 2。预热会循环
   使用与线上一致的单个 all-layer 连续 payload，并把测得的 pair-specific 成本送入控制面，
   但不计入 throughput 或 latency。
 
-54. `--route-cache-queue-slack`：
+55. `--route-cache-queue-slack`：
   route cache 命中时允许 cached owner 相比最低成本候选多出的 token-equivalent cost。
   值越小，缓存路由越容易被负载不均打破。
 
@@ -398,9 +416,11 @@ MODEL_CONFIG = {
     "route_reclaim_cost_weight": 0.5,
     "route_cache_queue_slack": 256.0,
     "enable_foreground_rebalance": True,
+    "enable_transfer_aware_owner_routing": True,
     "foreground_transfer_min_blocks": 2,
     "foreground_transfer_cost_weight": 1.0,
     "foreground_transfer_min_benefit_ratio": 1.5,
+    "foreground_transfer_require_idle_target": True,
     # The profile measures an otherwise-idle packed data path. Add a
     # loaded-serving transaction residual, then scale only the payload-varying
     # part. Pair/size EWMAs can raise the estimate after complete observations.
@@ -418,6 +438,8 @@ MODEL_CONFIG = {
     # 后台 proactive copy-style transfer：worker access snapshot 发现热点，
     # ingress 未提交需求估计剩余复用，并按 NVLink pair 在低负载时串行放置。
     "enable_background_copy": True,
+    "background_transfer_mode": "copy",
+    "background_move_source_free_block_threshold": 0,
     "background_copy_max_blocks": 8,
     # Coalesce independent prefix candidates on one directed NVLink pair into
     # one control transaction and one contiguous KV payload.
@@ -538,6 +560,7 @@ class ScenarioResult:
     stale_route_hit_rate: float = 0.0
     reuse_phase_request_hit_rate: float = 0.0
     reuse_phase_token_ratio: float = 0.0
+    pressure_reuse_overlap_s: float = 0.0
     repetitions: int = 1
     throughput_tok_s_std: float = 0.0
     goodput_tok_s_std: float = 0.0
@@ -570,6 +593,11 @@ class ScenarioResult:
     transfer_cost_underprediction_rate: float = 0.0
     goodput_sla_sweep_tok_s: dict[str, float] | None = None
     goodput_sla_sweep_tok_s_ci95: dict[str, float] | None = None
+    route_decision_counts: dict[str, int] | None = None
+    # Per-plan admission evidence.  This is intentionally separate from the
+    # aggregate failure counters so a paper run can explain why a transfer was
+    # rejected without reconstructing scheduler state from logs.
+    rebalance_diagnostics: list[dict] | None = None
 
 
 def build_shared_prefix(prompt_repeat: int, prefix_group: str = "shared") -> str:
@@ -599,18 +627,28 @@ def build_prompts(
     memory_skew_prefix_groups: int = 15,
     memory_skew_warmup_prompts: int = 0,
     memory_skew_pressure_prompts: int = 0,
+    memory_skew_trigger_prompts: int = 0,
+    memory_skew_pressure_hot_groups: int = 0,
+    memory_skew_pressure_hot_share: float = 0.8,
+    memory_skew_anchor_share: float = 0.375,
+    memory_skew_reuse_hot_groups: int = 0,
+    memory_skew_reuse_hot_share: float = 1.0,
+    memory_skew_proactive_move: bool = False,
     calibration_prefix_groups: int = 32,
     calibration_warmup_prompts: int = 0,
     load_skew_prefix_groups: int = 6,
     load_skew_warmup_prompts: int = 0,
+    load_skew_hot_groups: int = 0,
+    load_skew_hot_share: float = 0.8,
     seed: int = 0,
 ) -> list[str]:
     # locality: 多组长共享前缀，主要验证 KVCache-aware routing，避免单一前缀被每卡复制后
     # round-robin 也自然获得接近 100% 的本地命中。
     # load-skew: 先在每个 NVLink pair 的 source 预热多条长前缀，再提交高并发复用 burst。
     # 它让 forecast-driven background copy 和 replica-aware routing 面对同一组真实热点。
-    # memory-skew: 依次执行热点预热、一次性前缀施压、热点复用三个阶段，验证 transfer
-    # 是否能在释放源端容量的同时，把完整可复用前缀链保留到 NVLink 伙伴。
+    # memory-skew: 分开构造可迁移的长会话与只承载压力的短锚点。压力请求只
+    # 命中锚点，因此会在 source 形成容量短缺，却不会 pin 住要迁移的会话链；
+    # 触发请求在压力 drain 后到达，随后精确重放会话以验证实际复用。
     # transfer-calibration: source-build 和 partner-reuse 两阶段只用于采集完整
     # dispatch-to-publish transfer transaction，不是 serving 性能 workload。
     if workload == "locality":
@@ -621,31 +659,142 @@ def build_prompts(
         locality_group_order = [i % locality_prefix_groups for i in range(num_prompts)]
         random.Random(seed).shuffle(locality_group_order)
     elif workload == "load-skew":
+        hot_groups = (
+            int(load_skew_hot_groups)
+            if int(load_skew_hot_groups) > 0
+            else int(load_skew_prefix_groups)
+        )
+        if not 1 <= hot_groups <= load_skew_prefix_groups:
+            raise ValueError("--load-skew-hot-groups must fit within --load-skew-prefix-groups")
+        if not 0.0 < float(load_skew_hot_share) <= 1.0:
+            raise ValueError("--load-skew-hot-share must be in (0, 1]")
         hot_prefixes = [
             build_shared_prefix(prompt_repeat, f"load-hot-{group:04d}")
-            for group in range(load_skew_prefix_groups)
+            for group in range(hot_groups)
         ]
         warmup_end, _ = resolve_load_skew_phases(
             num_prompts,
-            load_skew_prefix_groups,
+            hot_groups,
             load_skew_warmup_prompts,
         )
+        reuse_count = num_prompts - warmup_end
+        hot_reuse_count = min(
+            reuse_count,
+            max(hot_groups, round(reuse_count * float(load_skew_hot_share))),
+        )
+        cold_reuse_count = reuse_count - hot_reuse_count
+        reuse_group_order = [
+            ("hot", index % hot_groups)
+            for index in range(hot_reuse_count)
+        ]
+        reuse_group_order.extend(
+            ("cold", index)
+            for index in range(cold_reuse_count)
+        )
+        # Shuffle the weighted multiset so prefix identity cannot lock to the
+        # round-robin rank period. The seed keeps the trace reproducible.
+        random.Random(seed ^ 0x4C4D504F).shuffle(reuse_group_order)
     elif workload in {"memory-skew", "capacity-offload"}:
-        # Multiple hot chains prevent round-robin from learning the only hot
-        # prefix locally after one miss. Each group is warmed on one source and
-        # revisited in an interleaved reuse phase.
-        hot_prefixes = [
-            build_shared_prefix(prompt_repeat, f"transfer-hot-{group:04d}")
+        # A session starts with a short anchor and then appends a long body.
+        # Pressure and trigger requests share only the anchor. Thus a normal
+        # prefix-aware router can return them to the session owner without
+        # keeping the long session suffix referenced or pinned.
+        if not 0.0 < float(memory_skew_anchor_share) < 1.0:
+            raise ValueError("--memory-skew-anchor-share must be in (0, 1)")
+        anchor_repeat = min(
+            max(1, prompt_repeat - 1),
+            max(1, round(prompt_repeat * float(memory_skew_anchor_share))),
+        )
+        session_repeat = max(1, prompt_repeat - anchor_repeat)
+        anchor_prefixes = [
+            build_shared_prefix(anchor_repeat, f"transfer-anchor-{group:04d}")
             for group in range(memory_skew_prefix_groups)
         ]
-        warmup_prompts, pressure_prompts, _ = resolve_memory_skew_phases(
+        session_prefixes = [
+            anchor_prefixes[group]
+            + " "
+            + build_shared_prefix(session_repeat, f"transfer-session-{group:04d}")
+            for group in range(memory_skew_prefix_groups)
+        ]
+        warmup_prompts, pressure_prompts, trigger_prompts, _ = resolve_memory_skew_phases(
             num_prompts,
             memory_skew_prefix_groups,
             memory_skew_warmup_prompts,
             memory_skew_pressure_prompts,
+            memory_skew_trigger_prompts,
+            allow_zero_trigger=memory_skew_proactive_move,
         )
         warmup_end = warmup_prompts
         pressure_end = warmup_prompts + pressure_prompts
+        trigger_end = pressure_end + trigger_prompts
+        pressure_hot_groups = (
+            int(memory_skew_pressure_hot_groups)
+            if int(memory_skew_pressure_hot_groups) > 0
+            else min(2, memory_skew_prefix_groups)
+        )
+        if not 1 <= pressure_hot_groups <= memory_skew_prefix_groups:
+            raise ValueError(
+                "--memory-skew-pressure-hot-groups must fit within "
+                "--memory-skew-prefix-groups"
+            )
+        if not 0.0 < float(memory_skew_pressure_hot_share) <= 1.0:
+            raise ValueError("--memory-skew-pressure-hot-share must be in (0, 1]")
+        reuse_hot_groups = (
+            int(memory_skew_reuse_hot_groups)
+            if int(memory_skew_reuse_hot_groups) > 0
+            else memory_skew_prefix_groups
+        )
+        if not 1 <= reuse_hot_groups <= memory_skew_prefix_groups:
+            raise ValueError(
+                "--memory-skew-reuse-hot-groups must fit within "
+                "--memory-skew-prefix-groups"
+            )
+        if not 0.0 < float(memory_skew_reuse_hot_share) <= 1.0:
+            raise ValueError("--memory-skew-reuse-hot-share must be in (0, 1]")
+        hot_pressure_count = min(
+            pressure_prompts,
+            max(
+                pressure_hot_groups,
+                round(pressure_prompts * float(memory_skew_pressure_hot_share)),
+            ),
+        )
+        pressure_group_order = [
+            index % pressure_hot_groups for index in range(hot_pressure_count)
+        ]
+        cold_groups = list(range(pressure_hot_groups, memory_skew_prefix_groups))
+        pressure_group_order.extend(
+            cold_groups[index % len(cold_groups)] if cold_groups else index % pressure_hot_groups
+            for index in range(pressure_prompts - hot_pressure_count)
+        )
+        # Each phase has an independent deterministic permutation. This is a
+        # workload arrival order, not a worker-placement hint, and prevents a
+        # prefix group from repeatedly landing on the same round-robin rank.
+        warmup_group_order = [
+            index % memory_skew_prefix_groups for index in range(warmup_prompts)
+        ]
+        trigger_group_order = [
+            index % pressure_hot_groups for index in range(trigger_prompts)
+        ]
+        reuse_count = num_prompts - trigger_end
+        hot_reuse_count = min(
+            reuse_count,
+            max(
+                reuse_hot_groups,
+                round(reuse_count * float(memory_skew_reuse_hot_share)),
+            ),
+        )
+        reuse_group_order = [
+            index % reuse_hot_groups for index in range(hot_reuse_count)
+        ]
+        cold_groups = list(range(reuse_hot_groups, memory_skew_prefix_groups))
+        reuse_group_order.extend(
+            cold_groups[index % len(cold_groups)] if cold_groups else index % reuse_hot_groups
+            for index in range(reuse_count - hot_reuse_count)
+        )
+        random.Random(seed ^ 0x4D534B57).shuffle(warmup_group_order)
+        random.Random(seed ^ 0x50524553).shuffle(pressure_group_order)
+        random.Random(seed ^ 0x54524947).shuffle(trigger_group_order)
+        random.Random(seed ^ 0x52455553).shuffle(reuse_group_order)
     elif workload == "transfer-calibration":
         hot_prefixes = [
             build_shared_prefix(prompt_repeat, f"calibration-{group:04d}")
@@ -660,18 +809,54 @@ def build_prompts(
         if workload == "locality":
             shared_prefix = locality_prefixes[locality_group_order[i]]
         elif workload == "load-skew":
-            phase_index = i if i < warmup_end else i - warmup_end
-            shared_prefix = hot_prefixes[phase_index % load_skew_prefix_groups]
+            if i < warmup_end:
+                shared_prefix = hot_prefixes[i % hot_groups]
+            else:
+                reuse_kind, reuse_group = reuse_group_order[i - warmup_end]
+                if reuse_kind == "hot":
+                    shared_prefix = hot_prefixes[reuse_group]
+                else:
+                    shared_prefix = build_shared_prefix(
+                        prompt_repeat,
+                        f"load-cold-{reuse_group:04d}",
+                    )
         elif workload in {"memory-skew", "capacity-offload"}:
             if i < warmup_end:
-                shared_prefix = hot_prefixes[i % memory_skew_prefix_groups]
-            elif i >= pressure_end:
-                shared_prefix = hot_prefixes[(i - pressure_end) % memory_skew_prefix_groups]
-            else:
-                shared_prefix = build_shared_prefix(
-                    max(1, prompt_repeat // 2),
-                    f"pressure-{i - warmup_end:04d}",
+                session_group = warmup_group_order[i]
+                shared_prefix = session_prefixes[session_group]
+                suffix = SUFFIXES[session_group % len(SUFFIXES)]
+            elif i < pressure_end:
+                pressure_index = i - warmup_end
+                anchor_group = pressure_group_order[pressure_index]
+                shared_prefix = (
+                    anchor_prefixes[anchor_group]
+                    + " "
+                    + build_shared_prefix(
+                        anchor_repeat,
+                        f"memory-pressure-tail-{pressure_index:04d}",
+                    )
                 )
+            elif i < trigger_end:
+                trigger_index = i - pressure_end
+                anchor_group = trigger_group_order[trigger_index]
+                # A long unique tail makes the already loaded source request
+                # additional blocks only after all pressure requests have
+                # completed and their blocks are releasable.
+                shared_prefix = (
+                    anchor_prefixes[anchor_group]
+                    + " "
+                    + build_shared_prefix(
+                        session_repeat,
+                        f"memory-trigger-tail-{trigger_index:04d}",
+                    )
+                )
+            else:
+                reuse_index = i - trigger_end
+                session_group = reuse_group_order[reuse_index]
+                shared_prefix = session_prefixes[session_group]
+                # Exact replay requires the same suffix used for the session
+                # warm-up request; otherwise the final block hash differs.
+                suffix = SUFFIXES[session_group % len(SUFFIXES)]
         elif workload == "transfer-calibration":
             phase_index = i if i < warmup_end else i - warmup_end
             shared_prefix = hot_prefixes[phase_index % calibration_prefix_groups]
@@ -813,30 +998,6 @@ def compute_goodput_sla_sweep(
     return result
 
 
-def resolve_memory_skew_source_ranks(config: dict) -> list[int]:
-    """Resolve benchmark placement without granting topology to a baseline policy."""
-    explicit = [
-        int(rank)
-        for rank in config.get("benchmark_memory_skew_source_ranks", [])
-        if 0 <= int(rank) < config["world_size"]
-    ]
-    if explicit:
-        return sorted(set(explicit))
-    pairs = config.get("nvlink_topo", {}).get("pairs") or []
-    return sorted({int(pair[0]) for pair in pairs}) or [0]
-
-
-def resolve_memory_skew_target_by_source(config: dict) -> dict[int, int]:
-    return {
-        int(source): int(target)
-        for source, target in config.get("benchmark_memory_skew_target_by_source", {}).items()
-        if (
-            0 <= int(source) < config["world_size"]
-            and 0 <= int(target) < config["world_size"]
-        )
-    }
-
-
 def resolve_load_skew_phases(
     num_prompts: int,
     prefix_groups: int,
@@ -863,45 +1024,38 @@ def resolve_load_skew_phases(
     return warmup_prompts, reuse_prompts
 
 
-def resolve_load_skew_source_rank(
-    prefix_group: int,
-    prefix_groups: int,
-    source_ranks: list[int],
-) -> int:
-    """Stripe pairs of hot groups across NVLink source ranks.
-
-    With round-robin reuse on a topology ``(0,1);(2,3);...``, group indices
-    ``2k`` and ``2k+1`` land on the owner and its direct partner. Repeating
-    this mapping for larger group counts preserves that controlled placement
-    instead of sending groups to unrelated ranks.
-    """
-    if prefix_groups < 1 or not source_ranks:
-        raise ValueError("load-skew placement requires groups and source ranks")
-    source_index = (int(prefix_group) // 2) % len(source_ranks)
-    return int(source_ranks[source_index])
-
-
 def resolve_memory_skew_prefix_groups(
     num_prompts: int,
     requested: int,
     warmup_prompts: int = 0,
     pressure_prompts: int = 0,
+    trigger_prompts: int = 0,
+    allow_zero_trigger: bool = False,
 ) -> int:
-    """Resolve enough hot groups to avoid one-prefix baseline saturation."""
+    """Resolve session groups that fit the warm-up, trigger, and reuse phases."""
     warmup_requests = (
-        int(warmup_prompts) if int(warmup_prompts) > 0 else max(1, num_prompts // 4)
+        int(warmup_prompts)
+        if int(warmup_prompts) > 0
+        else max(1, num_prompts // 4)
     )
     pressure_requests = (
         int(pressure_prompts)
         if int(pressure_prompts) > 0
         else max(1, num_prompts // 4)
     )
-    reuse_requests = num_prompts - warmup_requests - pressure_requests
+    trigger_requests = (
+        int(trigger_prompts)
+        if int(trigger_prompts) > 0
+        else (0 if allow_zero_trigger else max(1, num_prompts // 8))
+    )
+    reuse_requests = num_prompts - warmup_requests - pressure_requests - trigger_requests
     maximum = min(warmup_requests, reuse_requests)
+    if not allow_zero_trigger:
+        maximum = min(maximum, trigger_requests)
     if requested > 0:
         if requested > maximum:
             raise ValueError(
-                "--memory-skew-prefix-groups must fit in both the warmup and reuse phases"
+                "--memory-skew-prefix-groups must fit in warm-up and reuse phases"
             )
         return requested
     automatic = min(15, maximum)
@@ -913,32 +1067,40 @@ def resolve_memory_skew_phases(
     prefix_groups: int,
     warmup_prompts: int,
     pressure_prompts: int,
-) -> tuple[int, int, int]:
-    """Resolve explicit warm-up, pressure, and reuse phase lengths."""
+    trigger_prompts: int = 0,
+    allow_zero_trigger: bool = False,
+) -> tuple[int, int, int, int]:
+    """Resolve warm-up, pressure, trigger, and exact-reuse phase lengths."""
     warmup = (
         int(warmup_prompts)
         if int(warmup_prompts) > 0
-        else max(1, int(num_prompts) // 4)
+        else max(int(prefix_groups), int(num_prompts) // 4)
     )
     pressure = (
         int(pressure_prompts)
         if int(pressure_prompts) > 0
         else max(1, int(num_prompts) // 4)
     )
-    reuse = int(num_prompts) - warmup - pressure
-    if min(warmup, pressure, reuse) < 1:
+    trigger = (
+        int(trigger_prompts)
+        if int(trigger_prompts) > 0
+        else (0 if allow_zero_trigger else int(prefix_groups))
+    )
+    reuse = int(num_prompts) - warmup - pressure - trigger
+    if min(warmup, pressure, reuse) < 1 or (not allow_zero_trigger and trigger < 1):
         raise ValueError(
-            "memory-skew requires non-empty warm-up, pressure, and reuse phases"
+            "memory-skew requires non-empty warm-up, pressure, "
+            + ("and reuse phases" if allow_zero_trigger else "trigger, and reuse phases")
         )
     if warmup < int(prefix_groups):
         raise ValueError(
-            "memory-skew warm-up phase must cover every prefix group"
+            "memory-skew warm-up phase must build every session prefix group"
         )
     if reuse < int(prefix_groups):
         raise ValueError(
             "memory-skew reuse phase must cover every prefix group"
         )
-    return warmup, pressure, reuse
+    return warmup, pressure, trigger, reuse
 
 
 def resolve_transfer_calibration_warmup_prompts(
@@ -1383,16 +1545,19 @@ def run_engine_scenario(
     phase_ttfts: dict[str, list[float]] = {
         "warmup": [],
         "pressure": [],
+        "trigger": [],
         "reuse": [],
     }
     phase_e2es: dict[str, list[float]] = {
         "warmup": [],
         "pressure": [],
+        "trigger": [],
         "reuse": [],
     }
     phase_output_tokens: dict[str, int] = {
         "warmup": 0,
         "pressure": 0,
+        "trigger": 0,
         "reuse": 0,
     }
     phase_started_at: dict[str, float] = {}
@@ -1415,6 +1580,8 @@ def run_engine_scenario(
     rebalance_success = 0
     rebalance_fail = 0
     rebalance_fail_reasons: dict[str, int] = {}
+    rebalance_diagnostics: list[dict] = []
+    route_decision_counts: dict[str, int] = {}
     background_copy_success = 0
     background_copy_fail = 0
     background_copy_fail_reasons: dict[str, int] = {}
@@ -1434,6 +1601,7 @@ def run_engine_scenario(
                 "submitted": 0,
                 "warmup_submitted": 0,
                 "pressure_submitted": 0,
+                "trigger_submitted": 0,
                 "reuse_submitted": 0,
                 "finished": 0,
                 "output_tokens": 0,
@@ -1462,6 +1630,7 @@ def run_engine_scenario(
                 "hot_transfer_blocks": 0,
                 "rebalance_success": 0,
                 "rebalance_fail": 0,
+                "route_decision_counts": {},
                 "background_copy_success": 0,
                 "background_copy_fail": 0,
                 "max_cached_blocks": 0,
@@ -1515,17 +1684,23 @@ def run_engine_scenario(
                     int(config.get("benchmark_load_skew_warmup_prompts", 0)),
                 )
                 pressure_end = warmup_end
+                trigger_end = pressure_end
                 phase_ends = [warmup_end, len(prompts)]
             elif workload in {"memory-skew", "capacity-offload"}:
-                warmup_prompts, pressure_prompts, _ = resolve_memory_skew_phases(
+                warmup_prompts, pressure_prompts, trigger_prompts, _ = resolve_memory_skew_phases(
                     len(prompts),
                     int(config["benchmark_transfer_prefix_groups"]),
                     int(config.get("benchmark_memory_skew_warmup_prompts", 0)),
                     int(config.get("benchmark_memory_skew_pressure_prompts", 0)),
+                    int(config.get("benchmark_memory_skew_trigger_prompts", 0)),
+                    allow_zero_trigger=bool(
+                        config.get("benchmark_memory_skew_proactive_move", False)
+                    ),
                 )
                 warmup_end = warmup_prompts
                 pressure_end = warmup_prompts + pressure_prompts
-                phase_ends = [warmup_end, pressure_end, len(prompts)]
+                trigger_end = pressure_end + trigger_prompts
+                phase_ends = [warmup_end, pressure_end, trigger_end, len(prompts)]
             else:
                 warmup_end = int(
                     config.get(
@@ -1535,9 +1710,7 @@ def run_engine_scenario(
                 )
                 pressure_end = warmup_end
                 phase_ends = [warmup_end, len(prompts)]
-            source_ranks = resolve_memory_skew_source_ranks(config)
-            target_by_source = resolve_memory_skew_target_by_source(config)
-            transfer_prefix_groups = int(config["benchmark_transfer_prefix_groups"])
+                trigger_end = pressure_end
             warmup_hash_chains = [
                 compute_sequence_prefix_hashes(Sequence(
                     token_ids=tokenizer.encode(prompts[index]),
@@ -1555,7 +1728,12 @@ def run_engine_scenario(
                 if frequency >= (1 if workload == "transfer-calibration" else 2)
             }
             future_prefix_demands: dict[int, int] = {}
-            for index in range(pressure_end, len(prompts)):
+            future_start = (
+                trigger_end
+                if workload in {"memory-skew", "capacity-offload"}
+                else pressure_end
+            )
+            for index in range(future_start, len(prompts)):
                 seq = Sequence(
                     token_ids=tokenizer.encode(prompts[index]),
                     block_size=config["block_size"],
@@ -1565,10 +1743,8 @@ def run_engine_scenario(
                         future_prefix_demands.get(block_hash, 0) + 1
                     )
         else:
-            warmup_end = pressure_end = 0
+            warmup_end = pressure_end = trigger_end = 0
             phase_ends = [len(prompts)]
-            source_ranks = [0]
-            target_by_source = {}
             hot_prefix_hashes = set()
             future_prefix_demands = {}
         # Serving metrics start only after model load, CUDA/NCCL warmup, KV
@@ -1593,38 +1769,19 @@ def run_engine_scenario(
             )
             start = time.perf_counter()
             target_rank = 0
-            if transfer_workload and prompt_index < warmup_end:
-                # Deterministically create placement skew: warm-up and pressure
-                # use only the source side of each NVLink pair. Reuse returns to
-                # the scenario's normal routing/round-robin policy.
-                prefix_group = prompt_index % transfer_prefix_groups
-                if workload == "load-skew":
-                    target_rank = resolve_load_skew_source_rank(
-                        prefix_group,
-                        transfer_prefix_groups,
-                        source_ranks,
-                    )
-                else:
-                    target_rank = source_ranks[prefix_group % len(source_ranks)]
-            elif workload in {"memory-skew", "capacity-offload"} and prompt_index < pressure_end:
-                target_rank = source_ranks[(prompt_index - warmup_end) % len(source_ranks)]
-            elif (
-                workload
-                in {"memory-skew", "capacity-offload", "transfer-calibration"}
-                and route_mode == "round_robin"
-            ):
-                # The reuse phase deliberately crosses each NVLink pair for
-                # memory offload and transaction calibration. Load skew retains ordinary
-                # round-robin so its baseline does not receive a favorable or
-                # adverse topology hint.
-                prefix_group = (prompt_index - pressure_end) % transfer_prefix_groups
-                source_rank = source_ranks[prefix_group % len(source_ranks)]
-                target_rank = target_by_source.get(source_rank, source_rank)
-            elif route_mode == "control_plane" and engine.control_plane_client is not None:
+            if route_mode == "control_plane" and engine.control_plane_client is not None:
                 # 控制面模式：每个请求都先做 prefix hash，再让全局调度器决定落在哪张卡
                 routed = engine.control_plane_client.route_sequence(seq, return_meta=True)
                 target_rank = routed["target_rank"]
                 route_info = routed.get("route_info", {})
+                route_reason = str(route_info.get("reason") or "unknown")
+                route_decision_counts[route_reason] = (
+                    route_decision_counts.get(route_reason, 0) + 1
+                )
+                rank_route_counts = get_rank_stats(target_rank)["route_decision_counts"]
+                rank_route_counts[route_reason] = (
+                    rank_route_counts.get(route_reason, 0) + 1
+                )
                 route_count += 1
                 pair_spill_count += int(
                     route_info.get("reason") == "prefix_hit_pair_spill"
@@ -1659,6 +1816,8 @@ def run_engine_scenario(
                     phase_name = "warmup"
                 elif prompt_index < pressure_end:
                     phase_name = "pressure"
+                elif prompt_index < trigger_end:
+                    phase_name = "trigger"
                 else:
                     phase_name = "reuse"
                 phase_by_seq[seq.seq_id] = phase_name
@@ -1739,6 +1898,9 @@ def run_engine_scenario(
                 rank_data["output_tokens"] += int(item.get("output_tokens", 0))
                 for reason, count in item.get("rebalance_fail_reasons", {}).items():
                     rebalance_fail_reasons[reason] = rebalance_fail_reasons.get(reason, 0) + int(count)
+                for diagnostic in item.get("rebalance_diagnostics", []):
+                    if isinstance(diagnostic, dict):
+                        rebalance_diagnostics.append(dict(diagnostic))
                 for reason, count in item.get("background_copy_fail_reasons", {}).items():
                     background_copy_fail_reasons[reason] = (
                         background_copy_fail_reasons.get(reason, 0) + int(count)
@@ -1817,9 +1979,15 @@ def run_engine_scenario(
                 and next_prompt_idx >= current_phase_end
                 and current_phase_index + 1 < len(phase_ends)
             ):
+                should_flush_background = (
+                    not bool(config.get("benchmark_memory_skew_proactive_move", False))
+                    or workload not in {"memory-skew", "capacity-offload"}
+                    or current_phase_index == 1
+                )
                 if (
                     config.get("enable_background_copy", False)
                     and engine.control_plane_client is not None
+                    and should_flush_background
                 ):
                     placement_started = time.perf_counter()
                     flush_result = engine.control_plane_client.flush_background_copies(
@@ -1939,9 +2107,11 @@ def run_engine_scenario(
         rebalance_success=rebalance_success,
         rebalance_fail=rebalance_fail,
         rebalance_fail_reasons=rebalance_fail_reasons,
+        rebalance_diagnostics=rebalance_diagnostics,
         background_copy_success=background_copy_success,
         background_copy_fail=background_copy_fail,
         background_copy_fail_reasons=background_copy_fail_reasons,
+        route_decision_counts=route_decision_counts,
         gpu_util_mean=gpu_util_mean,
         gpu_util_p95=gpu_util_p95,
         gpu_mem_util_mean=gpu_mem_util_mean,
@@ -1955,6 +2125,11 @@ def run_engine_scenario(
         ),
         reuse_phase_token_ratio=(
             reuse_phase_cached_tokens / max(reuse_phase_prompt_tokens, 1)
+        ),
+        pressure_reuse_overlap_s=max(
+            0.0,
+            phase_finished_at.get("pressure", 0.0)
+            - phase_started_at.get("reuse", float("inf")),
         ),
         phase_latency_stats={
             phase: {
@@ -1978,7 +2153,7 @@ def run_engine_scenario(
                 "mean_e2e_s": _mean(phase_e2es[phase]),
                 "p90_e2e_s": _percentile(phase_e2es[phase], 0.90),
             }
-            for phase in ("warmup", "pressure", "reuse")
+            for phase in ("warmup", "pressure", "trigger", "reuse")
             if phase_e2es[phase]
         },
         pair_spill_count=pair_spill_count,
@@ -2161,6 +2336,29 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
             values = [result.rank_stats.get(rank, {}).get(key, 0.0) for result in trials]
             if all(isinstance(value, (int, float)) for value in values):
                 rank_stats[rank][key] = statistics.fmean(float(value) for value in values)
+            elif all(isinstance(value, dict) for value in values):
+                nested_keys = set().union(*(value.keys() for value in values))
+                rank_stats[rank][key] = {
+                    nested_key: (
+                        int(statistics.fmean(
+                            float(value.get(nested_key, 0)) for value in values
+                        ) + 0.5)
+                        if key == "route_decision_counts"
+                        else round(statistics.fmean(
+                            float(value.get(nested_key, 0)) for value in values
+                        ))
+                    )
+                    for nested_key in nested_keys
+                }
+
+    def mean_count_map(name: str) -> dict[str, int]:
+        keys = set().union(*((getattr(result, name) or {}).keys() for result in trials))
+        return {
+            key: int(statistics.fmean(
+                (getattr(result, name) or {}).get(key, 0) for result in trials
+            ) + 0.5)
+            for key in keys
+        }
 
     phase_names = sorted(set().union(*(
         set((result.phase_latency_stats or {}).keys())
@@ -2236,6 +2434,12 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         rebalance_success=round(mean_attr("rebalance_success")),
         rebalance_fail=round(mean_attr("rebalance_fail")),
         rebalance_fail_reasons=mean_reason_map("rebalance_fail_reasons"),
+        rebalance_diagnostics=[
+            dict(diagnostic)
+            for trial in trials
+            for diagnostic in (trial.rebalance_diagnostics or [])
+        ],
+        route_decision_counts=mean_count_map("route_decision_counts"),
         background_copy_success=round(mean_attr("background_copy_success")),
         background_copy_fail=round(mean_attr("background_copy_fail")),
         background_copy_fail_reasons=mean_reason_map("background_copy_fail_reasons"),
@@ -2252,6 +2456,7 @@ def aggregate_scenario_trials(trials: list[ScenarioResult]) -> ScenarioResult:
         stale_route_hit_rate=mean_attr("stale_route_hit_rate"),
         reuse_phase_request_hit_rate=mean_attr("reuse_phase_request_hit_rate"),
         reuse_phase_token_ratio=mean_attr("reuse_phase_token_ratio"),
+        pressure_reuse_overlap_s=mean_attr("pressure_reuse_overlap_s"),
         repetitions=len(trials),
         throughput_tok_s_std=statistics.stdev(result.throughput_tok_s for result in trials),
         goodput_tok_s_std=statistics.stdev(result.goodput_tok_s for result in trials),
@@ -2338,7 +2543,7 @@ def print_summary_table(
     # 横向总表：把所有场景放在同一张表里，便于直接看五种配置的整体差异。
     valid_results = [result for result in results if result is not None]
     print(f"\n{title}")
-    print("=" * 225)
+    print("=" * 235)
     print(
         f"{'scenario':<22} {'tput(tok/s)':>14} {'goodput':>12} {'ttft(ms)':>12} {'tpot(ms)':>12} "
         f"{'e2e(ms)':>12} {'p90(e2e)':>12} {'p95(e2e)':>12} {'gpu util':>10} {'mem util':>10} "
@@ -2346,7 +2551,8 @@ def print_summary_table(
         f"{'attempts':>9} {'preempt':>8} {'redund tok':>10} {'sent blk':>9} "
         f"{'copied':>8} {'released':>9} "
         f"{'fg ok':>7} {'fg fail':>8} {'bg ok':>7} {'bg fail':>8} "
-        f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'low value':>9} {'bg space':>8}"
+        f"{'pinned':>8} {'no space':>9} {'no plan':>8} {'low value':>9} "
+        f"{'target busy':>11} {'bg space':>8}"
     )
     for result in valid_results:
         print(
@@ -2378,6 +2584,7 @@ def print_summary_table(
             f"{result.rebalance_fail_reasons.get('no_target_space', 0):>9} "
             f"{result.rebalance_fail_reasons.get('no_plan', 0):>8} "
             f"{result.rebalance_fail_reasons.get('low_benefit', 0):>9} "
+            f"{result.rebalance_fail_reasons.get('target_busy', 0):>11} "
             f"{result.background_copy_fail_reasons.get('no_target_space', 0):>8}"
         )
 
@@ -2532,7 +2739,7 @@ def print_summary_table(
             f"{'mean E2E(ms)':>15} {'p90 E2E(ms)':>15}"
         )
         for result in valid_results:
-            for phase in ("warmup", "pressure", "reuse"):
+            for phase in ("warmup", "pressure", "trigger", "reuse"):
                 stats = (result.phase_latency_stats or {}).get(phase)
                 if not stats:
                     continue
@@ -3004,9 +3211,53 @@ def parse_args():
     parser.add_argument("--locality-prefix-groups", type=int, default=16)
     parser.add_argument("--load-skew-prefix-groups", type=int, default=6)
     parser.add_argument("--load-skew-warmup-prompts", type=int, default=0)
+    parser.add_argument("--load-skew-hot-groups", type=int, default=0)
+    parser.add_argument("--load-skew-hot-share", type=float, default=0.8)
     parser.add_argument("--memory-skew-prefix-groups", type=int, default=0)
     parser.add_argument("--memory-skew-warmup-prompts", type=int, default=0)
     parser.add_argument("--memory-skew-pressure-prompts", type=int, default=0)
+    parser.add_argument(
+        "--memory-skew-pressure-hot-groups",
+        type=int,
+        default=0,
+        help="Number of anchor groups receiving most memory-pressure requests; 0 uses two.",
+    )
+    parser.add_argument(
+        "--memory-skew-pressure-hot-share",
+        type=float,
+        default=0.8,
+        help="Share of memory-pressure requests assigned to hot anchor groups.",
+    )
+    parser.add_argument(
+        "--memory-skew-anchor-share",
+        type=float,
+        default=0.375,
+        help=(
+            "Fraction of each long session reserved for the shared routing anchor; "
+            "the remaining tokens form the movable session suffix."
+        ),
+    )
+    parser.add_argument(
+        "--memory-skew-reuse-hot-groups",
+        type=int,
+        default=0,
+        help="Number of session groups receiving most post-offload reuse; 0 uses all.",
+    )
+    parser.add_argument(
+        "--memory-skew-reuse-hot-share",
+        type=float,
+        default=1.0,
+        help="Share of reuse requests assigned to hot session groups.",
+    )
+    parser.add_argument(
+        "--memory-skew-trigger-prompts",
+        type=int,
+        default=0,
+        help=(
+            "Number of source-routed long trigger requests after pressure drains; "
+            "defaults to one per memory-skew prefix group."
+        ),
+    )
     parser.add_argument("--calibration-prefix-groups", type=int, default=0)
     parser.add_argument("--calibration-warmup-prompts", type=int, default=0)
     parser.add_argument("--output-json", type=str, default="")
@@ -3038,6 +3289,22 @@ def parse_args():
     parser.add_argument("--output-figure", type=str, default="")
     parser.add_argument("--submit-window", type=int, default=8)
     parser.add_argument("--disable-background-copy", action="store_true")
+    parser.add_argument(
+        "--background-transfer-mode",
+        choices=["copy", "move"],
+        default=MODEL_CONFIG["background_transfer_mode"],
+    )
+    parser.add_argument(
+        "--background-move-source-free-block-threshold",
+        type=int,
+        default=MODEL_CONFIG["background_move_source_free_block_threshold"],
+    )
+    parser.add_argument(
+        "--memory-skew-proactive-move",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Move a releasable session suffix after pressure and before reuse.",
+    )
     parser.add_argument("--background-copy-max-blocks", type=int, default=MODEL_CONFIG["background_copy_max_blocks"])
     parser.add_argument(
         "--background-copy-batch-max-blocks",
@@ -3081,6 +3348,15 @@ def parse_args():
         "--foreground-transfer-min-benefit-ratio",
         type=float,
         default=MODEL_CONFIG["foreground_transfer_min_benefit_ratio"],
+    )
+    parser.add_argument(
+        "--foreground-transfer-require-idle-target",
+        action=argparse.BooleanOptionalAction,
+        default=MODEL_CONFIG["foreground_transfer_require_idle_target"],
+        help=(
+            "Admit foreground transfer only to a normal NVLink neighbour with "
+            "no reported waiting, running, or pending work."
+        ),
     )
     parser.add_argument(
         "--foreground-transfer-bandwidth-gib-s",
@@ -3189,6 +3465,10 @@ def apply_background_copy_args(config: dict, args) -> None:
     config["background_copy_hot_threshold"] = args.background_copy_hot_threshold
     config["background_copy_min_load_skew"] = args.background_copy_min_load_skew
     config["background_copy_expected_reuses"] = args.background_copy_expected_reuses
+    config["background_transfer_mode"] = args.background_transfer_mode
+    config["background_move_source_free_block_threshold"] = (
+        args.background_move_source_free_block_threshold
+    )
 
 
 def apply_route_args(
@@ -3206,6 +3486,9 @@ def apply_route_args(
     config["foreground_transfer_cost_weight"] = args.foreground_transfer_cost_weight
     config["foreground_transfer_min_benefit_ratio"] = (
         args.foreground_transfer_min_benefit_ratio
+    )
+    config["foreground_transfer_require_idle_target"] = (
+        args.foreground_transfer_require_idle_target
     )
     config["foreground_transfer_bandwidth_gib_s"] = args.foreground_transfer_bandwidth_gib_s
     config["foreground_transfer_latency_profile"] = transfer_latency_profile
@@ -3247,10 +3530,11 @@ def main():
     if (
         args.workload in {"memory-skew", "capacity-offload"}
         and not args.disable_background_copy
+        and args.background_transfer_mode != "move"
     ):
         raise SystemExit(
-            "memory-skew capacity offload requires --disable-background-copy "
-            "so copied blocks cannot be mistaken for source-capacity release"
+            "memory-skew requires --background-transfer-mode move or "
+            "--disable-background-copy; copy cannot demonstrate source-capacity release"
         )
     try:
         kv_block_budget = resolve_kv_block_budget(args)
@@ -3259,9 +3543,18 @@ def main():
     if args.workload == "locality" and not 1 <= args.locality_prefix_groups <= args.num_prompts:
         raise SystemExit("--locality-prefix-groups must be between 1 and --num-prompts")
     try:
+        load_skew_hot_groups = (
+            args.load_skew_hot_groups
+            if args.load_skew_hot_groups > 0
+            else args.load_skew_prefix_groups
+        )
+        if not 1 <= load_skew_hot_groups <= args.load_skew_prefix_groups:
+            raise ValueError(
+                "--load-skew-hot-groups must fit within --load-skew-prefix-groups"
+            )
         load_skew_warmup_prompts, _ = resolve_load_skew_phases(
             args.num_prompts,
-            args.load_skew_prefix_groups,
+            load_skew_hot_groups,
             args.load_skew_warmup_prompts,
         )
     except ValueError as exc:
@@ -3274,17 +3567,47 @@ def main():
             args.memory_skew_prefix_groups,
             args.memory_skew_warmup_prompts,
             args.memory_skew_pressure_prompts,
+            args.memory_skew_trigger_prompts,
+            allow_zero_trigger=args.memory_skew_proactive_move,
         )
-        memory_skew_warmup_prompts, memory_skew_pressure_prompts, _ = (
+        memory_skew_warmup_prompts, memory_skew_pressure_prompts, memory_skew_trigger_prompts, _ = (
             resolve_memory_skew_phases(
                 args.num_prompts,
                 memory_skew_prefix_groups,
                 args.memory_skew_warmup_prompts,
                 args.memory_skew_pressure_prompts,
+                args.memory_skew_trigger_prompts,
+                allow_zero_trigger=args.memory_skew_proactive_move,
             )
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    memory_skew_pressure_hot_groups = (
+        args.memory_skew_pressure_hot_groups
+        if args.memory_skew_pressure_hot_groups > 0
+        else min(2, memory_skew_prefix_groups)
+    )
+    if not 1 <= memory_skew_pressure_hot_groups <= memory_skew_prefix_groups:
+        raise SystemExit(
+            "--memory-skew-pressure-hot-groups must fit within "
+            "--memory-skew-prefix-groups"
+        )
+    if not 0.0 < args.memory_skew_pressure_hot_share <= 1.0:
+        raise SystemExit("--memory-skew-pressure-hot-share must be in (0, 1]")
+    if not 0.0 < args.memory_skew_anchor_share < 1.0:
+        raise SystemExit("--memory-skew-anchor-share must be in (0, 1)")
+    memory_skew_reuse_hot_groups = (
+        args.memory_skew_reuse_hot_groups
+        if args.memory_skew_reuse_hot_groups > 0
+        else memory_skew_prefix_groups
+    )
+    if not 1 <= memory_skew_reuse_hot_groups <= memory_skew_prefix_groups:
+        raise SystemExit(
+            "--memory-skew-reuse-hot-groups must fit within "
+            "--memory-skew-prefix-groups"
+        )
+    if not 0.0 < args.memory_skew_reuse_hot_share <= 1.0:
+        raise SystemExit("--memory-skew-reuse-hot-share must be in (0, 1]")
     try:
         calibration_warmup_prompts = resolve_transfer_calibration_warmup_prompts(
             args.num_prompts,
@@ -3316,6 +3639,10 @@ def main():
         )
     except (OSError, ValueError) as exc:
         raise SystemExit(f"cannot resolve model config for {model_name}: {exc}") from exc
+    # The model resolver starts from MODEL_CONFIG. Apply the CLI override to
+    # the shared runtime template as well as to each scenario config so the
+    # exported resolved_config matches the workers that actually run.
+    runtime_model_config["gpu_memory_utilization"] = args.gpu_memory_utilization
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     prompts = build_prompts(
         tokenizer,
@@ -3325,9 +3652,18 @@ def main():
         locality_prefix_groups=args.locality_prefix_groups,
         load_skew_prefix_groups=args.load_skew_prefix_groups,
         load_skew_warmup_prompts=load_skew_warmup_prompts,
+        load_skew_hot_groups=load_skew_hot_groups,
+        load_skew_hot_share=args.load_skew_hot_share,
         memory_skew_prefix_groups=memory_skew_prefix_groups,
         memory_skew_warmup_prompts=memory_skew_warmup_prompts,
         memory_skew_pressure_prompts=memory_skew_pressure_prompts,
+        memory_skew_trigger_prompts=memory_skew_trigger_prompts,
+        memory_skew_pressure_hot_groups=memory_skew_pressure_hot_groups,
+        memory_skew_pressure_hot_share=args.memory_skew_pressure_hot_share,
+        memory_skew_anchor_share=args.memory_skew_anchor_share,
+        memory_skew_reuse_hot_groups=memory_skew_reuse_hot_groups,
+        memory_skew_reuse_hot_share=args.memory_skew_reuse_hot_share,
+        memory_skew_proactive_move=args.memory_skew_proactive_move,
         calibration_prefix_groups=calibration_prefix_groups,
         calibration_warmup_prompts=calibration_warmup_prompts,
         seed=args.seed,
@@ -3388,21 +3724,10 @@ def main():
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise SystemExit(f"cannot load transfer latency profile: {exc}") from exc
-    memory_skew_source_ranks = sorted({int(pair[0]) for pair in nvlink_pairs}) or [0]
-    memory_skew_target_by_source = {
-        int(source): int(target) for source, target in nvlink_pairs
-    }
-
     def apply_transfer_placement(config: dict) -> None:
-        # Workload placement must be identical across all multi-GPU scenarios,
-        # including baselines that intentionally do not expose topology to the
-        # engine policy itself.
-        config["benchmark_memory_skew_source_ranks"] = (
-            [0] if config["world_size"] == 1 else memory_skew_source_ranks
-        )
-        config["benchmark_memory_skew_target_by_source"] = (
-            {} if config["world_size"] == 1 else memory_skew_target_by_source
-        )
+        # Workloads never select a worker rank. Every scenario uses its own
+        # normal dispatch policy; NVLink topology is visible only to transfer
+        # planning and to topology-aware routing.
         config["memory_skew_prefix_groups"] = memory_skew_prefix_groups
         config["benchmark_memory_skew_warmup_prompts"] = (
             memory_skew_warmup_prompts
@@ -3410,11 +3735,30 @@ def main():
         config["benchmark_memory_skew_pressure_prompts"] = (
             memory_skew_pressure_prompts
         )
+        config["benchmark_memory_skew_trigger_prompts"] = (
+            memory_skew_trigger_prompts
+        )
+        config["benchmark_memory_skew_pressure_hot_groups"] = (
+            memory_skew_pressure_hot_groups
+        )
+        config["benchmark_memory_skew_pressure_hot_share"] = (
+            args.memory_skew_pressure_hot_share
+        )
+        config["benchmark_memory_skew_anchor_share"] = args.memory_skew_anchor_share
+        config["benchmark_memory_skew_reuse_hot_groups"] = (
+            memory_skew_reuse_hot_groups
+        )
+        config["benchmark_memory_skew_reuse_hot_share"] = (
+            args.memory_skew_reuse_hot_share
+        )
+        config["benchmark_memory_skew_proactive_move"] = (
+            args.memory_skew_proactive_move
+        )
         config["benchmark_transfer_prefix_groups"] = (
             calibration_prefix_groups
             if args.workload == "transfer-calibration"
             else (
-                args.load_skew_prefix_groups
+                load_skew_hot_groups
                 if args.workload == "load-skew"
                 else memory_skew_prefix_groups
             )
@@ -3489,6 +3833,7 @@ def main():
     routing_config["model_name_or_path"] = model_name
     routing_config["max_cached_blocks"] = kv_block_budget
     routing_config["enable_foreground_rebalance"] = False
+    routing_config["enable_transfer_aware_owner_routing"] = False
     routing_config["enable_background_copy"] = False
     routing_config["random_seed"] = args.seed
     apply_transfer_placement(routing_config)
@@ -3526,6 +3871,11 @@ def main():
             "transfer-calibration",
     }
     apply_background_copy_args(eviction_config, args)
+    if args.workload in {"memory-skew", "capacity-offload"}:
+        eviction_config["enable_foreground_rebalance"] = False
+    if args.workload == "load-skew":
+        eviction_config["enable_foreground_rebalance"] = False
+        eviction_config["enable_transfer_aware_owner_routing"] = False
     apply_route_args(eviction_config, args, transfer_latency_profile)
     if "multi-gpu-kv-transfer" in requested_scenarios:
         kv_eviction = run_repeated_engine_scenario(
@@ -3565,6 +3915,13 @@ def main():
                 "transfer-calibration",
             }
             apply_background_copy_args(pool_config, args)
+            if args.workload in {"memory-skew", "capacity-offload"}:
+                pool_config["enable_foreground_rebalance"] = False
+            if args.workload == "load-skew":
+                pool_config["enable_foreground_rebalance"] = False
+                pool_config["enable_transfer_aware_owner_routing"] = (
+                    args.workload != "load-skew"
+                )
             apply_route_args(pool_config, args, transfer_latency_profile)
             pool_result = run_repeated_engine_scenario(
                 args.repetitions,
@@ -3619,6 +3976,7 @@ def main():
                 **runtime_model_config,
                 "resolved_kv_block_budget": kv_block_budget,
                 "resolved_load_skew_prefix_groups": args.load_skew_prefix_groups,
+                "resolved_load_skew_hot_groups": load_skew_hot_groups,
                 "resolved_load_skew_warmup_prompts": (
                     load_skew_warmup_prompts
                 ),
@@ -3630,11 +3988,43 @@ def main():
                 "resolved_memory_skew_pressure_prompts": (
                     memory_skew_pressure_prompts
                 ),
+                "resolved_memory_skew_trigger_prompts": (
+                    memory_skew_trigger_prompts
+                ),
+                "resolved_memory_skew_pressure_hot_groups": (
+                    memory_skew_pressure_hot_groups
+                ),
+                "resolved_memory_skew_pressure_hot_share": (
+                    args.memory_skew_pressure_hot_share
+                ),
+                "resolved_memory_skew_anchor_share": args.memory_skew_anchor_share,
+                "resolved_memory_skew_reuse_hot_groups": memory_skew_reuse_hot_groups,
+                "resolved_memory_skew_reuse_hot_share": args.memory_skew_reuse_hot_share,
                 "resolved_calibration_prefix_groups": calibration_prefix_groups,
                 "resolved_calibration_warmup_prompts": (
                     calibration_warmup_prompts
                 ),
                 "resolved_nvlink_pairs": nvlink_pairs,
+                # Record policy values after argument parsing.  The model
+                # snapshot alone does not contain these scenario controls;
+                # omitting them made the JSON appear to use the defaults even
+                # when the command line supplied different admission values.
+                "resolved_foreground_transfer_min_benefit_ratio": (
+                    args.foreground_transfer_min_benefit_ratio
+                ),
+                "resolved_foreground_transfer_bandwidth_gib_s": (
+                    args.foreground_transfer_bandwidth_gib_s
+                ),
+                "resolved_foreground_transfer_fixed_latency_ms": (
+                    args.foreground_transfer_fixed_latency_ms
+                ),
+                "resolved_foreground_transfer_interference_multiplier": (
+                    args.foreground_transfer_interference_multiplier
+                ),
+                "resolved_disable_background_copy": args.disable_background_copy,
+                "resolved_kv_transfer_prewarm_blocks": (
+                    args.kv_transfer_prewarm_blocks
+                ),
             },
         )
         run_metadata["dataset_profile"] = dataset_profile

@@ -11,18 +11,17 @@ KV geometry 和 dtype 则由各自 `config.json` 自动解析。
 | --- | --- | --- | --- |
 | NVLink KV data path | `benchmark_kv_transfer.py` | block-count sweep | latency, P95, GiB/s, validation |
 | KV-aware routing | `benchmark_kv_routing.py` | `locality` | single GPU, round-robin, routing-only |
-| Load relief by proactive background transfer | `benchmark_e2e.py` | `load-skew` | all five configurations, source warm-up then reuse burst |
+| Load relief by proactive background transfer | `benchmark_e2e.py` | `load-skew` | all five configurations, source warm-up then hot/cold reuse burst |
 | Capacity offload by foreground transfer | `benchmark_e2e.py` | `memory-skew` | all five configurations, background disabled |
 | Model-scale robustness | all entries | Qwen3-0.6B / Qwen3-1.7B | same trace and policy parameters, model-specific runtime config |
 
 `capacity-offload` 仅保留为 `memory-skew` 的命令行兼容别名，不再产生独立论文目录。
 `benchmark_e2e.py --workload locality` 与独立 routing benchmark 重复，不作为额外主实验。
 `load-skew` 现在是 background transfer 的负载主实验：warm-up 把 24 条约 5.7K-token
-长前缀放在三个 source rank，reuse burst 让 background copy 根据明确 forecast 预先复制。
-Prefix group 以两个一组的方式在三个
-NVLink source 间交错，使普通 round-robin 在 reuse 时将一半 group 留在 owner，另一半送到
-该 owner 的 direct NVLink partner。每个 partner 因而面对 12 次真实冷 prefill，而不是旧版
-6-group trace 中仅有的 3 次；routing-only 则会把请求拉回 owner，形成受控负载倾斜。
+长前缀放在三个 source rank，每个 source 持有 8 条；reuse burst 中 80\% 的请求访问
+这些热点，其余请求使用各不相同的一次性 cold prefix。请求顺序按固定 seed 打乱，
+避免 prefix group 与 round-robin rank 周期重合。Routing-only 会把热点请求拉回 owner，
+而 background copy 与 placement lease 可以把后续请求分摊到 source 和 direct NVLink partner。
 `memory-skew` 只认 source block release，专门证明 offloading。完整 transaction
 calibration 使用独立的内部 `transfer-calibration` trace，只生成成本 profile，不作为论文
 workload 或 serving 性能证据。
@@ -144,17 +143,19 @@ bash benchmarks/run_preflight_suite.sh
 
 脚本固定执行第 7 节的 5x routing、第 8 节的 memory-skew 和第 9 节的 load-skew，并在
 全部 JSON 写完后执行以下验收。Qwen3-0.6B 主 SLA 固定为 3 秒；memory-skew 使用
-24 warm-up、64 pressure 和 168 reuse requests。预验不用于论文数值，只检查：
+24 warm-up、128 pressure 和 24 reuse requests，reuse 会与仍在执行的 pressure 重叠。
+预验不用于论文数值，只检查：
 
 - routing-only 的 transfer counters 为 0，5x 的 uncached prefill 明显低于 multi-GPU，
   且 per-rank request share 没有集中到单卡；
-- memory-skew 至少一个 transfer-enabled 场景满足 `fg ok>0`、
-  `source freed>0` 和 `offload_verified=true`，reuse-phase TTFT/throughput 相对无
-  transfer 基线方向正确；
-- load-skew 满足 `bg ok>0`、`source kept>0`，完整 LMPool 出现 replica/lease route，
-  reuse request hit 高于实际 round-robin 结果，且 reuse TTFT 方向正确。Foreground
-  offload 不在此项强制触发，因为复用阶段正在引用的 prefix blocks 不能由 move-style
-  transfer 释放。
+- memory-skew 的 transfer-only 场景满足 `fg ok>0`、`source freed>0` 和
+  `offload_verified=true`，reuse-phase throughput、P90 TTFT 和 P90 E2E 均优于
+  round-robin；完整 LMPool 的 reuse throughput/TTFT 不能比 routing-only 退化超过 5%；
+- load-skew 的 transfer-only 和 LMPool 都必须满足 `fg ok=0`、`fg fail=0`，以确认
+  该 workload 没有混入 foreground 重试；同时要求 `bg ok>0`，完整 LMPool 出现
+  placement-lease route，reuse request hit 至少比实际 round-robin 高 10 个百分点，
+  reuse throughput 同时高于 round-robin 和 routing-only，且 reuse P90 TTFT/P90 E2E
+  均低于 round-robin。任何一项不满足都会阻止正式论文实验。
 
 预验中断后，保留原 `PREFLIGHT_ID` 和参数并设置 `RESUME=1` 再运行同一脚本。它会跳过
 已经成功写入且元数据一致的 workload；中断时尚未写完的单个 workload 从第一轮重新执行：
@@ -166,6 +167,29 @@ TRANSFER_PROFILE="${TRANSFER_PROFILE}" \
 RESUME=1 \
 bash benchmarks/run_preflight_suite.sh
 ```
+
+### 2.1 单独诊断 memory-skew foreground transfer
+
+如果 memory-skew 在整套预验中失败，不需要重复 routing 和 load-skew。可以先运行独立诊断脚本：
+
+```bash
+MODEL="${MODEL_06B}" \
+TRANSFER_PROFILE="benchmarks/results/paper/20260726T165849Z/qwen3-0.6b/kv_transfer/latency_profile.json" \
+REPETITIONS=1 \
+bash benchmarks/run_memory_skew.sh
+```
+
+脚本使用 12 个长共享前缀、24 个 warm-up、24 个独立 continuation pressure 和 24 个
+overlapping reuse 请求。`prompt-repeat=64` 将共享前缀从正式预验的约 3.8K token 提高到约
+7.6K token，continuation 还会消耗额外 block。每个 rank 的 KV budget 仍为 64，且关闭
+background copy。这个设计的目的不是人为指定请求的目标 rank，而是让 source owner 在真实
+prefill admission 中先出现 shortage，再由 foreground transfer 决定是否释放 source block。
+
+重点查看 `${OUT}/summary.json` 中的 `rebalance_success`、`transfer_release_count`、
+`offload_verified` 以及 reuse phase 的 throughput、P90 TTFT 和 P90 E2E。该脚本同时运行
+round-robin、routing-only、transfer-only 和完整 LMPool，因此可以区分“transfer 本身没有
+执行”和“transfer 执行了但完整 routing 仍然造成排队”这两类问题。memory-skew 只用于
+foreground capacity offload；background copy 的论文结论仍由 load-skew 单独验证。
 
 ## 3. Mode A: Automated Dual-Model Suite
 
@@ -453,9 +477,15 @@ reuse，并改善 throughput、TTFT 或尾延迟，且 per-rank request share �
 结束后，ingress 会在 pressure phase 前同步发布剩余 reuse 的精确 prefix-demand snapshot，
 使 foreground admission 按已知未来需求估值，而不是只按 warm-up 历史访问次数猜测。64-block
 budget 是所有五个配置共用的受限容量，不允许单独缩小 transfer 场景预算。12 个热点各预热
-2 次，使每个 source 持有 4 条约 3.8K-token 长前缀；64 条互不共享的 pressure 请求使 source
-工作集超过 budget 并触发容量释放。余下 168 条请求专门测量 offload 后的 prefix reuse，
-在不增加冷 pressure 的情况下摊薄 transfer 固定开销。
+2 次，使每个 source 持有 4 条约 3.8K-token 长前缀；128 条保留热点前缀但追加独立长尾的
+pressure continuation 请求使 owner 工作集超过 budget 并触发容量释放。所有 pressure
+请求提交后，当每个热点组至少有一个 pressure 请求产出首 token，benchmark 立即开放最后
+24 条 reuse 请求，不等待 pressure 排空。由此测到的是容量竞争仍存在时的 offload 效果，
+而不是 pressure 结束后的静态缓存命中。
+
+Foreground admission 除了分段 NVLink profile 和 transaction residual，还加入目标 rank
+当前 token-equivalent queue work 乘以目标 prefill token time 得到的 dispatch wait。该动态
+排队项只用于当前 plan，不写回 pair residual，避免一次繁忙目标永久污染 NVLink 成本。
 
 ```bash
 CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
@@ -465,8 +495,8 @@ CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
   --workload memory-skew \
   --memory-skew-prefix-groups 12 \
   --memory-skew-warmup-prompts 24 \
-  --memory-skew-pressure-prompts 64 \
-  --num-prompts 256 \
+  --memory-skew-pressure-prompts 128 \
+  --num-prompts 176 \
   --prompt-repeat 32 \
   --max-tokens 16 \
   --temperature 0.6 \
@@ -474,7 +504,7 @@ CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
   --seed 0 \
   --repetitions "${REPETITIONS}" \
   --nvlink-pairs "${NVLINK_PAIRS}" \
-  --submit-window 32 \
+  --submit-window 160 \
   --kv-block-budget 64 \
   --gpu-memory-utilization 0.5 \
   --goodput-e2e-sla-ms "${GOODPUT_SLA_MS}" \
@@ -490,20 +520,22 @@ CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
   2>&1 | tee "${OUT}/memory_skew/run.log"
 ```
 
-运行前必须先由第 6 节生成 `TRANSFER_PROFILE`。验收时要求
-`multi-gpu-kv-transfer` 或 `multi-gpu-lmpool` 的 `offload_verified=true`、
-`transfer_release_count>0` 且 `fg ok>0`。随后比较 preemption、throughput、TTFT 和 P90 E2E。
-只有发送 block 而没有释放源端 block 是复制，不构成 offloading 证据。
+运行前必须先由第 6 节生成 `TRANSFER_PROFILE`。验收时要求 transfer-only 的
+`offload_verified=true`、`transfer_release_count>0` 且 `fg ok>0`，reuse-phase throughput
+高于 multi-gpu，P90 TTFT/P90 E2E 低于 multi-gpu，request hit 至少增加 25 个百分点，且
+transfer cost underprediction rate 不超过 25%。完整 LMPool 的 reuse throughput 和 P90
+TTFT 还必须保持在 routing-only 的 95%/105% 边界内。只有发送 block 而没有释放源端 block
+是复制，不构成 offloading 证据。
 
 ## 9. Load Skew: Background Transfer for Load Relief
 
 该实验先用 48 个请求把 24 条约 5.7K-token 长前缀固定在三个 source rank，每组预热两次，
-再一次最多提交 64 个请求，形成 144-request 热点 burst。普通 round-robin 对每组重复 6 次，
-其中 12 个组落在 owner、12 个组落在 direct NVLink partner；未 transfer 的 partner 因而
-必须完成 12 次长前缀冷 prefill。Reuse 前的 phase boundary 将未来前缀需求交给控制面，
+随后一次提交 336 个打乱的 reuse 请求。80\% 的请求访问热点，其余请求使用一次性 cold
+prefix。普通 round-robin 无法再依靠请求序号与 group 编号的周期关系稳定命中。Reuse 前的
+phase boundary 将未来前缀需求交给控制面，
 background path 可按 pair 批量复制；192-block budget 可容纳每个 source 或 partner 的
-8 条长前缀。复用请求会 pin 已放置的 prefix，因而本实验不要求 foreground move 释放这些
-活跃 blocks；foreground capacity offload 由第 8 节单独验证。Routing-only 始终关闭
+8 条长前缀。该 workload 自动关闭 foreground transfer，避免容量搬迁与 proactive copy
+互相争用目标空间；foreground capacity offload 由第 8 节单独验证。Routing-only 始终关闭
 transfer，因而是完整 LMPool 的直接消融基线。输出限制为 8 token，避免 decode
 掩盖 transfer 对 TTFT 和 serving throughput 的影响。
 
@@ -515,7 +547,9 @@ CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
   --workload load-skew \
   --load-skew-prefix-groups 24 \
   --load-skew-warmup-prompts 48 \
-  --num-prompts 192 \
+  --load-skew-hot-groups 24 \
+  --load-skew-hot-share 0.8 \
+  --num-prompts 384 \
   --prompt-repeat 48 \
   --max-tokens 8 \
   --temperature 0.6 \
@@ -523,7 +557,7 @@ CUDA_VISIBLE_DEVICES="${GPU_SET}" uv run python benchmarks/benchmark_e2e.py \
   --seed 0 \
   --repetitions "${REPETITIONS}" \
   --nvlink-pairs "${NVLINK_PAIRS}" \
-  --submit-window 64 \
+  --submit-window 336 \
   --kv-block-budget 192 \
   --gpu-memory-utilization 0.7 \
   --goodput-e2e-sla-ms "${GOODPUT_SLA_MS}" \
@@ -565,12 +599,13 @@ prefill token 减少量能否随可复用前缀增长，并在 3x/5x 转化为 T
 若额外测 10x，也必须作为同一 sweep 的敏感性点完整报告，不能替代默认三档。
 
 Memory-skew 首先检查 workload 是否成立：每个 source rank 必须收到 warm-up 和 pressure
-请求，partner 必须有目标空间。然后检查 `fg ok>0`、`source freed>0` 和
-`offload_verified=true`。只有满足这些机制条件后，才比较 transfer-only 对 multi-gpu、完整
-LMPool 对 routing-only 的 throughput 与 latency；若机制未触发，该批次只能诊断成本门限或
-容量构造，不能用于宣称 transfer 无效或有效。
+请求，partner 必须有目标空间，并且 reuse 提交时间早于 pressure 全部完成。然后检查
+`fg ok>0`、`source freed>0` 和 `offload_verified=true`。只有满足这些机制条件后，才比较
+transfer-only 对 multi-gpu、完整 LMPool 对 routing-only 的 reuse-phase throughput、P90
+TTFT 与 P90 E2E；若机制未触发，该批次只能诊断成本门限或容量构造，不能用于宣称 transfer
+无效或有效。
 
-Load-skew 首先检查 48/144 的 phase 计数和 source/partner 的 per-rank 分布。机制验收要求
+Load-skew 首先检查 48/336 的 phase 计数和 source/partner 的 per-rank 分布。机制验收要求
 `multi-gpu-kv-transfer` 或 `multi-gpu-lmpool` 的 `background_copy_success>0`、
 `transfer_copy_count>0`；完整 LMPool 还应出现 `placement_lease_route_count>0` 或
 replica-copy route，reuse request hit 应高于同批次 round-robin。只有这些条件
