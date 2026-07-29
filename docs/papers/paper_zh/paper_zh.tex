@@ -93,9 +93,7 @@ PagedAttention 将这些状态划分为固定大小的物理 block，并将每�
 映射到物理 block~\citep{vLLM}。Prefix caching 对完整逻辑 block 做 hash，使具有相同
 hash chain 的两个请求可以引用同一 ready physical block。Block-based allocation 减少
 fragmentation，hash-based sharing 避免重复 prefill，但复用仍局限于拥有该物理 block 的
-cache allocator。
-
-对被拆分为完整 block $b_0,\ldots,b_k$ 的 prompt，\sys{} 计算 chained hash：
+cache allocator。对被拆分为完整 block $b_0,\ldots,b_k$ 的 prompt，\sys{} 计算 chained hash：
 \begin{equation}
   h_i = \mathrm{xxhash64}(h_{i-1} \parallel b_i),
 \end{equation}
@@ -131,7 +129,7 @@ estimation，以及 foreground 与 background transfer 的独立 admission polic
 \sys{} 面向同一模型在一台多 GPU 节点上的副本，直接 NVLink pair 可被显式配置或自动
 发现。由于 ingress request 尚未分配给 worker，ingress routing 可选择任意 healthy replica。
 Worker-originated rerouting 与所有 KV-transfer plan 则仅限当前 GPU 及其已配置 direct NVLink
-partner；不相关的 PCIe 或 NUMA peer 不作为 transfer path。原型补充而非替代 RDMA-based
+partner；不相关的 PCIe 或 NUMA peer 不作为 transfer path。系统补充而非替代 RDMA-based
 和 storage-tier system；cross-node RDMA、CPU/SSD tier、heterogeneous model 与透明 remote
 memory addressing 不在当前范围内。
 
@@ -141,10 +139,9 @@ memory addressing 不在当前范围内。
   \centering
   \includegraphics[width=0.92\textwidth]{fig_architecture.png}
   \caption{\sys{} 的 request、control、metadata 与 KV data path 分别位于 main process、
-  control plane 和 per-GPU data plane。每个详细 GPU rank 使用相同的 $2\times2$ 布局，
-  重复 rank pair 表示其他实例。Global Scheduler 向每个 Local Scheduler 发送 routing 和
+  control plane 和 per-GPU data plane。Global Scheduler 向每个 Local Scheduler 发送 routing 和
   transfer command；每个 Local Block Manager 向 Global Block Manager 发布版本化 block 与
-  load snapshot。只有配对的 Model Runner 通过绿色 NVLink path 交换打包 KV tensor，物理
+  load snapshot。只有配对的 Model Runner 通过 NVLink path 交换打包 KV tensor，物理
   KV data 不经过 control plane。}
   \label{fig:arch}
 \end{figure*}
@@ -196,7 +193,7 @@ ownership boundary：global page table 是 global metadata 的 authoritative sou
 Local Block Manager 对 physical allocation、reference count、readiness 和 local KV tensor
 具有 authoritative ownership。Global Scheduler 向每个 Local Scheduler 发送 routing target
 与 transfer phase；每个 Local Block Manager 在相关 state change 后向 Global Block Manager
-发送版本化 snapshot。没有 Python BlockManager instance 在进程间共享。
+发送版本化 snapshot。
 
 Request/result path 在 LLMEngine 和 selected worker 之间传递完整 Sequence object、generated
 token 与 runtime measurement。Metadata/control path 向 control plane 传递版本化 block/load
@@ -207,7 +204,7 @@ destination Local Block Manager 保留的 block。
 
 LLMEngine 还会监控并可重启 control process。双向 heartbeat 检测无响应 worker 或 control
 process，但不提供 consensus 或 high availability。control-process restart 后可由 worker state
-snapshot 重建 control metadata；当前原型不能在 launcher failure 后继续服务。
+snapshot 重建 control metadata；当前系统不能在 launcher failure 后继续服务。
 
 \subsection{权威全局元数据}
 
@@ -234,7 +231,7 @@ NVLink partner。令 $\mathcal{N}_{\mathrm{NV}}(s)$ 表示这些 partner，则
  \begin{cases}
  2, & g=s,\\
  1, & g\in\mathcal{N}_{\mathrm{NV}}(s),\\
- 0, & \text{其他情况}。
+ 0, & \text{其他情况}
  \end{cases}
 \end{equation}
 Affinity 为零的 candidate 在 cost evaluation 前被移除。该区分允许 global admission-time
@@ -398,9 +395,7 @@ lock。
 
 \section{实现}
 
-\sys{} 使用 Python 与 PyTorch 扩展 Mini-vLLM。表~\ref{tab:modules} 总结 implementation boundary。
-遗留函数名 swap\_out 与 swap\_in 仍在 KV-transfer module 内；论文与公开文档使用 transfer，
-因为 data path 同时支持 copy 与 move，且没有 CPU swap tier。
+\sys{} 使用 Python 与 PyTorch 扩展 Mini-vLLM。表~\ref{tab:modules} 总结了 implementation。
 
 \begin{table}[t]
 \centering\caption{主要实现模块}\label{tab:modules}\footnotesize
@@ -420,8 +415,8 @@ KV transfer & 打包 NCCL GPU-to-GPU payload movement\\\bottomrule
 
 \subsection{测试策略}
 
-仓库为每个 engine module 提供 focused test，而非仅依赖 benchmark 成功完成。当前 CPU test run 包含
-190 个通过测试和一个被跳过的 hardware-gated test。表~\ref{tab:tests} 总结 coverage。
+我为每个 engine module 实施了 unit test。表~\ref{tab:tests} 总结 coverage。
+测试使用 fake component 获得 deterministic control decision。
 
 \begin{table}[t]
 \centering\caption{测试设计与覆盖范围}\label{tab:tests}\footnotesize
@@ -438,10 +433,6 @@ Benchmark & Workload、schema、metric、confidence interval、plotting、profil
 End-to-end & Multi-process completion 与 optional CUDA/NCCL integration\\\bottomrule
 \end{tabular}\end{table}
 
-测试使用 fake component 获得 deterministic control decision。CUDA/NCCL case 有明确 marker，使 CPU-only
-CI 仍可用。Hardware test 将已知 KV value 从 rank~0 发送到 rank~1，验证 transfer 后 equality，并以
-completion timeout 检测不一致的 send/receive ordering。
-
 \section{评估}
 
 评估回答四个问题：(Q1) KV-aware routing 是否在长共享前缀下改善有效 prefix reuse 和 service？
@@ -455,7 +446,7 @@ behavior 与 completed transfer 不产生增量服务收益的边界。
 评估在一台七 GPU host 中选取六张 24~GiB GeForce RTX 3090。实测 topology 有三组 direct pair：
 physical GPU $(0,1)$、$(3,4)$ 和 $(5,6)$；benchmark 将其分别暴露为 logical pair $(0,1)$、
 $(2,3)$、$(4,5)$。NVLink topology 与 peer-access matrix 均显示每个 selected pair 内为 direct
-path、pair 间无 direct path。NV4 表示四条 bonded link，而非 fourth-generation NVLink。RTX 3090
+path、pair 间无 direct path。NV4 表示四条 bonded link。RTX 3090
 使用 GA102 的 third-generation NVLink interface；每条 link 单向 14.0625~GB/s，因此一组 four-link
 pair 理论单向峰值为 56.25~GB/s，双向合计 112.5~GB/s~\citep{NVIDIAAmpereGA102}。KV-transfer
 workload 是单向的，因此与 56.25~GB/s 上限比较。
@@ -466,7 +457,7 @@ KV block budget，以 seed~0 重复五次，禁用 EOS termination。Routing、m
 生成 64、16、8 个 output token；goodput 使用 workload-specific E2E SLA。每个 JSON artifact 记录
 command、resolved model configuration、Git state、individual trial value、95\% confidence interval 与
 per-rank statistic。每个 scenario 在 fresh process 中运行，cache content 不跨 scenario 保留；完整
-artifact 对应 paper batch `20260727T231622Z`。
+artifact 对应结果 `20260727T231622Z`。
 
 \subsection{合成数据集剖析}
 
@@ -508,7 +499,7 @@ local request hit 与 cached-token ratio。Transfer counter 报告 block/payload
 protocol outcome、estimated/observed cost；per-rank request、token、execution time 和 utilization 分布
 揭示 load concentration。
 
-对 $R$ 次完整重复测得的 scalar metric，报告 sample mean
+对 $R$ 次完整重复测得的 metric，报告 sample mean
 $\bar{x}=R^{-1}\sum_{r=1}^{R}x_r$ 与双侧 95\% confidence interval
 $\bar{x}\pm t_{0.975,R-1}s/\sqrt{R}$，其中 $s$ 为 sample standard deviation。实验 $R=5$，
 $t_{0.975,4}=2.776$。对 P90 E2E 等 tail metric，$x_r$ 是第 $r$ 次重复中的 request-level P90，
