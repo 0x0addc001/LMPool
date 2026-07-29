@@ -3,7 +3,7 @@
 This directory contains the paper source synchronized with the current implementation and the experiment batch in:
 
 ```text
-benchmarks/results/paper/20260725T031840Z/
+benchmarks/results/paper/20260727T231622Z/
 ```
 
 ## Files
@@ -17,8 +17,10 @@ benchmarks/results/paper/20260725T031840Z/
 - `figures/fig_kv_block_lifecycle.png` / `.pdf`: local and transactional cross-GPU KV-block lifecycle.
 - `figures/fig_routing_cost_model.png` / `.pdf`: token-equivalent routing cost and bounded-spill model.
 - `figures/fig_transfer_cost_model.png` / `.pdf`: measured transfer cost, saved-work, and admission model.
-- `figures/fig_results_summary.png`: color summary of routing, transfer, and session-handoff results.
-- `figures/fig_absolute_metrics.png`: absolute throughput and TTFT aggregates in original units.
+- `figures/fig_suite_routing.png` / `.pdf`: five-trial routing results across 1x, 3x, and 5x shared-prefix lengths.
+- `figures/fig_suite_skew.png` / `.pdf`: load-skew and memory-skew mechanism and serving results.
+- `figures/fig_suite_transfer_profile.png` / `.pdf`: pair-aggregated NVLink P95 transfer profiles.
+- `figures/generate_suite_results.py`: reproducible aggregation and visualization source for the current paper suite.
 - `figures/generate_architecture.py`: reproducible source for the light paper/report architecture and dark README variant.
 - `figures/generate_decision_flow.py`: synchronized light paper/report and dark README decision-flow figures.
 - `figures/generate_block_lifecycle.py`: synchronized light paper and dark README lifecycle figures.
@@ -55,13 +57,12 @@ MPLCONFIGDIR=/tmp/matplotlib UV_CACHE_DIR=/tmp/uvcache \
   uv run python docs/paper/figures/generate_cost_models.py
 ```
 
-Regenerate the color results figure directly from the archived paper JSON:
+Regenerate the current suite figures directly from the archived paper JSON:
 
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib UV_CACHE_DIR=/tmp/uvcache \
-  uv run python docs/reports/figures/generate_report_20260720.py \
-  --output docs/paper/figures/fig_results_summary.png \
-  --absolute-output docs/paper/figures/fig_absolute_metrics.png
+  uv run python docs/paper/figures/generate_suite_results.py \
+  --suite benchmarks/results/paper/20260727T231622Z
 ```
 
 Build the paper on a machine with a TeX distribution:
@@ -75,6 +76,6 @@ Alternatively, run `pdflatex`, `bibtex`, then `pdflatex` twice. Generated PDF fi
 
 ## Evidence Policy
 
-The main paper claims use five-trial means from both Qwen3-0.6B and Qwen3-1.7B. The routing workload supports a cached-token locality claim, while session handoff supports the end-to-end routing-plus-transfer claim. Load-skew and memory-skew results are retained as boundary results rather than omitted. The workload inputs are deterministic synthetic traces and are described as such; they are not presented as a production dataset.
+The main paper claims use five-trial means from both Qwen3-0.6B and Qwen3-1.7B. The routing workload supports the primary end-to-end locality claim: at 5x shared-prefix length, it reduces uncached prefill by about 60\% and improves throughput and tail latency on both models. The load-skew and memory-skew workloads verify background placement, placement leases, and safe foreground source release, while also showing the boundary of the current scheduler: transfer does not uniformly improve mean E2E latency or throughput. The workload inputs are deterministic synthetic traces and are described as such; they are not presented as a production dataset.
 
 The JSON metadata records a dirty worktree and a documentation-only revision transition during the long batch. The executable design used by the system experiments is consistent, so these artifacts are suitable for the current draft and internal comparison. A final archival submission should rerun the matrix from one clean, tagged revision.

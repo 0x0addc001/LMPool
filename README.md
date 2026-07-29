@@ -95,7 +95,7 @@ Cached complete blocks are reclaimed with dependency-safe LFU-first/LRU-second o
 
 A local block ID moves from `Free` to `Allocated / Writing`, then becomes reusable only after ModelRunner has completed the K/V tensor and BlockManager publishes it as `Ready`. Releasing the last request reference retains a complete block as a reclaimable prefix-cache entry; a prefix hit returns it to active use, while dependency-safe reclamation returns it to `Free`.
 
-Cross-GPU transfer is transactional. `prepare` locks a source generation and reserves free destination IDs; ModelRunner moves the packed tensor; the destination remains hidden until `publish`. Copy finalization retains the source, move finalization reclaims only a safe unreferenced source suffix, and abort releases the target reservation while restoring the source state. Consequently, routing never observes reserved or received-but-unpublished blocks.
+Cross-GPU transfer is transactional. `prepare` locks a source generation and reserves free destination IDs; ModelRunner moves the packed tensor; the destination remains hidden until `publish`. Copy finalization retains the source, move finalization reclaims only a safe unreferenced source suffix, and abort releases the target reservation while retaining the source. Consequently, routing never observes reserved or received-but-unpublished blocks.
 
 ### NVLink KV Transfer
 
@@ -181,8 +181,8 @@ The benchmark profiles prefix sharing before launching the system. `trace req sh
 | Workload | Exact prefix construction | Request/token sharing |
 | --- | --- | ---: |
 | Locality/routing | 192 requests across 16 recurring groups; 1x/3x/5x prefixes contain up to 1,911/5,655/9,399 tokens | 91.67% / 86.20-91.38% |
-| Load skew | 48 source warm-up requests over 24 hot groups, followed by 336 shuffled requests; 80% revisit hot groups and 20% use one-shot cold prefixes | 76.30% / 76.05% |
-| Memory skew | 24 warm-up requests over 12 hot groups, 128 hot-prefix continuations with unique tails, then 24 reuse requests that overlap active pressure | 93.18% / 64.83% |
+| Load skew | 3 warm-up requests create one long prefix per hot group; 189 subsequent requests revisit the 3 groups | 98.44% / 97.15% |
+| Memory skew | 6 session-prefix warm-ups, 30 anchor/cold pressure requests, then 36 session reuses | 91.67% / 72.29% |
 
 Runtime `DP req hit` and `DP tok reuse` show how much of that potential the system realizes. JSON artifacts store the full counts under `metadata.dataset_profile`.
 
@@ -190,22 +190,37 @@ Latency output now reports decode TPOT rather than the legacy E2E-per-token prox
 
 ### Paper Experiment Matrix
 
-The current suite uses five repetitions, six RTX 3090 GPUs arranged as three
-NV4 pairs, BF16 Qwen3-0.6B/Qwen3-1.7B, 256-token KV blocks, and equal
-per-worker block budgets. It evaluates a 1x/3x/5x routing sweep, load-skew
-background transfer, and memory-skew foreground capacity offload. The internal
+The current paper suite is archived at
+[`benchmarks/results/paper/20260727T231622Z`](./benchmarks/results/paper/20260727T231622Z).
+It uses five repetitions, six RTX 3090 GPUs arranged as three NV4 pairs, BF16
+Qwen3-0.6B/Qwen3-1.7B, 256-token KV blocks, and equal per-worker block
+budgets. It evaluates a 1x/3x/5x routing sweep, load-skew background-copy
+placement, and memory-skew move-style capacity release. The internal
 `transfer-calibration` trace only produces transaction residuals for the cost
-profile and is not reported as serving performance. Earlier result directories
-remain archived, but a fresh run is required because the current workload
-definitions and routing artifact names have changed.
+profile and is not reported as serving performance.
 
 The transfer microbenchmark proves that the packed all-layer K/V path is
 byte-correct and measures latency for each direct pair and plan size. It does
-not by itself prove serving benefit. Load skew must show successful copy and
-replica/lease routing before comparing against routing-only; memory skew must
-show successful foreground plans, positive source-block release, and improved
-reuse-phase throughput and P90 TTFT/E2E over the corresponding no-transfer
-baseline while pressure remains active.
+not by itself prove serving benefit. In the archived suite, routing has the
+strongest end-to-end result: at 5x shared-prefix length it improves throughput
+by 11.8%/21.3% and reduces mean TTFT by 18.6%/25.2% for 0.6B/1.7B relative to
+round robin. Load skew completes three background placements, copies 87 blocks,
+and routes 95 requests through placement leases; it substantially reduces TTFT,
+but decode-side TPOT can offset the mean-E2E benefit. Memory skew verifies
+source-block release for 0.6B, but does not yet establish a stable throughput
+advantage over routing-only. These latter results are mechanism and boundary
+evidence, not a claim of universal transfer superiority.
+
+### Latest Figures
+
+The figures below are generated directly from the archived JSON and use 95%
+confidence intervals across five repetitions.
+
+![Routing sweep](./assets/fig_suite_routing.png)
+
+![Skew workload results](./assets/fig_suite_skew.png)
+
+![NVLink transfer profile](./assets/fig_suite_transfer_profile.png)
 
 ## Tests
 
@@ -231,8 +246,10 @@ See [tests/README.md](./tests/README.md) for the test-to-module map and hardware
 - Current transfer decisions use direct same-node NVLink pairs only; no PCIe/NUMA fallback is scored.
 - The global page table coordinates metadata; it does not provide transparent remote block addressing.
 - The paper workloads are deterministic synthetic traces, not production datasets.
-- Transfer claims require successful plans and measured serving improvement;
-  memory-skew additionally requires positive source-block release.
+- Transfer claims distinguish completed mechanisms from end-to-end gains.
+  Load-skew validates copy plus lease routing; 0.6B memory-skew validates
+  source-block release. Neither result is presented as universal throughput or
+  E2E superiority.
 - The prototype has heartbeat and control-process restart but no replicated controller or launcher HA.
 - Cross-node RDMA, CPU/SSD cache tiers, persistent KV cache, and heterogeneous model replicas are out of scope.
 

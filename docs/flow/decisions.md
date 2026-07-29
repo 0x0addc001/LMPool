@@ -2440,8 +2440,8 @@ decision demand, decision plan, decision implementation, and decision result.
   `docs/reviews/review_20260725.md` with a 5/10 weak-reject/borderline
   assessment. The paper now identifies session handoff as a synthetic,
   forecast-assisted opportunity study, states that the benchmark supplies
-  exact queued-request demand, and distinguishes controlled Mini-vLLM
-  ablations from production-system comparisons. The limitations now cover the
+  exact queued-request demand, and distinguishes controlled internal ablations
+  from production-system comparisons. The limitations now cover the
   absence of a production trace and production baselines, the six-GPU and
   sub-2B-model scope, the 256-token block size, and the lack of held-out cost
   prediction and sensitivity results. The abstract, evaluation questions,
@@ -3701,3 +3701,292 @@ Updated `run_preflight_suite.sh` and `run_paper_suite.sh` to use three prefix gr
 ## Decision Result
 
 Preflight and paper runs now measure the same background-copy and placement-lease path that the focused workload validated, rather than a separate broad-hotset workload with different capacity behavior.
+
+# 2026-07-28: Synchronize Documentation With the Current Paper Suite
+
+## Decision Demand
+
+The paper, README files, slides, scripts, runbook, report, and oral Q&A still
+mixed current implementation details with retired session-handoff results and
+the former fixed 40 ms transfer prior. This made the documented claims stronger
+than the current `20260727T231622Z` data support.
+
+## Decision Plan
+
+Use the latest five-trial paper suite as the sole source for documented
+workloads, figures, and conclusions. Present long-prefix routing as the primary
+end-to-end performance result. Present load-skew and memory-skew as transfer
+mechanism and boundary evidence unless they show a repeatable serving gain.
+Replace slide tables with reproducible aggregate charts.
+
+## Decision Implementation
+
+Added `docs/paper/figures/generate_suite_results.py`, which reads the current
+suite JSON and produces routing, skew, and NVLink-profile figures in PNG and
+PDF. Updated both READMEs, the paper, paper README, slide deck, 10- and
+15-minute scripts, runbook, report, and Q&A to use the same workload
+definitions: 1x/3x/5x long-prefix routing, three-group load skew, and
+six-group memory skew. Removed session-handoff performance claims, replaced
+the fixed-latency description with the calibrated residual/profile model, and
+made the transfer trade-off explicit in prose and figures.
+
+## Decision Result
+
+The documented record now distinguishes stable routing improvements from
+verified transfer execution. At 5x prefix length, routing reduces uncached
+prefill by about 60\% and improves throughput and tail latency on both models.
+Load skew verifies three background placements, 87 copied blocks, and 95 lease
+routes; memory skew verifies safe source-block release on 0.6B. Neither is
+presented as a universal mean-E2E or throughput improvement.
+
+# 2026-07-28: Make Paper Figures Numerically Self-Contained
+
+## Decision Demand
+
+The first synchronized suite figures contained error bars but required readers
+to cross-reference JSON or text for exact values. Slide content also relied on
+tables more than necessary, reducing the visibility of trends and uncertainty.
+
+## Decision Plan
+
+Keep the standard academic chart types already matched to the evidence:
+faceted grouped bars for policy comparisons and a pair-wise line chart for
+transfer calibration. Add numerical mean labels to every bar, retain 95\%
+confidence intervals, and label every transfer-profile calibration point.
+
+## Decision Implementation
+
+Extended `generate_suite_results.py` with error-aware bar annotations and
+point annotations for all 1--64 block bandwidth samples. Regenerated the
+routing, skew, and transfer-profile figures for paper, slides, README assets,
+and report. The charts retain the shared Google-style policy palette: gray for
+round robin, blue for routing, green for transfer-only, and yellow for LMPool.
+
+## Decision Result
+
+Each figure can now be interpreted without consulting a separate table: bar
+heights show the exact five-trial mean, whiskers show the 95\% confidence
+interval, and calibrated NVLink points show their measured effective
+bandwidth. No logarithmic or broken axis is used because the plotted metrics
+remain within a readable single scale in each facet.
+
+# 2026-07-28: Separate Candidate Figure Generation From Documentation Publication
+
+## Decision Demand
+
+Figure design may need visual review before paper, README, slides, and reports
+reference a new asset. Writing every exploratory render directly to document
+asset paths makes that review boundary unclear.
+
+## Decision Plan
+
+Add a preview-only output mode to the suite plotting tool. Candidate figures
+will be written next to the archived experiment artifacts, while the default
+mode retains the existing synchronized publication behavior.
+
+## Decision Implementation
+
+Added `--preview-dir` to `generate_suite_results.py`. When provided, the tool
+writes only PNG and PDF candidate figures to that directory and skips all paper,
+slide, README, and report asset copies. Generated the current candidates from
+the `20260727T231622Z` suite.
+
+## Decision Result
+
+Figure review is now explicit and non-destructive. The current candidate set
+contains the routing, skew, and transfer-profile charts with numerical labels
+and confidence intervals, ready for approval before any further documentation
+publication.
+
+# 2026-07-28: Reserve Figure Whitespace for Legends
+
+## Decision Demand
+
+Candidate legends overlapped bar labels and plotted data. This reduced the
+legibility of both the numerical annotations and the policy mapping.
+
+## Decision Plan
+
+Reserve a dedicated horizontal band between each figure title and its faceted
+axes. Keep legends centered in that band rather than placing them inside a
+subplot.
+
+## Decision Implementation
+
+Changed routing and skew figures from constrained layout to explicit subplot
+margins. The top margin now contains the title and external legend; chart axes
+begin below the legend. Regenerated the candidate PNG and PDF files. Reviewed
+all paper captions: sentence captions retain sentence case with periods, while
+figure and table noun phrases use Title Case without periods.
+
+## Decision Result
+
+Legends no longer overlap bars, error bars, or numerical labels. Candidate
+figures remain separate from document publication until the review is approved.
+
+# 2026-07-29: Publish Approved Figures and Strengthen Evaluation Explanations
+
+## Decision Demand
+
+The reviewed candidate figures were ready for publication. The evaluation also
+needed explicit explanations of why a policy improves one metric but not
+another, particularly for short-prefix routing, background placement, and
+foreground source release.
+
+## Decision Plan
+
+Publish the approved numerical figures to all document asset locations. Expand
+the evaluation only where the five-trial data support a direct comparison and a
+mechanistic explanation. Preserve negative and mixed outcomes rather than
+rewriting them as positive transfer results.
+
+## Decision Implementation
+
+Regenerated the default paper, slide, README, and report assets with external
+legends, bar-value labels, confidence intervals, and calibrated bandwidth
+labels. Extended the LaTeX evaluation paragraphs to compare 1x versus 5x
+routing, LMPool versus routing-only and round robin under load skew, and
+transfer-only versus routing-only under memory skew. The text attributes
+long-prefix routing gains to avoided contiguous prefill, load-skew E2E trade-
+offs to higher decode TPOT, and memory-skew outcomes to safe release without
+sufficient incremental avoided work.
+
+## Decision Result
+
+All published document assets now use the reviewed figures. The evaluation
+states both the observed comparison and the supported reason: routing improves
+only when saved prefill is large enough, background placement lowers TTFT but
+can increase decode contention, and a completed move validates offload safety
+without proving a serving speedup.
+
+# 2026-07-29: Align the Paper With the Calibrated Transfer Model
+
+## Decision Demand
+
+The paper still described an obsolete manually selected 40~ms transfer prior.
+The implementation and current paper-suite methodology instead use a
+pair-specific, payload-dependent P95 data-path profile, a transaction-residual
+profile, and nonnegative online residual EWMAs. Leaving the obsolete model in
+the paper would make the systems description inconsistent with the artifact.
+
+## Decision Plan
+
+Review the paper against the systems-paper-writing guidance, correct the cost
+model to match the implementation, and revise the abstract, introduction,
+evaluation setup, and limitations for a clear problem--gap--design--evidence
+narrative. Preserve reported results and state mixed transfer outcomes without
+claiming universal serving gains.
+
+## Decision Implementation
+
+Rewrote the abstract as a concise systems summary, added a prose contribution
+mapping in the introduction, and replaced the fixed-prior formula with the
+calibrated pair-and-payload profile, transaction residual, size-bucket EWMA,
+and zero-residual bootstrap behavior used by GlobalScheduler. The edit also
+clarified extrapolation of the piecewise-linear profile, removed stale
+session-handoff references, and tightened prose throughout implementation,
+evaluation, and limitations.
+
+## Decision Result
+
+The paper now describes the current implementation and the 20260727T231622Z
+evaluation suite consistently. It makes a strong routing claim for sufficiently
+long prefixes, reports background placement and move release as validated
+mechanisms, and retains the measured boundary that completed transfer has not
+yet shown a universal E2E or throughput benefit.
+
+# 2026-07-29: Final Diagram and Transaction-Semantics Audit
+
+## Decision Demand
+
+The final paper audit found that the transfer cost diagram still showed the
+obsolete fixed-latency prior, and that the lifecycle diagram described an abort
+as restoring the source even though a source is not released before successful
+move finalization. The background-placement diagram also made ingress forecasts
+appear mandatory rather than optional.
+
+## Decision Plan
+
+Compare the paper figures and README assets against the current scheduler and
+transaction protocol. Correct only factual inconsistencies, regenerate light
+and dark diagrams from their source scripts, and leave stylistic details
+unchanged.
+
+## Decision Implementation
+
+Changed the transfer cost diagram to show the P95 transaction residual plus
+interference-scaled data-path prior, with source and placement residual EWMAs.
+Changed background placement to use observed reuse or optional ingress demand.
+Changed abort semantics to release the target reservation while retaining the
+source. Regenerated paper, slide, report, and README figure outputs and updated
+the corresponding English and Chinese README text.
+
+## Decision Result
+
+The current diagram set matches the implementation: publication remains the
+visibility boundary, copy retains the source, move releases only after commit,
+and cost admission uses calibrated pair-and-payload profiles rather than a
+fixed 40~ms prior.
+
+# 2026-07-29: Remove Retired Session-Handoff Figures
+
+## Decision Demand
+
+The unreferenced `fig_results_summary.png` and the obsolete report generator
+still visualized a retired forecast-assisted session-handoff workload. The
+current paper and report use the routing, load-skew, memory-skew, and transfer
+profile suite instead, so retaining those artifacts created a risk of
+accidentally reintroducing unsupported conclusions.
+
+## Decision Plan
+
+Verify whether the retired figures are referenced by the paper, slides, README,
+or report. Remove them only if they have no active references, while retaining
+the current suite figures.
+
+## Decision Implementation
+
+Confirmed that neither paper nor documentation referenced the retired result
+summary. Removed the paper and slide copies of `fig_results_summary.png` and
+the unused report generator plus its two session-handoff outputs, all of which
+read an older paper batch.
+
+## Decision Result
+
+The repository now exposes only the current suite figures for routing, skew,
+and the NVLink transfer profile. No documentation path can silently regenerate
+the retired session-handoff comparison.
+
+# 2026-07-29: Final Paper-Figure Audit and MLSys Review
+
+## Decision Demand
+
+The final submission required a one-to-one audit between paper figure references
+and checked-in assets, plus a strict MLSys review that distinguished evidence
+gaps from problems that wording could fix.
+
+## Decision Plan
+
+Remove every unreferenced paper figure, verify that each referenced PNG has a
+current matching README asset, write a concrete review, and narrow only the
+claims that could otherwise be misread as transfer performance guarantees.
+
+## Decision Implementation
+
+Audited all `\\includegraphics` references in `example_paper.tex`. Removed the
+unused `fig_absolute_metrics.png` copies from paper and slides, the retired
+session-handoff result figures, and the unreferenced duplicate PDF exports from
+the paper figure directory. Confirmed that the ten referenced paper figures
+exist and that the corresponding README assets are byte-identical. Added
+`docs/reviews/review_20260729.md` and clarified in the evaluation introduction
+that Q1 is the primary end-to-end performance claim, whereas Q2--Q4 establish
+data-path correctness, protocol behavior, and the boundary of transfer benefit.
+The report now references the same paper-suite figures directly, and the figure
+generators no longer emit unused report copies or duplicate PDF exports.
+
+## Decision Result
+
+The paper contains no unreferenced figure artifact. The review identifies the
+remaining substantive risks as missing production baselines and traces, missing
+cost-model ablations, and the absence of a stable incremental transfer speedup.
+Those are preserved as evidence gaps rather than obscured through prose.

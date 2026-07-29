@@ -10,10 +10,8 @@ from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
 ROOT = Path(__file__).resolve().parents[3]
 PAPER_PNG = Path(__file__).with_name("fig_architecture.png")
-PAPER_PDF = Path(__file__).with_name("fig_architecture.pdf")
 README_LIGHT_PNG = ROOT / "assets" / "fig_architecture.png"
 README_DARK_PNG = ROOT / "assets" / "fig_architecture_dark.png"
-REPORT_PNG = ROOT / "docs/reports/figures/report_20260720_architecture.png"
 
 LIGHT = {
     "background": "#FFFFFF",
@@ -813,7 +811,7 @@ def render(output, palette):
 
 
 def main():
-    for output in (PAPER_PNG, PAPER_PDF, README_LIGHT_PNG, REPORT_PNG):
+    for output in (PAPER_PNG, README_LIGHT_PNG):
         render(output, LIGHT)
     render(README_DARK_PNG, DARK)
 

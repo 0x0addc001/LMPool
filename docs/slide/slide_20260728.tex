@@ -188,8 +188,8 @@
   \end{center}
   \vspace{-0.5em}
   \begin{center}
-    \small Paper setting: $T_{\mathrm{fixed}}=40$ ms and interference $=1.2$.
-    The fixed term is a conservative manual prior.
+    \small Static cost uses the pair-specific P95 profile plus a calibrated residual.
+    Fixed latency is only a zero-default fallback; completed plans update EWMA residuals.
   \end{center}
 \end{frame}
 
@@ -201,7 +201,8 @@
         \item 6 RTX 3090 GPUs, 3 direct NV4 pairs
         \item Qwen3-0.6B and Qwen3-1.7B, BF16
         \item Same per-worker KV budget
-        \item 5 trials, fixed seed, fixed 64-token output
+        \item 5 trials, fixed seed, EOS disabled
+        \item Outputs: routing 64, memory skew 16, load skew 8 tokens
         \item Controlled internal ablations
       \end{itemize}
     \end{column}
@@ -210,10 +211,9 @@
         \toprule
         Workload & Purpose \\
         \midrule
-        Locality & Isolate routing and prefix reuse \\
-        Load skew & Test an already replicated hot prefix \\
-        Memory skew & Test foreground shortage admission \\
-        Handoff & Forecast-assisted background placement \\
+        Routing & 1x/3x/5x shared-prefix locality \\
+        Load skew & Background copy plus placement leases \\
+        Memory skew & Move-style capacity release \\
         \bottomrule
       \end{tabular}
     \end{column}
@@ -224,156 +224,46 @@
   \end{alertblock}
 \end{frame}
 
-\begin{frame}{Routing Cuts Uncached Prefill}
+\begin{frame}{Routing: Longer Prefixes Create Stable Gains}
   \begin{center}
-    \begin{tabular}{@{}llrrr@{}}
-      \toprule
-      Model & Policy & Cached Tokens & Uncached Tokens & Mean TTFT \\
-      \midrule
-      0.6B & Round robin & 44.1\% & 204,549 & 192.3 ms \\
-           & KV-aware & \good{72.2\%} & \good{101,842} & 206.5 ms \\
-      1.7B & Round robin & 44.1\% & 204,651 & 254.6 ms \\
-           & KV-aware & \good{71.3\%} & \good{105,170} & \good{228.6 ms} \\
-      \bottomrule
-    \end{tabular}
+    \includegraphics[width=0.94\textwidth,height=0.69\textheight,keepaspectratio]{fig_suite_routing.png}
   \end{center}
-  \vspace{0.8em}
-  \begin{itemize}
-    \item Uncached prefill falls by \good{50.2\%} and \good{48.6\%}.
-    \item Requests remain nearly balanced across ranks.
-    \item Latency payoff is model dependent: avoided prefill is more valuable for 1.7B.
-  \end{itemize}
+  \vspace{-0.5em}
+  \begin{center}\small At 5x, routing improves throughput by \good{11.8\% / 21.3\%} and reduces TTFT by \good{18.6\% / 25.2\%} for 0.6B / 1.7B.\end{center}
 \end{frame}
 
 \begin{frame}{NVLink Data-Path Calibration}
-  \scriptsize
   \begin{center}
-    \begin{tabular}{@{}rrrr@{}}
-      \toprule
-      Blocks & Payload (GiB) & Mean Latency (ms) & Bandwidth (GiB/s) \\
-      \midrule
-       1 & 0.027 &  2.96--3.66 &  7.47--9.23 \\
-       2 & 0.055 &  3.55--5.03 & 10.87--15.40 \\
-       4 & 0.109 &  4.73--5.34 & 20.48--23.14 \\
-       8 & 0.219 &  7.27--8.15 & 26.85--30.08 \\
-      16 & 0.438 & 13.27--13.53 & 32.33--32.98 \\
-      32 & 0.875 & 24.41--24.58 & 35.60--35.84 \\
-      64 & 1.750 & 47.88--48.04 & 36.43--36.55 \\
-      \bottomrule
-    \end{tabular}
+    \includegraphics[width=0.94\textwidth,height=0.68\textheight,keepaspectratio]{fig_suite_transfer_profile.png}
   \end{center}
-  \vspace{0.35em}
-  \begin{center}
-    \small Ranges span two models and three NVLink pairs; every destination validation passed.
-  \end{center}
-  \vspace{0.25em}
   \begin{alertblock}{Interpretation}
-    Larger plans amortize launch, gather, synchronization, and scatter. This calibrates the data path; it does not by itself prove serving benefit.
+    Every destination passed byte validation. The 1--64 block curves calibrate the pair-specific cost model; they do not alone prove serving benefit.
   \end{alertblock}
 \end{frame}
 
-\begin{frame}{Forecast-Assisted Session Handoff}
+\begin{frame}{Transfer: Mechanism Evidence and Boundary}
+  \begin{center}
+    \includegraphics[width=0.94\textwidth,height=0.67\textheight,keepaspectratio]{fig_suite_skew.png}
+  \end{center}
+  \vspace{-0.55em}
   \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.39\textwidth}
-      \begin{block}{Warm-up phase}
-        One request for each of 32 prefix groups runs on the source side.
-      \end{block}
-      \begin{block}{Placement boundary}
-        Exact demand for 96 queued reuse requests triggers 224 copied blocks in three pair plans.
-      \end{block}
-      \begin{block}{Reuse phase}
-        Placement leases distribute matching requests across source and replica.
-      \end{block}
+    \begin{column}{0.48\textwidth}\small
+      \good{Load skew:} three background placements copy 87 blocks. Placement leases serve 95 later requests. TTFT falls sharply, but a higher TPOT can offset mean E2E.
     \end{column}
-    \begin{column}{0.58\textwidth}
-      \begin{center}
-        \includegraphics[width=\textwidth,height=0.66\textheight,keepaspectratio]{fig_hot_prefix_decision.png}
-      \end{center}
+    \begin{column}{0.48\textwidth}\small
+      \caution{Memory skew:} 0.6B verifies 35 released source blocks. It remains close to routing-only; the 1.7B run does not satisfy the full offload verification predicate.
     \end{column}
   \end{columns}
-  \vspace{0.2em}
-  \begin{alertblock}{Scope}
-    This tests placement under exact future demand; it does not evaluate an online predictor.
-  \end{alertblock}
-\end{frame}
-
-\begin{frame}{End-to-End Handoff Results}
-  \scriptsize
-  \begin{center}
-    \begin{tabular}{@{}llrrrr@{}}
-      \toprule
-      Model & Policy & Throughput & Mean TTFT & Mean E2E & Cached Tokens \\
-      \midrule
-      0.6B & Round robin & 497.1 & 1,136.3 ms & 5,515.1 ms & 47.0\% \\
-           & Transfer only & 496.9 & 1,013.9 ms & 5,424.8 ms & 70.5\% \\
-           & \sys{} & \good{518.9} & \good{767.6 ms} & \good{5,001.1 ms} & 70.5\% \\
-      \midrule
-      1.7B & Round robin & 451.2 & 1,427.7 ms & 6,121.4 ms & 47.0\% \\
-           & Transfer only & 465.4 & 1,117.9 ms & 5,746.1 ms & 70.5\% \\
-           & \sys{} & \good{484.8} & \good{850.4 ms} & \good{5,329.7 ms} & 70.5\% \\
-      \bottomrule
-    \end{tabular}
-  \end{center}
-  \vspace{0.7em}
-  \begin{center}
-    \large Throughput: \good{+4.4\% to +7.4\%}\quad
-    TTFT: \good{32.4\% to 40.4\% lower}\quad
-    E2E: \good{9.3\% to 12.9\% lower}
-  \end{center}
-\end{frame}
-
-\begin{frame}{Why Routing and Transfer Must Cooperate}
-  \small
-  \begin{center}
-    \begin{tabular}{@{}lrrr@{}}
-      \toprule
-      Policy & Cached Tokens & Rank Request Ratio & Mean GPU Utilization \\
-      \midrule
-      Round robin & 47.0\% & 3.3 & 32.2--34.6\% \\
-      Transfer only & 70.5\% & 3.3 & 31.0--32.9\% \\
-      Full \sys{} & 70.5\% & \good{1.8} & \good{50.2--51.9\%} \\
-      \bottomrule
-    \end{tabular}
-  \end{center}
-  \vspace{0.7em}
-  \begin{itemize}
-    \item Transfer alone removes cold prefill but leaves demand concentrated.
-    \item Placement-lease routing turns the copied KV into parallel serving capacity.
-    \item Versus routing only, full \sys{} adds 2.6--3.8\% throughput; the 0.6B E2E confidence intervals overlap.
-  \end{itemize}
-\end{frame}
-
-\begin{frame}{Where Transfer Does Not Help}
-  \begin{columns}[T,onlytextwidth]
-    \begin{column}{0.48\textwidth}
-      \begin{block}{Memory skew}
-        Qwen3-1.7B admits no transfer. Cached-token ratios remain near 55\%, and full-system throughput is 0.8\% below round robin.
-      \end{block}
-      \vspace{0.4em}
-      \small Pressure alone is insufficient without reusable state, capacity, and future demand.
-    \end{column}
-    \begin{column}{0.48\textwidth}
-      \begin{block}{Steady load skew}
-        Round robin naturally warms the same hot prefix on all six workers. Every multi-GPU throughput result remains within 0.6\% of baseline.
-      \end{block}
-      \vspace{0.4em}
-      \small Once locality is already replicated, movement cannot remove additional work.
-    \end{column}
-  \end{columns}
-  \vspace{0.8em}
-  \begin{center}
-    \large\caution{A useful KV pool rejects unprofitable movement.}
-  \end{center}
 \end{frame}
 
 \begin{frame}{Limitations and Future Work}
   \small
   \begin{itemize}
-    \item Synthetic traces; exact future-demand signal in the positive handoff workload
+    \item Synthetic workloads and deterministic replay order; no production trace evaluation
     \item Internal ablations rather than production-engine comparisons
     \item Six RTX 3090 GPUs, two sub-2B models with identical KV geometry
     \item Fixed 256-token block size; no block-size sensitivity study
-    \item Manual 40 ms transaction prior; no held-out cost-prediction error or policy ablation
+    \item Pair-specific P95 profiles and online residuals; no held-out cost-prediction error or policy ablation
     \item Single control process and launcher; no consensus or launcher failover
   \end{itemize}
   \vspace{0.5em}
@@ -386,8 +276,8 @@
   \begin{enumerate}
     \item \metric{Routing solves cache locality:} reuse KV where it already resides without creating a load hotspot.
     \item \metric{NVLink transfer provides cache fluidity:} move complete block chains only when reuse repays the full transaction.
-    \item \metric{The mechanisms must cooperate:} copied KV matters only when routing sends demand to the replica.
-    \item \metric{The boundary is part of the result:} memory or request skew does not automatically justify transfer.
+    \item \metric{Transfer mechanisms are verified:} background copy, placement leases, and safe source-block release execute under their respective stressors.
+    \item \metric{The boundary is part of the result:} a completed transfer does not automatically improve mean E2E or throughput.
   \end{enumerate}
   \vspace{1em}
   \begin{center}

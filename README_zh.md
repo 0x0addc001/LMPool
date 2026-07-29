@@ -95,7 +95,7 @@ prefix hash -> [(gpu, physical block, generation, readiness), ...]
 
 本地 block ID 从 `Free` 进入 `Allocated / Writing`；只有 ModelRunner 完成 K/V tensor 写入、BlockManager 将其发布为 `Ready` 后，它才可以被复用。最后一个请求引用释放后，完整 block 会作为可回收的 prefix-cache 条目保留；prefix hit 会使其重新进入活跃使用，而满足依赖约束的回收会使其返回 `Free`。
 
-跨 GPU transfer 使用事务式生命周期。`prepare` 锁定源 block generation 并预留空闲目标 ID；ModelRunner 搬运打包后的 tensor；目标 block 在 `publish` 前保持不可见。copy finalize 保留源副本，move finalize 只回收安全且无引用的源端后缀，abort 则释放目标预留并恢复源状态。因此，路由不会观察到已预留或已接收但尚未发布的 block。
+跨 GPU transfer 使用事务式生命周期。`prepare` 锁定源 block generation 并预留空闲目标 ID；ModelRunner 搬运打包后的 tensor；目标 block 在 `publish` 前保持不可见。copy finalize 保留源副本，move finalize 只回收安全且无引用的源端后缀，abort 则释放目标预留并保留源状态。因此，路由不会观察到已预留或已接收但尚未发布的 block。
 
 ### NVLink KV Transfer
 
@@ -181,8 +181,8 @@ Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`t
 | Workload | 确切前缀构造 | 请求级/Token 级共享率 |
 | --- | --- | ---: |
 | Locality/routing | 192 个请求分布在 16 个循环复用组中；1x/3x/5x 最长前缀分别约为 1,911/5,655/9,399 tokens | 91.67% / 86.20-91.38% |
-| Load skew | 48 个 source warm-up 请求覆盖 24 个热点组，随后提交 336 个打乱的请求；其中 80% 复用热点，20% 使用各不相同的一次性冷前缀 | 76.30% / 76.05% |
-| Memory skew | 24 个 warm-up 请求建立 12 个热点组；随后是 128 个复用热点前缀但追加独立长尾的 pressure 请求，以及与仍在执行的 pressure 重叠的 24 个 reuse 请求 | 93.18% / 64.83% |
+| Load skew | 3 个 warm-up 请求分别建立 3 个长热点前缀，随后 189 个请求复用这些组 | 98.44% / 97.15% |
+| Memory skew | 6 个 session 前缀 warm-up、30 个 anchor/cold pressure 请求，随后 36 个 session reuse 请求 | 91.67% / 72.29% |
 
 运行时的 `DP req hit` 与 `DP tok reuse` 用于衡量系统实际实现了多少理论复用潜力。JSON 会把完整计数写入 `metadata.dataset_profile`。
 
@@ -190,18 +190,31 @@ Benchmark 会在启动系统前对输入 trace 做 prefix sharing profiling。`t
 
 ### 论文实验矩阵
 
-当前 suite 使用 5 次重复实验、6 张组成 3 对 NV4 直连的 RTX 3090、
-BF16 Qwen3-0.6B/Qwen3-1.7B、256-token KV block，并为每个 worker 配置相同 block budget。
-实验包括 1x/3x/5x routing sweep、load-skew 后台 transfer 和 memory-skew 前台容量
-offload。内部 `transfer-calibration` trace 只生成成本 profile 使用的完整事务 residual，
-不作为 serving 性能结果。旧结果目录继续归档，但由于 workload 定义和 routing 产物命名已经
-变化，论文结果必须使用新的完整实验批次。
+当前论文 suite 归档在
+[`benchmarks/results/paper/20260727T231622Z`](./benchmarks/results/paper/20260727T231622Z)。
+它使用 5 次重复实验、6 张组成 3 对 NV4 直连的 RTX 3090、BF16
+Qwen3-0.6B/Qwen3-1.7B、256-token KV block，并为每个 worker 配置相同 block budget。
+实验包括 1x/3x/5x routing sweep、load-skew 后台 copy placement 和 memory-skew
+move-style capacity release。内部 `transfer-calibration` trace 只生成成本 profile 使用的完整事务
+residual，不作为 serving 性能结果。
 
 NVLink transfer microbenchmark 证明 packed all-layer K/V 数据路径在字节级正确，并测得每个
-直连 pair、每种 plan 大小的 latency，但它本身不等于服务收益。Load-skew 必须先观察到
-background copy 和 replica/lease routing，才能与 routing-only 比较；memory-skew 还必须同时
-观察到 foreground plan 成功、源端 block 释放，以及在 pressure 仍活跃时，相对无 transfer
-基线更高的 reuse-phase throughput 和更低的 P90 TTFT/E2E。
+直连 pair、每种 plan 大小的 latency，但它本身不等于服务收益。归档 suite 中，routing 是最强的
+端到端结果：5x 共享前缀时，0.6B/1.7B 相对 round-robin 的吞吐提升为 11.8%/21.3%，mean TTFT
+降低为 18.6%/25.2%。Load-skew 完成 3 个 background placement、复制 87 个 block，并通过
+placement lease 路由 95 个请求；TTFT 显著降低，但 decode TPOT 会抵消部分 mean-E2E 收益。
+Memory-skew 在 0.6B 上验证了源端 block 释放，但尚未证明稳定的、超过 routing-only 的吞吐收益。
+后二者是机制与边界证据，不能表述为 transfer 在所有场景下都优于基线。
+
+### 最新图表
+
+下图直接从归档 JSON 生成，误差线为五次重复间的 95% 置信区间。
+
+![Routing sweep](./assets/fig_suite_routing.png)
+
+![Skew workload results](./assets/fig_suite_skew.png)
+
+![NVLink transfer profile](./assets/fig_suite_transfer_profile.png)
 
 ## 测试
 
@@ -227,8 +240,8 @@ RUN_NCCL_INTEGRATION=1 CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
 - 当前只对同节点 NVLink 直连 pair 做 transfer 决策，不会对 PCIe/NUMA fallback 打分。
 - 全局页表协调的是元数据，不提供透明远端 block 寻址。
 - 论文 workload 是确定性 synthetic trace，不是生产数据集。
-- Transfer 结论必须同时满足计划执行成功和 serving 性能改善；memory-skew 还必须观察到
-  源端 block 实际释放。
+- Transfer 结论区分机制完成和端到端收益。Load-skew 验证 copy 加 lease routing，0.6B
+  memory-skew 验证源端 block 释放；两者都不被表述为普遍的吞吐或 E2E 优势。
 - 原型具有 heartbeat 和控制进程重启，但没有副本化 controller 或 launcher HA。
 - 跨节点 RDMA、CPU/SSD cache tier、持久化 KV cache 和异构模型实例不在当前范围内。
 

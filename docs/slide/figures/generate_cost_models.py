@@ -54,13 +54,11 @@ PALETTES = {
 OUTPUTS = {
     "routing": {
         "paper_png": Path(__file__).with_name("fig_routing_cost_model.png"),
-        "paper_pdf": Path(__file__).with_name("fig_routing_cost_model.pdf"),
         "readme_light": ROOT / "assets" / "fig_routing_cost_model.png",
         "readme_dark": ROOT / "assets" / "fig_routing_cost_model_dark.png",
     },
     "transfer": {
         "paper_png": Path(__file__).with_name("fig_transfer_cost_model.png"),
-        "paper_pdf": Path(__file__).with_name("fig_transfer_cost_model.pdf"),
         "readme_light": ROOT / "assets" / "fig_transfer_cost_model.png",
         "readme_dark": ROOT / "assets" / "fig_transfer_cost_model_dark.png",
     },
@@ -394,7 +392,7 @@ def draw_transfer(palette, outputs):
         "Size-Aware Offline Prior",
         "bytes = B x 2 x L x S x H_kv x D x dtype_bytes\n"
         "piecewise-linear P95 latency over 1/2/4/8/16/32/64 blocks\n"
-        "T_base = T_fixed + interference x T_data",
+        "T_prior = P95 residual + interference x T_data",
         palette,
         title_size=9.5,
         body_size=7.2,
@@ -416,7 +414,8 @@ def draw_transfer(palette, outputs):
         (0.50, 0.465),
         (0.62, 0.095),
         "Conservative Transfer Cost",
-        "T_xfer = max(T_base, T_data + delta_source, T_base + delta_place) x cost_weight",
+        "T_xfer = max(T_prior, T_data + delta_source,\n"
+        "interference x T_data + delta_place) x cost_weight",
         palette,
         title_size=10.0,
         body_size=7.8,
@@ -437,7 +436,7 @@ def draw_transfer(palette, outputs):
         (0.73, 0.295),
         (0.39, 0.115),
         "Background Saved Work",
-        "forecast qualifies a reusable prefix chain\n"
+        "observed reuse or optional ingress demand qualifies a prefix chain\n"
         "T_save_bg = B x S x destination prefill_ms/token",
         palette,
         title_size=9.4,
@@ -515,14 +514,14 @@ def main():
     routing = OUTPUTS["routing"]
     draw_routing(
         PALETTES["routing"]["light"],
-        [routing["paper_png"], routing["paper_pdf"], routing["readme_light"]],
+        [routing["paper_png"], routing["readme_light"]],
     )
     draw_routing(PALETTES["routing"]["dark"], [routing["readme_dark"]])
 
     transfer = OUTPUTS["transfer"]
     draw_transfer(
         PALETTES["transfer"]["light"],
-        [transfer["paper_png"], transfer["paper_pdf"], transfer["readme_light"]],
+        [transfer["paper_png"], transfer["readme_light"]],
     )
     draw_transfer(PALETTES["transfer"]["dark"], [transfer["readme_dark"]])
 

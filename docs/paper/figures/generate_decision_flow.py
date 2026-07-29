@@ -38,22 +38,16 @@ PALETTES = {
 OUTPUTS = {
     "routing": {
         "paper": Path(__file__).with_name("fig_routing_decision.png"),
-        "paper_pdf": Path(__file__).with_name("fig_routing_decision.pdf"),
-        "report": ROOT / "docs/reports/figures/report_20260720_routing_decision.png",
         "readme_light": ROOT / "assets/fig_routing_decision.png",
         "readme_dark": ROOT / "assets/fig_routing_decision_dark.png",
     },
     "placement": {
         "paper": Path(__file__).with_name("fig_hot_prefix_decision.png"),
-        "paper_pdf": Path(__file__).with_name("fig_hot_prefix_decision.pdf"),
-        "report": ROOT / "docs/reports/figures/report_20260720_hot_prefix_decision.png",
         "readme_light": ROOT / "assets/fig_hot_prefix_decision.png",
         "readme_dark": ROOT / "assets/fig_hot_prefix_decision_dark.png",
     },
     "transfer": {
         "paper": Path(__file__).with_name("fig_transfer_decision.png"),
-        "paper_pdf": Path(__file__).with_name("fig_transfer_decision.pdf"),
-        "report": ROOT / "docs/reports/figures/report_20260720_transfer_decision.png",
         "readme_light": ROOT / "assets/fig_transfer_decision.png",
         "readme_dark": ROOT / "assets/fig_transfer_decision_dark.png",
     },
@@ -224,12 +218,12 @@ def draw_placement(ax, palette):
     heading(
         ax,
         "Background Placement",
-        "Forecast reusable KV, then admit only a profitable replica",
+        "Use observed reuse or optional ingress demand, then admit only a profitable replica",
         palette,
     )
     process(ax, (0.50, 0.840), (0.39, 0.058), "Observe Reuse Signals", "block access / route hits / ingress demand", palette)
     process(ax, (0.50, 0.745), (0.38, 0.058), "Build Resident Prefix Chain", "deepest hot leaf + complete ancestors", palette)
-    decision(ax, (0.50, 0.630), (0.27, 0.095), "Hot or forecast\nthreshold met?", palette)
+    decision(ax, (0.50, 0.630), (0.27, 0.095), "Observed reuse or optional\ningress-demand threshold met?", palette, fontsize=8.0)
     process(ax, (0.15, 0.630), (0.18, 0.052), "Defer", "collect more evidence", palette, outcome=True, fontsize=9.0)
     decision(ax, (0.50, 0.505), (0.28, 0.095), "Replica needed at\ntarget rank?", palette)
     process(ax, (0.15, 0.505), (0.18, 0.052), "Skip", "duplicate placement", palette, outcome=True, fontsize=9.0)
@@ -362,7 +356,7 @@ def main():
     for kind, outputs in OUTPUTS.items():
         light = PALETTES[kind]["light"]
         dark = PALETTES[kind]["dark"]
-        for key in ("paper", "paper_pdf", "report", "readme_light"):
+        for key in ("paper", "readme_light"):
             render(kind, outputs[key], light)
         render(kind, outputs["readme_dark"], dark)
 

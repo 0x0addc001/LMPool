@@ -9,7 +9,6 @@ from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Polygon
 
 ROOT = Path(__file__).resolve().parents[3]
 PAPER_PNG = Path(__file__).with_name("fig_kv_block_lifecycle.png")
-PAPER_PDF = Path(__file__).with_name("fig_kv_block_lifecycle.pdf")
 README_LIGHT = ROOT / "assets" / "fig_kv_block_lifecycle.png"
 README_DARK = ROOT / "assets" / "fig_kv_block_lifecycle_dark.png"
 
@@ -366,7 +365,7 @@ def render(palette, outputs):
         (0.46, 0.225),
         (0.15, 0.085),
         "Abort",
-        "target -> Free\nsource restored",
+        "target -> Free\nsource retained",
         palette,
         "free_fill",
         "free_edge",
@@ -492,7 +491,7 @@ def render(palette, outputs):
 
 
 def main():
-    render(LIGHT, [PAPER_PNG, PAPER_PDF, README_LIGHT])
+    render(LIGHT, [PAPER_PNG, README_LIGHT])
     render(DARK, [README_DARK])
 
 
