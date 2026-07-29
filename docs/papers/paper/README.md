@@ -1,6 +1,6 @@
 # LMPool Paper
 
-This directory contains the paper source synchronized with the current implementation and the experiment batch in:
+This directory contains the paper aligned with the current implementation and the experiment data in:
 
 ```text
 benchmarks/results/paper/20260727T231622Z/

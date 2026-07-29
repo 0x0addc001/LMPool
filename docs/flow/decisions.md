@@ -3990,3 +3990,35 @@ The paper contains no unreferenced figure artifact. The review identifies the
 remaining substantive risks as missing production baselines and traces, missing
 cost-model ablations, and the absence of a stable incremental transfer speedup.
 Those are preserved as evidence gaps rather than obscured through prose.
+
+# 2026-07-29: Maintain a Chinese Reading Version Without Duplicating Results
+
+## Decision Demand
+
+The project needed a Chinese version of the paper for local reading and
+presentation, while the English MLSys source remained the submission artifact.
+Duplicating result figures or bibliography assets would create an unnecessary
+second source of truth.
+
+## Decision Plan
+
+Create a standalone Chinese LaTeX document that translates the technical text
+while preserving equations, citations, numeric results, and qualified claims.
+Reference figures and bibliography from the English paper directory rather than
+copying them.
+
+## Decision Implementation
+
+Added `docs/papers/paper_zh/paper_zh.tex` and its README. The document supports
+both pdfLaTeX through CJKutf8 and XeLaTeX through Fandol, and translates the
+abstract, system design, workloads, evaluation, limitations, and related work.
+It retains English labels inside the original research figures and supplies
+Chinese captions. `sync_assets.sh` copies the canonical figures, bibliography,
+and bibliography style into the Chinese directory so that it is self-contained
+when uploaded to Overleaf.
+
+## Decision Result
+
+The Chinese reading version is self-contained for Overleaf while a repeatable
+sync script keeps its ten figures and bibliography aligned with the English
+paper. The English paper remains the canonical submission source.
