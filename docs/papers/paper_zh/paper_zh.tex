@@ -44,8 +44,8 @@ cache fluidity。路由器在连续已就绪前缀复用、排队成本和容量
 RTX 3090 GPU 上，针对 Qwen3-0.6B 和 Qwen3-1.7B，5 倍共享前缀长度的 routing 相比
 round-robin data parallelism，分别将吞吐提升 11.8\% 和 21.3\%，将平均 TTFT 降低
 18.6\% 和 25.2\%，并将未缓存 prefill token 数降低 59.9\% 和 61.0\%。对所有 layer
-的打包 K/V microbenchmark 验证了按 GPU pair 区分的 1--64-block transfer profile。
-端到端实验验证了 background placement 以及 0.6B 中 move-style source release 的实现，
+的打包 K/V microbenchmark 验证了按 GPU pair 区分的 1-64 block transfer profile。
+端到端实验验证了 background placement 以及 foreground offloading 的实现，
 同时表明一次已完成的 transfer 本身并不必然带来更低的 E2E latency 或更高的 throughput。
 源代码位于 \url{https://github.com/0x0addc001/LMPool}。
 \end{abstract}
@@ -146,7 +146,7 @@ memory addressing 不在当前范围内。
   \label{fig:arch}
 \end{figure*}
 
-图~\ref{fig:routing-decision}--\ref{fig:transfer-decision} 区分三个常被混淆的操作：
+图~\ref{fig:routing-decision}-\ref{fig:transfer-decision} 区分三个常被混淆的操作：
 routing 选择请求执行的 GPU；background placement 预测需求并准入 candidate replica；
 transactional transfer 验证并执行已准入 plan。图中的 decision node 展示 rejection、
 deferral、spill 和 rollback path；hotness threshold 不能绕过 capacity、cooldown、
@@ -436,9 +436,9 @@ End-to-end & Multi-process completion 与 optional CUDA/NCCL integration\\\botto
 \section{评估}
 
 评估回答四个问题：(Q1) KV-aware routing 是否在长共享前缀下改善有效 prefix reuse 和 service？
-(Q2) Transfer data path 提供何种 latency/bandwidth？(Q3) Background copy 与 placement lease 是否
-在 load skew 下执行，它们带来什么 serving trade-off？(Q4) Foreground move 是否能在 memory skew
-下安全释放 source capacity？Q1 是主要端到端性能主张；Q2--Q4 证明 data-path correctness、protocol
+(Q2) Transfer data path 提供何种 latency/bandwidth？(Q3) Background placement 是否
+在 load skew 下执行，它们带来什么 serving trade-off？(Q4) Foreground offloading 是否能在 memory skew
+下安全释放 source capacity？Q1 是主要端到端性能主张；Q2-Q4 证明 data-path correctness、protocol
 behavior 与 completed transfer 不产生增量服务收益的边界。
 
 \subsection{设置与方法}
@@ -476,9 +476,9 @@ upper bound，且不含 partial tail block；runtime request hit 与 cached-toke
 \setlength{\tabcolsep}{1.5pt}\renewcommand{\arraystretch}{1.08}
 \begin{tabularx}{\linewidth}{@{}L{0.07\linewidth}L{0.05\linewidth}Y L{0.10\linewidth}L{0.07\linewidth}L{0.10\linewidth}L{0.05\linewidth}Y@{}}\toprule
 工作负载 & 请求数 & 前缀构造 & Prompt token & 请求共享 & Token 共享 & Window & 目的\\\midrule
-Routing & 192 & 16 个 recurring group；每组首请求为 cold；共享前缀长度为 1x、3x、5x & 365,880 / 1,084,728 / 1,803,576 & 91.67\% & 86.20\% / 91.38\% / 89.93\% & 16 & 隔离 locality-aware routing。\\
-Load skew & 192 & 三个长 hot group；三个 warm-up 后为 189 次 hot reuse & 1,444,344 & 98.44\% & 97.15\% & 96 & 测试 background copy 与 placement lease。\\
-Memory skew & 72 & 六个 session warm-up、30 个 anchor/cold pressure request、36 个 session reuse & 486,554 & 91.67\% & 72.29\% & 48 & 测试 move-style source-capacity release。\\\bottomrule
+Routing & 192 & 16 个 recurring group；每组首请求为 cold；共享前缀长度为 1x、3x、5x & 365,880 / 1,084,728 / 1,803,576 & 91.67\% & 86.20\% / 91.38\% / 89.93\% & 16 & 测试 locality-aware routing。\\
+Load skew & 192 & 三个长 hot group；三个 warm-up 后为 189 次 hot reuse & 1,444,344 & 98.44\% & 97.15\% & 96 & 测试 background placement。\\
+Memory skew & 72 & 六个 session warm-up、30 个 anchor/cold pressure request、36 个 session reuse & 486,554 & 91.67\% & 72.29\% & 48 & 测试 foreground offloading。\\\bottomrule
 \end{tabularx}\end{table}
 
 \subsection{Baseline 与指标}
@@ -513,7 +513,7 @@ request-level latency distribution 或 model/hardware 间变化。
 \begin{figure*}[t]\centering\includegraphics[width=0.92\textwidth]{fig_suite_transfer_profile.png}
 \caption{跨 Direct GPU Pair 的打包 NVLink KV Transfer Profile}\label{fig:suite-transfer-profile}\end{figure*}
 
-\subsection{Q1：Routing 改善长前缀服务}
+\subsection{Q1：KV-aware routing 是否在长共享前缀下改善有效 prefix reuse 和 service？}
 
 \paragraph{Routing 收益随前缀长度增大。} 图~\ref{fig:suite-routing} 报告五次重复均值与 95\%
 confidence interval。1x 时，routing 不改善 throughput：Qwen3-0.6B 从 164.7 变为 161.8~tok/s，
@@ -530,7 +530,7 @@ throughput 从 43.63 提升到 48.77~tok/s，mean TTFT 从 536 降至 436~ms，m
 降低 route cost 中的 missing-prefill term，因此同一 locality 直接减少 scheduled compute。5x 时效果
 最强，两个模型同时改善 throughput 与所有报告 latency metric，而非只改善 cache-hit counter。
 
-\subsection{Q2：批量 NVLink Transfer}
+\subsection{Q2：Transfer data path 提供何种 latency/bandwidth？}
 
 \paragraph{Data path 保持 KV 语义。} Microbenchmark 在两 rank 间 transfer 每个 layer 的 K/V tensor，
 并逐 byte 验证 destination。它验证 packed tensor shape、byte count、dtype path 和 receive-side content，
@@ -546,7 +546,8 @@ small plan，是因为 gather、packing、communicator synchronization 与 scatt
 不应将该曲线视为 raw-link measurement。Runtime plan 不限于采样 size，scheduler 按 payload 插值并以
 已完成 operation 更新 pair-by-size residual。
 
-\subsection{Q3：Background Copy 与 Placement Lease}
+\subsection{Q3：Background placement 是否
+在 load skew 下执行，它们带来什么 serving trade-off？}
 
 \paragraph{Load-skew trace 覆盖预期路径。} 请求共享率 98.44\% 的 load-skew trace 在三次 warm-up
 后留下 target capacity。两个模型中，transfer-only 和完整 \sys{} 均完成三次 background placement，
@@ -563,9 +564,10 @@ TTFT 从 725 降至 247~ms，P90 E2E 从 4,850 降至 4,071~ms；mean E2E 从 2,
 scheduler 可能在 first token 后引入更多 contention。因此，load-skew 结果支持 background-copy
 correctness 和显著 TTFT benefit，而非 universal mean-E2E claim。
 
-\subsection{Q4：Capacity Offload 边界}
+\subsection{Q4：Foreground offloading 是否能在 memory skew
+下安全释放 source capacity？}
 
-\paragraph{0.6B 验证 move-style release。} Memory skew 中，0.6B full-system 结果报告 35 个释放的
+\paragraph{0.6B 验证 offloading。} Memory skew 中，0.6B full-system 结果报告 35 个释放的
 source block、两次 copy operation 和 true offload verification flag。Transfer-only 与 round robin
 接近，throughput 为 68.47 对 68.75~tok/s，TTFT 为 714 对 716~ms，说明 movement 本身没有移除足够
 work 以改善 service。Routing 是主要改善来源：它通过选择已有 local prefix chain，将 throughput 从
@@ -660,7 +662,7 @@ admission。比较并不表示 \sys{} 替代 durable 或 cross-node cache system
 \caption{按 Locality-Aware Placement、Fluidity Mechanism、Durable Capacity 和 Coupled Admission 的 KV-Cache 系统比较}
 \label{tab:related-principles}\setlength{\tabcolsep}{1.5pt}
 \begin{tabularx}{\linewidth}{@{}L{0.10\linewidth}Y Y Y L{0.10\linewidth}Y@{}}\toprule
-系统 & 主要范围 & Locality-aware request placement & Fluidity mechanism/path & Durable/multi-tier pool & Coupled route--transfer admission\\\midrule
+系统 & 主要范围 & Locality-aware request placement & Fluidity mechanism/path & Durable/multi-tier pool & Coupled route-transfer admission\\\midrule
 Mooncake Store~\citep{MooncakeStore} & Cluster-wide agentic prefix reuse & Partial：hash lookup 辅助 scheduling，完整 cache-aware routing 仍是 future work & GPU HBM 与 distributed cache worker 间异步 GPUDirect RDMA & 是：DRAM/SSD & 无公开模型比较 recomputation 与 transfer cost\\
 PegaFlow~\citep{PegaFlow} & External、process-independent KV lifetime/sharing & 否：vLLM 保留 request scheduling，global index 定位 remote hit & Local CUDA IPC、cross-node one-sided RDMA；cold block 使用 SSD & 是：pinned DRAM、remote DRAM、SSD & 否；TinyLFU 管理 cache admission，不在 routing/transfer 间选择\\
 Aqua~\citep{Aqua} & GPU-memory burst 下 responsive preemption & 无 content-addressed prefix routing & 经 NVLink/NVSwitch 将 inference state page 到 spare GPU HBM & 否：volatile GPU HBM & 基于 memory pressure，而非 expected future prefix reuse\\
