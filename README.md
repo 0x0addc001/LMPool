@@ -9,7 +9,7 @@
 
 # LMPool: KV-Aware Routing and NVLink Transfer for Multi-GPU LLM Serving
 
-LMPool is a LLM serving system built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM). It coordinates the physically local PagedAttention KV caches of multiple data-parallel LLM replicas through a dedicated control plane.
+LMPool is a multi-GPU LLM serving system built on single-GPU inference engine [Mini-vLLM](https://github.com/Wenyueh/MinivLLM). It coordinates the physically local PagedAttention KV caches of multiple data-parallel LLM replicas through a dedicated control plane.
 
 The design follows two principles:
 

@@ -54,7 +54,7 @@
 \vskip 0.3in
 
 \begin{abstract}
-Prefix caching avoids repeated prefill computation, but independent KV caches in data-parallel LLM replicas can place reusable state on a GPU other than the selected worker, while strict owner routing can overload that worker. This paper presents \sys{}, a LLM serving system that combines KV-aware routing for cache locality with direct NVLink transfer for cache fluidity when placement no longer matches demand. The router balances contiguous ready-prefix reuse against queueing and capacity costs, while a pair- and payload-aware cost model admits copy or move operations only when predicted saved prefill time covers the transfer cost; a versioned transaction protocol keeps incomplete replicas from routing decisions. On six RTX 3090 GPUs and Qwen3-0.6B and Qwen3-1.7B, 5x shared-prefix routing improves throughput by 11.8\% and 21.3\%, reduces mean TTFT by 18.6\% and 25.2\%, and reduces uncached prefill tokens by 59.9\% and 61.0\% relative to round-robin data parallelism. The packed all-layer K/V microbenchmark validates pair-specific 1--64-block transfer profiles, and the end-to-end results validate background placement and 0.6B move-style source release while showing that completed transfer does not by itself guarantee lower E2E latency or higher throughput; source code is available at \url{https://github.com/0x0addc001/LMPool}.
+Prefix caching avoids repeated prefill computation, but independent KV caches in data-parallel LLM replicas can place reusable state on a GPU other than the selected worker, while strict owner routing can overload that worker. This paper presents \sys{}, a multi-GPU LLM serving system that combines KV-aware routing for cache locality with direct NVLink transfer for cache fluidity when placement no longer matches demand. The router balances contiguous ready-prefix reuse against queueing and capacity costs, while a pair- and payload-aware cost model admits copy or move operations only when predicted saved prefill time covers the transfer cost; a versioned transaction protocol keeps incomplete replicas from routing decisions. On six RTX 3090 GPUs and Qwen3-0.6B and Qwen3-1.7B, 5x shared-prefix routing improves throughput by 11.8\% and 21.3\%, reduces mean TTFT by 18.6\% and 25.2\%, and reduces uncached prefill tokens by 59.9\% and 61.0\% relative to round-robin data parallelism. The packed all-layer K/V microbenchmark validates pair-specific 1--64-block transfer profiles, and the end-to-end results validate background placement and 0.6B move-style source release while showing that completed transfer does not by itself guarantee lower E2E latency or higher throughput; source code is available at \url{https://github.com/0x0addc001/LMPool}.
 \end{abstract}
 ]
 \printAffiliationsAndNotice{}
@@ -258,7 +258,7 @@ The protocol is idempotent for each plan ID and phase. Per-client receive locks 
 \section{Implementation}
 \label{sec:impl}
 
-\sys{} extends Mini-vLLM using Python and PyTorch. Table~\ref{tab:modules} summarizes the implementation.
+\sys{} extends single-GPU inference engine Mini-vLLM using Python and PyTorch. Table~\ref{tab:modules} summarizes the implementation.
 
 \begin{table}[t]
   \centering

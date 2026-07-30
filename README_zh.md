@@ -9,7 +9,7 @@
 
 # LMPool：面向多 GPU LLM 服务的 KV 感知路由与 NVLink 传输
 
-LMPool 是一个基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 LLM 推理系统。它通过独立控制面，协调多个数据并行 LLM 实例中物理上仍驻留于各 GPU 的 PagedAttention KV cache。
+LMPool 是一个基于单 GPU 推理引擎 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的多 GPU LLM 服务系统。它通过独立控制面，协调多个数据并行 LLM 实例中物理上仍驻留于各 GPU 的 PagedAttention KV cache。
 
 系统遵循两条第一性原理：
 

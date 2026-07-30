@@ -36,7 +36,7 @@
 \begin{abstract}
 前缀缓存可以避免重复的 prefill 计算，但数据并行 LLM 副本的 KV cache 相互独立，
 可复用状态可能位于并非当前选定 worker 的 GPU 上；而严格将请求路由到前缀 owner
-又可能使该 GPU 过载。本文提出 \sys{}，一个 LLM serving 系统：它以 KV-aware
+又可能使该 GPU 过载。本文提出 \sys{}，一个多 GPU LLM serving 系统：它以 KV-aware
 routing 解决 cache locality，以直接 NVLink transfer 在 KV 放置不再匹配需求时提供
 cache fluidity。路由器在连续已就绪前缀复用、排队成本和容量成本之间进行权衡；pair-
 和 payload-aware 成本模型仅在预测可节省的 prefill 时间足以覆盖 transfer 成本时，才
@@ -395,7 +395,7 @@ lock。
 
 \section{实现}
 
-\sys{} 使用 Python 与 PyTorch 扩展 Mini-vLLM。表~\ref{tab:modules} 总结了 implementation。
+\sys{} 使用 Python 与 PyTorch 扩展单 GPU 推理引擎 Mini-vLLM。表~\ref{tab:modules} 总结了 implementation。
 
 \begin{table}[t]
 \centering\caption{主要实现模块}\label{tab:modules}\footnotesize
