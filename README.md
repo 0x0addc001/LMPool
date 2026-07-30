@@ -9,7 +9,7 @@
 
 # LMPool: KV-Aware Routing and NVLink Transfer for Multi-GPU LLM Serving
 
-LMPool is a research prototype built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM). It coordinates the physically local PagedAttention KV caches of multiple data-parallel LLM replicas through a dedicated control plane.
+LMPool is a LLM serving system built on [Mini-vLLM](https://github.com/Wenyueh/MinivLLM). It coordinates the physically local PagedAttention KV caches of multiple data-parallel LLM replicas through a dedicated control plane.
 
 The design follows two principles:
 
@@ -226,7 +226,7 @@ confidence intervals across five repetitions.
 
 The test tree mirrors engine and benchmark modules. It covers allocation/reclamation, chained hashes, route hit/miss/capacity cases, load bypass, direct-pair filtering, page-table epochs/snapshots, reservations, transactional transfer phases, queue concurrency, process lifecycle, model/KV dtype, benchmark schemas/plots, and end-to-end completion.
 
-CPU and simulated tests:
+Simulated tests:
 
 ```bash
 CUDA_VISIBLE_DEVICES="" UV_CACHE_DIR=/tmp/uvcache uv run pytest -q
@@ -250,9 +250,5 @@ See [tests/README.md](./tests/README.md) for the test-to-module map and hardware
   Load-skew validates copy plus lease routing; 0.6B memory-skew validates
   source-block release. Neither result is presented as universal throughput or
   E2E superiority.
-- The prototype has heartbeat and control-process restart but no replicated controller or launcher HA.
+- The system has heartbeat and control-process restart but no replicated controller or launcher HA.
 - Cross-node RDMA, CPU/SSD cache tiers, persistent KV cache, and heterogeneous model replicas are out of scope.
-
-## Paper
-
-The [paper directory](./docs/paper/README.md) contains the source, verified bibliography, reproducible architecture figure, and build instructions. [example_paper.tex](./docs/paper/example_paper.tex) covers the motivation, detailed design, dataset/workload profiling, test methodology, evaluation, limitations, and related work synchronized with the current code and the paper artifact batch.

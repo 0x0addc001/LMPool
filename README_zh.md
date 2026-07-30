@@ -9,7 +9,7 @@
 
 # LMPool：面向多 GPU LLM 服务的 KV 感知路由与 NVLink 传输
 
-LMPool 是一个基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的研究原型。它通过独立控制面，协调多个数据并行 LLM 实例中物理上仍驻留于各 GPU 的 PagedAttention KV cache。
+LMPool 是一个基于 [Mini-vLLM](https://github.com/Wenyueh/MinivLLM) 的 LLM 推理系统。它通过独立控制面，协调多个数据并行 LLM 实例中物理上仍驻留于各 GPU 的 PagedAttention KV cache。
 
 系统遵循两条第一性原理：
 
@@ -220,7 +220,7 @@ Memory-skew 在 0.6B 上验证了源端 block 释放，但尚未证明稳定的�
 
 测试目录与 engine 和 benchmark 模块一一对应，覆盖 block 分配/回收、链式 hash、路由命中/未命中/容量不足、负载绕过、NVLink pair 过滤、页表 epoch/快照、容量预留、事务化 transfer 阶段、队列并发、进程生命周期、模型/KV dtype、benchmark schema/绘图和端到端完成。
 
-CPU 与模拟测试：
+模拟测试：
 
 ```bash
 CUDA_VISIBLE_DEVICES="" UV_CACHE_DIR=/tmp/uvcache uv run pytest -q
@@ -242,9 +242,5 @@ RUN_NCCL_INTEGRATION=1 CUDA_VISIBLE_DEVICES=0,1 UV_CACHE_DIR=/tmp/uvcache \
 - 论文 workload 是确定性 synthetic trace，不是生产数据集。
 - Transfer 结论区分机制完成和端到端收益。Load-skew 验证 copy 加 lease routing，0.6B
   memory-skew 验证源端 block 释放；两者都不被表述为普遍的吞吐或 E2E 优势。
-- 原型具有 heartbeat 和控制进程重启，但没有副本化 controller 或 launcher HA。
+- 系统具有 heartbeat 和控制进程重启，但没有副本化 controller 或 launcher HA。
 - 跨节点 RDMA、CPU/SSD cache tier、持久化 KV cache 和异构模型实例不在当前范围内。
-
-## 论文
-
-[论文目录说明](./docs/paper/README.md)包含源码、已核验的参考文献、可复现架构图和构建命令。[example_paper.tex](./docs/paper/example_paper.tex) 中的动机、系统机制、dataset/workload profiling、测试设计、实验结果、限制与 related work 已与当前代码和论文实验批次同步。

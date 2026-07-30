@@ -1,4 +1,4 @@
-# LMPool Oral QA（中文版）
+# LMPool QA
 
 ## 1. 一个请求进入 LMPool 后经历什么完整过程？
 

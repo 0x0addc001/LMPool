@@ -1,4 +1,4 @@
-# LMPool Oral QA
+# LMPool QA
 
 ## 1. What is the complete path of a request through LMPool?
 
