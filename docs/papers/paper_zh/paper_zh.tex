@@ -45,7 +45,7 @@ RTX 3090 GPU 上，针对 Qwen3-0.6B 和 Qwen3-1.7B，5 倍共享前缀长度的
 round-robin data parallelism，分别将吞吐提升 11.8\% 和 21.3\%，将平均 TTFT 降低
 18.6\% 和 25.2\%，并将未缓存 prefill token 数降低 59.9\% 和 61.0\%。对所有 layer
 的打包 K/V microbenchmark 验证了按 GPU pair 区分的 1-64 block transfer profile。
-端到端实验验证了 background placement 以及 foreground offloading 的实现，
+端到端实验验证了 background placement 以及 foreground offloading 的功能，
 同时表明一次已完成的 transfer 本身并不必然带来更低的 E2E latency 或更高的 throughput。
 源代码位于 \url{https://github.com/0x0addc001/LMPool}。
 \end{abstract}
@@ -435,10 +435,10 @@ End-to-end & Multi-process completion 与 optional CUDA/NCCL integration\\\botto
 
 \section{评估}
 
-评估回答四个问题：(Q1) KV-aware routing 是否在长共享前缀下改善有效 prefix reuse 和 service？
+评估回答四个问题：(Q1) KV-aware routing 是否在长共享前缀下改善 service？
 (Q2) Transfer data path 提供何种 latency/bandwidth？(Q3) Background placement 是否
-在 load skew 下执行，它们带来什么 serving trade-off？(Q4) Foreground offloading 是否能在 memory skew
-下安全释放 source capacity？Q1 是主要端到端性能主张，Q2-Q4 证明 data-path correctness、protocol
+在 load skew 下执行，它带来什么 serving trade-off？(Q4) Foreground offloading 是否能在 memory skew
+下安全且高效地工作？Q1 是主要端到端性能主张，Q2-Q4 证明 data-path correctness、protocol
 behavior 与 completed transfer 不产生增量服务收益的边界。
 
 \subsection{设置与方法}
@@ -513,7 +513,7 @@ request-level latency distribution 或 model/hardware 间变化。
 \begin{figure*}[t]\centering\includegraphics[width=0.92\textwidth]{fig_suite_transfer_profile.png}
 \caption{跨 Direct GPU Pair 的打包 NVLink KV Transfer Profile}\label{fig:suite-transfer-profile}\end{figure*}
 
-\subsection{Q1：KV-aware routing 是否在长共享前缀下改善有效 prefix reuse 和 service？}
+\subsection{Q1：KV-aware routing 是否在长共享前缀下改善 service？}
 
 \paragraph{Routing 收益随前缀长度增大。} 图~\ref{fig:suite-routing} 报告五次重复均值与 95\%
 confidence interval。1x 时，routing 不改善 throughput：Qwen3-0.6B 从 164.7 变为 161.8~tok/s，
@@ -547,7 +547,7 @@ small plan，是因为 gather、packing、communicator synchronization 与 scatt
 已完成 operation 更新 pair-by-size residual。
 
 \subsection{Q3：Background placement 是否
-在 load skew 下执行，它们带来什么 serving trade-off？}
+在 load skew 下执行，它带来什么 serving trade-off？}
 
 \paragraph{Load-skew trace 覆盖预期路径。} 请求共享率 98.44\% 的 load-skew trace 在三次 warm-up
 后留下 target capacity。两个模型中，transfer-only 和完整 \sys{} 均完成三次 background placement，
@@ -565,19 +565,21 @@ scheduler 可能在 first token 后引入更多 contention。因此，load-skew 
 correctness 和显著 TTFT benefit，而非 universal mean-E2E claim。
 
 \subsection{Q4：Foreground offloading 是否能在 memory skew
-下安全释放 source capacity？}
+下安全且高效地工作？}
 
-\paragraph{0.6B 验证 offloading。} Memory skew 中，0.6B full-system 结果报告 35 个释放的
+\paragraph{Offloading 被验证功能，但未必可以仅凭自身提高性能}
+Memory skew 中，0.6B full-system 结果报告 35 个释放的
 source block、两次 copy operation 和 true offload verification flag。Transfer-only 与 round robin
 接近，throughput 为 68.47 对 68.75~tok/s，TTFT 为 714 对 716~ms，说明 movement 本身没有移除足够
 work 以改善 service。Routing 是主要改善来源：它通过选择已有 local prefix chain，将 throughput 从
 68.75 提升至 80.30~tok/s，TTFT 从 716 降至 333~ms，加入 move path 后为 80.11~tok/s 和 329~ms，
-与 routing-only 在统计上接近。该实验验证安全的 capacity-release transaction，但未证明增量 throughput
-收益。
-
-\paragraph{1.7B 运行不构成 offload 结论。} 1.7B 结果记录了 moved block，但不满足完整 offload
+与 routing-only 在统计上接近。
+1.7B 结果记录了 moved block，但不满足完整 offload
 verification predicate，其 full-system throughput/latency 与 routing-only 接近，confidence interval
-重叠。因此，memory skew 被用于 implementation/safety result，而非证明 transfer-out 改善 serving
+重叠。
+该实验验证安全的 capacity-release transaction，但未证明增量 throughput
+收益。
+因此，memory skew 被用于 implementation/safety result，而非证明 transfer-out 改善 serving
 performance。Memory pressure 本身不能保证存在可复用、可执行且足够有价值的 transfer plan。
 
 \section{讨论、局限与未来工作}
