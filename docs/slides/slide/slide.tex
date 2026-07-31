@@ -131,7 +131,7 @@
     \item \metric{Local admission:} The target Local Scheduler reuses ready local blocks and asks Local Block Manager to allocate missing blocks.
     \item \metric{Optional foreground transfer:} A real block shortage may trigger a cost-gated pair-local copy or move plan.
     \item \metric{Execution:} Model Runner performs prefill, writes missing KV, and then iterates decode.
-    \item \metric{Publication:} The worker reports tokens and a new versioned block/load snapshot; only ready blocks become globally visible.
+    \item \metric{Publication:} The worker reports tokens and a new versioned block/load snapshot, only ready blocks become globally visible.
     \item \metric{Completion:} References are released. Complete prefixes remain cached at ref-count zero until reuse or dependency-safe reclamation.
   \end{enumerate}
 \end{frame}
@@ -155,9 +155,9 @@
     \begin{column}{0.47\textwidth}
       \scriptsize
       \begin{itemize}
-        \item $R$: required prompt blocks; $N$: prompt tokens
-        \item $S$: tokens per block; $h_g$: contiguous ready blocks
-        \item $n_g$: missing blocks; $M_g$: missing prefill tokens
+        \item $R$: required prompt blocks, $N$: prompt tokens
+        \item $S$: tokens per block, $h_g$: contiguous ready blocks
+        \item $n_g$: missing blocks, $M_g$: missing prefill tokens
         \item $F_g$: currently free blocks
         \item $A_g$: missing blocks beyond $F_g$, hence reclaim pressure
         \item $Q_g$: queued, pending, and running token-equivalent work
@@ -177,7 +177,7 @@
   \end{center}
   \vspace{-0.5em}
   \begin{center}
-    \small Prepare $\rightarrow$ Execute $\rightarrow$ Publish $\rightarrow$ Finalize;
+    \small Prepare $\rightarrow$ Execute $\rightarrow$ Publish $\rightarrow$ Finalize,
     abort preserves the source and releases the destination reservation.
   \end{center}
 \end{frame}
@@ -189,7 +189,7 @@
   \vspace{-0.5em}
   \begin{center}
     \small Static cost uses the pair-specific P95 profile plus a calibrated residual.
-    Fixed latency is only a zero-default fallback; completed plans update EWMA residuals.
+    Fixed latency is only a zero-default fallback, completed plans update EWMA residuals.
   \end{center}
 \end{frame}
 
@@ -220,7 +220,7 @@
   \end{columns}
   \vspace{0.8em}
   \begin{alertblock}{Scope}
-    Synthetic mechanism study; not a production-trace or production-engine comparison.
+    Synthetic mechanism study, not a production-trace or production-engine comparison.
   \end{alertblock}
 \end{frame}
 
@@ -237,7 +237,7 @@
     \includegraphics[width=0.94\textwidth,height=0.68\textheight,keepaspectratio]{fig_suite_transfer_profile.png}
   \end{center}
   \begin{alertblock}{Interpretation}
-    Every destination passed byte validation. The 1--64 block curves calibrate the pair-specific cost model; they do not alone prove serving benefit.
+    Every destination passed byte validation. The 1-64 block curves calibrate the pair-specific cost model, they do not alone prove serving benefit.
   \end{alertblock}
 \end{frame}
 
@@ -251,7 +251,7 @@
       \good{Load skew:} three background placements copy 87 blocks. Placement leases serve 95 later requests. TTFT falls sharply, but a higher TPOT can offset mean E2E.
     \end{column}
     \begin{column}{0.48\textwidth}\small
-      \caution{Memory skew:} 0.6B verifies 35 released source blocks. It remains close to routing-only; the 1.7B run does not satisfy the full offload verification predicate.
+      \caution{Memory skew:} 0.6B verifies 35 released source blocks. It remains close to routing-only, the 1.7B run does not satisfy the full offload verification predicate.
     \end{column}
   \end{columns}
 \end{frame}
@@ -259,16 +259,17 @@
 \begin{frame}{Limitations and Future Work}
   \small
   \begin{itemize}
-    \item Synthetic workloads and deterministic replay order; no production trace evaluation
+    \item Synthetic workloads and deterministic replay order, no production trace evaluation
     \item Internal ablations rather than production-engine comparisons
     \item Six RTX 3090 GPUs, two sub-2B models with identical KV geometry
-    \item Fixed 256-token block size; no block-size sensitivity study
-    \item Pair-specific P95 profiles and online residuals; no held-out cost-prediction error or policy ablation
-    \item Single control process and launcher; no consensus or launcher failover
+    \item No NVSwitch-fabric evaluation; pair-local profiles do not capture all-to-all target selection or shared-fabric contention
+    \item Fixed 256-token block size, no block-size sensitivity study
+    \item Pair-specific P95 profiles and online residuals, no held-out cost-prediction error or policy ablation
+    \item Single control process and launcher, no consensus or launcher failover
   \end{itemize}
   \vspace{0.5em}
   \begin{block}{Next evaluation}
-    Online forecast on public multi-turn traces; production baseline; 1/2/4/6-GPU and block-size scaling; cost-model prediction and admission ablations.
+    Production traces and baselines, 1/2/4/6-GPU and block-size scaling, cost-model prediction and admission ablations, concurrent transfer profiles and end-to-end scaling on an eight-GPU NVSwitch domain.
   \end{block}
 \end{frame}
 
