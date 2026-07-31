@@ -596,8 +596,8 @@ NVSwitch fabric 需要单独评估：它扩大每个 source GPU 的可行 target
 上的 routing 或 admission behavior。
 结果不应直接外推到 RDMA 或 PCIe-only cluster。
 
-内部消融提供受控 mechanism comparison，但不比较完整 production serving stack。Kernel、scheduler、
-prefix index 和 connector implementation 的差异使这些改善不能被解释为相对 vLLM、SGLang、Mooncake 或
+内部消融提供受控 mechanism comparison，但不比较完整 production serving stack 在 production traces 上。Kernel、scheduler、
+prefix index、connector implementation 和 workload 的差异使这些改善不能被解释为相对 vLLM、SGLang、Mooncake 或
 LMCache 的 superiority。Versioned snapshot、transactional transfer、heartbeat 和 control-process restart
 保持 metadata consistency 并支持 failure detection，但不实现 replicated consensus，launcher failure 会停止
 service，worker failure 可能失去该 worker 上的 physical cache。
@@ -668,8 +668,7 @@ rescheduling 与 defragmentation~\citep{Llumnix}，MELL 联合考虑 multi-GPU K
 表~\ref{tab:related-principles} 区分常被统称为 ``distributed KV cache'' 的三类关切。Locality-aware
 placement 将请求分配到已有相关 prefix 的 GPU，fluidity-aware placement 在当前位置不再匹配需求时移动 state，
 coupled admission 在 routing/transfer 间选择前比较 recomputation、queueing、capacity 与 measured transfer cost。
-表中 ``Partial'' 表示 metadata lookup，但没有公开的 policy 联合考虑 locality、load、routing 与 transfer
-admission。比较并不表示 \sys{} 替代 durable 或 cross-node cache system，而是说明在所列系统中，\sys{}
+比较并不表示 \sys{} 替代 durable 或 cross-node cache system，而是说明在所列系统中，\sys{}
 将三种 decision 集成在 serving scheduler 内。
 
 \begin{table}[!htbp]\centering\footnotesize
@@ -677,7 +676,7 @@ admission。比较并不表示 \sys{} 替代 durable 或 cross-node cache system
 \label{tab:related-principles}\setlength{\tabcolsep}{2pt}
 \begin{tabularx}{\linewidth}{@{}L{0.15\linewidth}Y Y@{}}\toprule
 系统 & 主要范围 & Locality-aware request placement\\\midrule
-Mooncake Store~\citep{MooncakeStore} & Cluster-wide agentic prefix reuse & 否：提供 cache-location information 给 scheduling, 但不路由 requests to the owner by itself\\
+Mooncake Store~\citep{MooncakeStore} & Cluster-wide agentic prefix reuse & 否：提供 cache-location information 给 scheduling 来作 metadata lookup，但不路由 requests to the owner by itself 或 联合考虑 locality、load、routing 与 transfer admission。\\
 PegaFlow~\citep{PegaFlow} & External、process-independent KV lifetime/sharing & 否：vLLM 保留 request scheduling，global index 只定位 remote hit\\
 Aqua~\citep{Aqua} & GPU-memory burst 下 responsive preemption & 否：无 content-addressed prefix routing\\
 \sys{} & Data-parallel GPU replica 间的 KV locality/fluidity & 是：最长 contiguous prefix 与 load/effective capacity 联合评分\\\bottomrule
@@ -697,8 +696,8 @@ Aqua~\citep{Aqua} & 经 NVLink/NVSwitch 将 inference state page 到 spare GPU H
 \sys{} 通过 global routing 协调物理局部 KV cache 以获得 cache locality，并仅在 expected benefit 覆盖 cost 时
 使用 pair-local NVLink transfer 获得 cache fluidity。实现将 authoritative control process 与 per-GPU data
 process 分离，并在 configured direct pair 上结合 versioned metadata 与 transactional block movement。实验
-在两个模型的长共享前缀下显示稳定 routing gain，验证 load skew 中的 background copy/lease routing 及 0.6B
-memory skew 中的 source-block release，并给出当前边界：completed movement 本身不保证更低 E2E latency 或更高
+在两个模型的长共享前缀下显示稳定 routing gain，验证了 load skew 中的 background placement 及 
+memory skew 中 foreground offloading 的 source-block release 的功能，但 completed movement 本身不保证更低 E2E latency 或更高
 throughput。
 
 \section*{致谢}

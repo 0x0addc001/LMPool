@@ -277,8 +277,7 @@
   \begin{enumerate}
     \item \metric{Routing solves cache locality:} reuse KV where it already resides without creating a load hotspot.
     \item \metric{NVLink transfer provides cache fluidity:} move complete block chains only when reuse repays the full transaction.
-    \item \metric{Transfer mechanisms are verified:} background copy, placement leases, and safe source-block release execute under their respective stressors.
-    \item \metric{The boundary is part of the result:} a completed transfer does not automatically improve mean E2E or throughput.
+    \item \metric{Transfer mechanisms are verified in functionality but not performance:} background placement and foreground offloading execute under their respective stressors. However, a completed transfer does not automatically improve mean E2E or throughput.
   \end{enumerate}
   \vspace{1em}
   \begin{center}

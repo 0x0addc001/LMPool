@@ -405,13 +405,11 @@ For a metric measured in $R$ complete repetitions, I report the sample mean $\ba
 \section{Discussion, Limitations, and Future Work}
 \label{sec:limitations}
 
-The synthetic phase structure supports causal attribution, but cannot replace the profiling of production traces. The background-placement workload uses deterministic prompt identities and a fixed replay order, rather than an evaluated online forecast. Future evaluation should replay a published or anonymized trace and report prefix popularity, reuse distance, prompt and decode distributions, transitions in session affinity, forecast accuracy, and invalid-copy rate before selecting cache policies.
-
 The study uses one host, six consumer GPUs, and two models with fewer than two billion parameters and identical KV geometry. It does not evaluate scale-out beyond six GPUs or sensitivity to the 256-token KV block size. Smaller blocks may change fragmentation, metadata cost, transfer-plan size, and batching efficiency. Larger models alter the ratio between computation and transfer, while larger NVLink fabrics alter candidate selection.
 An NVSwitch fabric requires separate evaluation: it enlarges each source GPU's feasible target set, and concurrent transfers contend for a shared fabric rather than independent pair-local links. Pair-specific profiles measured on the current topology therefore do not establish routing or admission behavior on an all-to-all NVSwitch domain.
 The reported results should not be extrapolated directly to RDMA or PCIe-only clusters.
 
-The internal ablations provide a controlled comparison of mechanisms but do not compare complete production serving stacks. Differences in kernels, schedulers, prefix indexes, and connector implementations prevent the reported improvements from being interpreted as superiority over vLLM, SGLang, Mooncake, or LMCache.
+The internal ablations provide a controlled comparison of mechanisms but do not compare complete production serving stacks on production traces. Differences in kernels, schedulers, prefix indexes, connector implementations, and workloads prevent the reported improvements from being interpreted as superiority over vLLM, SGLang, Mooncake, or LMCache.
 
 Versioned snapshots, transactional transfers, heartbeats, and control-process restart preserve metadata consistency and support failure detection. They do not implement replicated consensus. A launcher failure stops the service, and a worker failure can remove the physical cache stored by that worker.
 
@@ -442,7 +440,7 @@ MemServe provides an elastic memory pool and a global prompt-tree scheduler for 
 
 Aqua uses spare memory on GPUs connected by NVLink or NVSwitch to page inference state for preemptive, time-sliced serving under bursty memory pressure. On eight H100 GPUs, Aqua reports up to 20$\times$ better responsiveness and 4$\times$ higher throughput for a single long prompt~\citep{Aqua}. Aqua therefore provides fluidity for active inference state, but does not route requests according to content-addressed prefix ownership. Llumnix migrates requests to support dynamic rescheduling and defragmentation~\citep{Llumnix}. MELL jointly considers multi-GPU KV load and the cost of request migration~\citep{MELL}. These studies show that state movement is a costed scheduling operation rather than a universally beneficial fallback. \sys{} differs by using content-addressed prefix chains, copy-based replication, and placement leases to serve future requests from both the source and destination.
 
-Table~\ref{tab:related-principles} distinguishes three concerns that are often grouped under ``distributed KV cache.'' Locality-aware placement assigns a request to a GPU on which the relevant prefix already exists. Fluidity-aware placement moves state when its current location no longer matches demand. Coupled admission compares recomputation, queueing, capacity, and measured transfer cost before choosing between routing and transfer. In the table, ``Partial'' denotes metadata lookup without a published policy that jointly considers locality, load, routing, and transfer admission. The comparison does not suggest that \sys{} replaces durable or cross-node cache systems. Instead, it shows that, among the listed designs, \sys{} integrates all three decisions within the serving scheduler.
+Table~\ref{tab:related-principles} distinguishes three concerns that are often grouped under ``distributed KV cache.'' Locality-aware placement assigns a request to a GPU on which the relevant prefix already exists. Fluidity-aware placement moves state when its current location no longer matches demand. Coupled admission compares recomputation, queueing, capacity, and measured transfer cost before choosing between routing and transfer. The comparison does not suggest that \sys{} replaces durable or cross-node cache systems. Instead, it shows that, among the listed designs, \sys{} integrates all three decisions within the serving scheduler.
 
 \begin{table*}[t]
   \caption{Comparison of KV-Cache Systems by Locality-Aware Placement, Fluidity Mechanism, Durable Capacity, and Coupled Admission}
@@ -456,7 +454,7 @@ Table~\ref{tab:related-principles} distinguishes three concerns that are often g
     \midrule
     Mooncake Store~\citep{MooncakeStore}
       & Cluster-wide agentic prefix reuse
-      & No: Exposes cache-location information to scheduling, but does not route requests to the owner by itself
+      & No: could only exposes cache-location information to scheduling for meta data lookup, but does not route requests by itself or jointly consider locality load, routing and transfer addmission
       & Asynchronous GPUDirect RDMA between GPU HBM and distributed cache workers
       & Yes: DRAM and SSD
       & No: no published model for comparing recomputation and transfer costs \\
@@ -471,7 +469,7 @@ Table~\ref{tab:related-principles} distinguishes three concerns that are often g
       & No: no content-addressed prefix routing
       & Inference-state paging to spare GPU HBM over NVLink/NVSwitch
       & No: volatile GPU HBM
-      & No: Placement based on memory pressure rather than expected future prefix reuse \\
+      & No: placement based on memory pressure rather than expected future prefix reuse \\
     \sys{}
       & KV locality and fluidity across data-parallel GPU replicas
       & Yes: longest contiguous prefix jointly scored with load and effective capacity
@@ -485,7 +483,7 @@ Table~\ref{tab:related-principles} distinguishes three concerns that are often g
 \section{Conclusion}
 \label{sec:concl}
 
-\sys{} coordinates physically local KV caches through global routing for cache locality and pair-local NVLink transfer for cache fluidity only when the expected benefit exceeds the cost. The implementation separates an authoritative control process from per-GPU data processes and combines versioned metadata with transactional block movement over configured direct pairs. The experiments show stable routing gains for long shared prefixes across both models, validate background copy plus lease routing in load skew and source-block release in 0.6B memory skew, and establish the current boundary: completed movement does not by itself guarantee lower E2E latency or higher throughput.
+\sys{} coordinates physically local KV caches through global routing for cache locality and pair-local NVLink transfer for cache fluidity only when the expected benefit exceeds the cost. The implementation separates an authoritative control process from per-GPU data processes and combines versioned metadata with transactional block movement over configured direct pairs. The experiments show stable routing gains for long shared prefixes across both models, validate the functionality of background placement in load skew and foreground offloading in memory skew, however, completed movement does not by itself guarantee lower E2E latency or higher throughput.
 
 \section*{Acknowledgements}
 I thank Yijun Sun and Professor Kai Chen for project supervision and the authors of Mini-vLLM for providing the base inference engine.
