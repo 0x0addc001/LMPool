@@ -426,6 +426,8 @@ Orca introduced iteration-level scheduling for transformer serving~\citep{ORCA}.
 
 \subsection{Cluster Orchestration}
 
+NVIDIA Dynamo is a datacenter-scale inference framework that combines disaggregated serving, KV-aware routing based on worker load and KV-cache overlap, and tiered KV offload through its KV Block Manager~\citep{NVIDIADynamo}. Its router and cache events support cluster-level worker selection, while its storage hierarchy extends KV capacity beyond GPU HBM. \sys{} addresses a narrower scale-up problem: it coordinates physically local HBM caches across data-parallel replicas connected by configured direct NVLink pairs. The contribution of \sys{} is a pair- and payload-aware admission path for transactional copy or move of complete KV block chains, coupled with placement leases for subsequent requests. The designs are complementary rather than interchangeable, and this paper does not compare their end-to-end performance.
+
 Ray~\citep{Ray} and Kubernetes~\citep{Kubernetes} manage resource allocation, worker placement, scaling, and lifecycle at cluster or replica granularity. Ray schedules distributed tasks and actors, while Kubernetes schedules and maintains containers. They can provide an outer deployment layer for \sys{}, but do not natively maintain prefix-level KV ownership, route requests from contiguous ready-prefix chains, or admit transactional KV movement. \sys{} is therefore complementary to cluster orchestration: an orchestrator manages replica lifecycle, whereas \sys{} manages request and KV placement within a serving group.
 
 \subsection{Distributed and Tiered KV Caches}

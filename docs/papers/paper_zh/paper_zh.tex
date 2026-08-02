@@ -631,6 +631,13 @@ placement，它们可通过 direct NVLink copy KV block。
 
 \subsection{Cluster 编排}
 
+NVIDIA Dynamo 是 datacenter-scale inference framework，结合 disaggregated serving、基于 worker load 与
+KV-cache overlap 的 KV-aware routing，以及通过 KV Block Manager 实现的 tiered KV offload~\citep{NVIDIADynamo}。
+其 router 和 cache event 支持 cluster-level worker selection，storage hierarchy 将 KV capacity 扩展到 GPU HBM
+之外。\sys{} 解决更窄的 scale-up 问题：在由 configured direct NVLink pair 连接的 data-parallel replica 间协调物理
+局部 HBM cache。\sys{} 的重点是根据 pair 与 payload 的 cost 对 complete KV block chain 的 transactional copy/move
+准入，并以 placement lease 服务后续 request。二者是互补而非可相互替代的设计，本文也不比较其 end-to-end performance。
+
 Ray~\citep{Ray} 与 Kubernetes~\citep{Kubernetes} 在 cluster 或 replica 粒度管理 resource allocation、worker
 placement、scaling 和 lifecycle。Ray 调度 distributed task 与 actor，Kubernetes 调度并维护 container。它们可作为
 \sys{} 的外层 deployment layer，但不会原生维护 prefix-level KV ownership、依据 contiguous ready-prefix chain
